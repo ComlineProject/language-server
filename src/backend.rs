@@ -133,9 +133,25 @@ impl LanguageServer for Backend {
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
-        tracing::debug!("Completion request at {:?}", params.text_document_position);
-        // TODO: Implement completion
-        Ok(None)
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        
+        tracing::debug!("Completion request for {} at {:?}", uri, position);
+        
+        let document = match self.documents.get(&uri) {
+            Some(doc) => doc,
+            None => return Ok(None),
+        };
+        
+        // Use our completion handler
+        use crate::handlers::completion;
+        let completions = completion::get_completions(&document.text, &uri, position);
+        
+        if completions.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(CompletionResponse::Array(completions)))
+        }
     }
 
     async fn goto_definition(
