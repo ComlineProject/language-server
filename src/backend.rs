@@ -158,9 +158,26 @@ impl LanguageServer for Backend {
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
-        tracing::debug!("Find references request at {:?}", params.text_document_position);
-        // TODO: Implement find references
-        Ok(None)
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let include_declaration = params.context.include_declaration;
+        
+        tracing::debug!("Find references request for {} at {:?}", uri, position);
+        
+        let document = match self.documents.get(&uri) {
+            Some(doc) => doc,
+            None => return Ok(None),
+        };
+        
+        // Use our references handler
+        use crate::handlers::references;
+        let refs = references::find_references(&document.text, &uri, position, include_declaration);
+        
+        if refs.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(refs))
+        }
     }
 
     async fn document_symbol(
