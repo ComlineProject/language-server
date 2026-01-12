@@ -168,15 +168,41 @@ impl LanguageServer for Backend {
 impl Backend {
     /// Parse a document and publish diagnostics
     async fn parse_and_publish_diagnostics(&self, uri: &Url) {
+        use crate::analysis::diagnostics;
+        use crate::parser;
+        
         let document = match self.documents.get(uri) {
             Some(doc) => doc,
             None => return,
         };
 
-        // TODO: Parse the document and generate diagnostics
-        // For now, just clear diagnostics
-        self.client
-            .publish_diagnostics(uri.clone(), vec![], Some(document.version))
-            .await;
+        // Parse the document
+        match parser::parse(&document.text) {
+            Ok(result) => {
+                // Generate LSP diagnostics from parse errors
+                let lsp_diagnostics = diagnostics::generate_diagnostics(&document.text, &result.errors);
+                
+                // Log parse results
+                if result.is_ok() {
+                    if let Some(doc) = &result.document {
+                        tracing::debug!("Successfully parsed {}: {} declarations", uri, parser::get_declaration_count(doc));
+                    }
+                } else {
+                    tracing::debug!("Parse errors for {}: {} error(s)", uri, result.errors.len());
+                }
+                
+                // Publish diagnostics to client
+                self.client
+                    .publish_diagnostics(uri.clone(), lsp_diagnostics, Some(document.version))
+                    .await;
+            }
+            Err(e) => {
+                tracing::error!("Failed to parse {}: {}", uri, e);
+                // Clear diagnostics on internal error
+                self.client
+                    .publish_diagnostics(uri.clone(), vec![], Some(document.version))
+                    .await;
+            }
+        }
     }
 }
