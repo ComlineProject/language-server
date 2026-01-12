@@ -142,9 +142,19 @@ impl LanguageServer for Backend {
         &self,
         params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
-        tracing::debug!("Go to definition request at {:?}", params.text_document_position_params);
-        // TODO: Implement go to definition
-        Ok(None)
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        
+        tracing::debug!("Go-to-definition request for {} at {:?}", uri, position);
+        
+        let document = match self.documents.get(&uri) {
+            Some(doc) => doc,
+            None => return Ok(None),
+        };
+        
+        // Use our definition handler
+        use crate::handlers::definition;
+        Ok(definition::find_definition(&document.text, &uri, position))
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
