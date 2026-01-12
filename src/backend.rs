@@ -268,9 +268,8 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
         
-        // Use our semantic tokens handler
-        use crate::handlers::semantic_tokens;
-        Ok(semantic_tokens::get_semantic_tokens(&document.text, &uri))
+        // Use our semantic tokens handler directly
+        Ok(crate::handlers::semantic_tokens::get_semantic_tokens(&document.text, &uri))
     }
 }
 
