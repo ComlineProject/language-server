@@ -4,12 +4,18 @@ A Language Server Protocol (LSP) implementation for [Comline](https://github.com
 
 ## Features
 
-### ✅ Implemented
+### ✅ Fully Implemented
 
 - **Diagnostics** - Real-time syntax error detection and reporting
 - **Document Symbols** - Hierarchical outline view of structs, enums, protocols, and constants
 - **Hover Information** - Rich tooltips showing full type definitions and signatures
 - **Go to Definition** - Jump from type references to their declarations
+- **Find References** - Locate all usages of a symbol (with include/exclude declaration option)
+- **Auto-Completion** - Context-aware code suggestions:
+  - Keywords with snippets (`struct`, `enum`, `protocol`, `const`, `use`, `import`)
+  - Primitive types (i8-i64, u8-u64, f32/f64, string, bool)
+  - User-defined types (all structs, enums, protocols from current file)
+  - Context detection (type position, top-level, struct body)
 
 ### 🚧 Planned
 

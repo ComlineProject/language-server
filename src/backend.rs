@@ -220,15 +220,57 @@ impl LanguageServer for Backend {
     }
 
     async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
-        tracing::debug!("Format request for {}", params.text_document.uri);
-        // TODO: Implement formatting
-        Ok(None)
+        let uri = params.text_document.uri;
+        tracing::debug!("Format request for {}", uri);
+        
+        let document = match self.documents.get(&uri) {
+            Some(doc) => doc,
+            None => return Ok(None),
+        };
+        
+        // Use our formatting handler
+        use crate::handlers::formatting;
+        let edits = formatting::format_document(&document.text);
+        
+        if edits.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(edits))
+        }
     }
 
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
-        tracing::debug!("Rename request at {:?}", params.text_document_position);
-        // TODO: Implement rename
-        Ok(None)
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let new_name = params.new_name;
+        
+        tracing::debug!("Rename request for {} at {:?} to '{}'", uri, position, new_name);
+        
+        let document = match self.documents.get(&uri) {
+            Some(doc) => doc,
+            None => return Ok(None),
+        };
+        
+        // Use our rename handler
+        use crate::handlers::rename;
+        Ok(rename::rename_symbol(&document.text, &uri, position, &new_name))
+    }
+
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> Result<Option<SemanticTokensResult>> {
+        let uri = params.text_document.uri;
+        tracing::debug!("Semantic tokens request for {}", uri);
+        
+        let document = match self.documents.get(&uri) {
+            Some(doc) => doc,
+            None => return Ok(None),
+        };
+        
+        // Use our semantic tokens handler
+        use crate::handlers::semantic_tokens;
+        Ok(semantic_tokens::get_semantic_tokens(&document.text, &uri))
     }
 }
 
