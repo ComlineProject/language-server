@@ -147,9 +147,23 @@ impl LanguageServer for Backend {
         &self,
         params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>> {
-        tracing::debug!("Document symbols request for {}", params.text_document.uri);
-        // TODO: Implement document symbols
-        Ok(None)
+        let uri = params.text_document.uri;
+        tracing::debug!("Document symbols request for {}", uri);
+        
+        let document = match self.documents.get(&uri) {
+            Some(doc) => doc,
+            None => return Ok(None),
+        };
+        
+        // Use our symbols handler
+        use crate::handlers::symbols;
+        let doc_symbols = symbols::get_document_symbols(&document.text, &uri);
+        
+        if doc_symbols.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(DocumentSymbolResponse::Nested(doc_symbols)))
+        }
     }
 
     async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
