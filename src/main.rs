@@ -14,6 +14,7 @@ mod analysis {
 }
 
 mod handlers {
+    pub mod code_actions;
     pub mod completion;
     pub mod definition;
     pub mod formatting;
@@ -21,6 +22,7 @@ mod handlers {
     pub mod references;
     pub mod rename;
     pub mod semantic_tokens;
+    pub mod signature_help;
     pub mod symbols;
 }
 
