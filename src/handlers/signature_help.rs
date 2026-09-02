@@ -1,7 +1,7 @@
 // Signature help handler - provides function signature information
 
 use tower_lsp::lsp_types::{
-    ParameterInformation, ParameterLabel, Position, SignatureHelp, SignatureInformation, Url,
+    Position, SignatureHelp, Url,
 };
 
 /// Get signature help for function calls

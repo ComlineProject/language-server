@@ -1,6 +1,6 @@
 // Symbol provider for LSP document symbols
 
-use crate::analysis::symbols::{self, SymbolTable};
+use crate::analysis::symbols;
 use crate::parser;
 use tower_lsp::lsp_types::{DocumentSymbol, Range, SymbolInformation, SymbolKind, Url};
 
@@ -125,7 +125,7 @@ fn byte_offset_to_range(source: &str, offset: usize, length: usize) -> Range {
 }
 
 /// Get workspace symbols (basic implementation - searches all symbols by name)
-pub fn get_workspace_symbols(query: &str) -> Vec<SymbolInformation> {
+pub fn get_workspace_symbols(_query: &str) -> Vec<SymbolInformation> {
     // TODO: Implement workspace-wide symbol search
     // This would require maintaining a workspace-level symbol index
     vec![]

@@ -4,7 +4,7 @@ use crate::analysis::symbols;
 use crate::parser;
 use crate::util::position_to_offset;
 use comline_core::schema::idl::grammar::{Declaration, Type};
-use tower_lsp::lsp_types::{Hover, HoverContents, HoverParams, MarkedString, Position, Url};
+use tower_lsp::lsp_types::{Hover, HoverContents, MarkedString, Position, Url};
 
 /// Get hover information at a position
 pub fn get_hover_info(source: &str, uri: &Url, position: Position) -> Option<Hover> {
@@ -164,10 +164,10 @@ fn create_field_hover(info: &str) -> Hover {
 /// Format a type for display
 fn format_type(ty: &Type) -> String {
     match ty {
-        Type::I8(_) => "i8".to_string(),
-        Type::I16(_) => "i16".to_string(),
-        Type::I32(_) => "i32".to_string(),
-        Type::I64(_) => "i64".to_string(),
+        Type::S8(_) => "s8".to_string(),
+        Type::S16(_) => "s16".to_string(),
+        Type::S32(_) => "s32".to_string(),
+        Type::S64(_) => "s64".to_string(),
         Type::U8(_) => "u8".to_string(),
         Type::U16(_) => "u16".to_string(),
         Type::U32(_) => "u32".to_string(),
@@ -185,6 +185,13 @@ fn format_type(ty: &Type) -> String {
                 format!("{}[]", format_type(arr.elem_type()))
             }
         }
+        Type::Union(u) => u
+            .members()
+            .iter()
+            .map(format_type)
+            .collect::<Vec<_>>()
+            .join(" | "),
+        Type::Unit(_) => "()".to_string(),
     }
 }
 
@@ -220,7 +227,7 @@ fn find_type_at_position(document: &comline_core::schema::idl::grammar::Document
         _ => {
             // Check if it's a user-defined type
             for decl in &document.0 {
-                match decl {
+                match &**decl {
                     Declaration::Struct(s) if s.name() == word => return Some("struct"),
                     Declaration::Enum(e) if e.name() == word => return Some("enum"),
                     Declaration::Protocol(p) if p.name() == word => return Some("protocol"),
@@ -241,7 +248,7 @@ fn find_field_info(_document: &comline_core::schema::idl::grammar::Document, _wo
 // Helper functions to find declarations
 fn find_struct_declaration<'a>(document: &'a comline_core::schema::idl::grammar::Document, name: &str) -> Option<&'a comline_core::schema::idl::grammar::Struct> {
     for decl in &document.0 {
-        if let Declaration::Struct(s) = decl {
+        if let Declaration::Struct(s) = &**decl {
             if s.name() == name {
                 return Some(s);
             }
@@ -252,7 +259,7 @@ fn find_struct_declaration<'a>(document: &'a comline_core::schema::idl::grammar:
 
 fn find_enum_declaration<'a>(document: &'a comline_core::schema::idl::grammar::Document, name: &str) -> Option<&'a comline_core::schema::idl::grammar::Enum> {
     for decl in &document.0 {
-        if let Declaration::Enum(e) = decl {
+        if let Declaration::Enum(e) = &**decl {
             if e.name() == name {
                 return Some(e);
             }
@@ -263,7 +270,7 @@ fn find_enum_declaration<'a>(document: &'a comline_core::schema::idl::grammar::D
 
 fn find_protocol_declaration<'a>(document: &'a comline_core::schema::idl::grammar::Document, name: &str) -> Option<&'a comline_core::schema::idl::grammar::Protocol> {
     for decl in &document.0 {
-        if let Declaration::Protocol(p) = decl {
+        if let Declaration::Protocol(p) = &**decl {
             if p.name() == name {
                 return Some(p);
             }
@@ -274,7 +281,7 @@ fn find_protocol_declaration<'a>(document: &'a comline_core::schema::idl::gramma
 
 fn find_const_declaration<'a>(document: &'a comline_core::schema::idl::grammar::Document, name: &str) -> Option<&'a comline_core::schema::idl::grammar::Const> {
     for decl in &document.0 {
-        if let Declaration::Const(c) = decl {
+        if let Declaration::Const(c) = &**decl {
             if c.name() == name {
                 return Some(c);
             }

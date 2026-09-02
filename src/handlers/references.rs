@@ -57,7 +57,7 @@ pub fn find_references(
     
     // Search for type references in all declarations
     for decl in &document.0 {
-        match decl {
+        match &**decl {
             Declaration::Struct(s) => {
                 // Check each field type
                 for field in s.fields() {

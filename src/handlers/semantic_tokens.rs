@@ -1,7 +1,7 @@
 // Semantic tokens handler - provides enhanced syntax highlighting
 
 use tower_lsp::lsp_types::{
-    SemanticToken, SemanticTokenType, SemanticTokens, SemanticTokensResult, Url,
+    SemanticTokens, SemanticTokensResult, Url,
 };
 
 /// Generate semantic tokens for a document (basic stub implementation)

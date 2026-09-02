@@ -3,7 +3,7 @@
 use crate::analysis::symbols;
 use crate::parser;
 use crate::util::position_to_offset;
-use tower_lsp::lsp_types::{GotoDefinitionResponse, Location, Position, Url};
+use tower_lsp::lsp_types::{GotoDefinitionResponse, Position, Url};
 
 /// Find the definition of a symbol at a position
 pub fn find_definition(source: &str, uri: &Url, position: Position) -> Option<GotoDefinitionResponse> {
