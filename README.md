@@ -11,19 +11,23 @@ A Language Server Protocol (LSP) implementation for [Comline](https://github.com
 - **Hover Information** - Rich tooltips showing full type definitions and signatures
 - **Go to Definition** - Jump from type references to their declarations
 - **Find References** - Locate all usages of a symbol (with include/exclude declaration option)
-- **Auto-Completion** - Context-aware code suggestions:
-  - Keywords with snippets (`struct`, `enum`, `protocol`, `const`, `use`, `import`)
-  - Primitive types (i8-i64, u8-u64, f32/f64, string, bool)
-  - User-defined types (all structs, enums, protocols from current file)
-  - Context detection (type position, top-level, struct body)
+- **Auto-Completion** - Context-aware code suggestions (keywords, primitives, user types)
+- **Semantic Tokens** - Comline syntax highlighting from a shared lexer
 
-### 🚧 Planned
+### 🚧 Rougher / next
 
-- Find References - Locate all usages of a symbol
-- Auto-Completion - Context-aware code completion
-- Rename Symbol - Safe refactoring across files
-- Code Formatting - Automatic code formatting
-- Semantic Tokens - Enhanced syntax highlighting
+- Rename Symbol, Code Formatting, Signature Help, Code Actions — present but thin
+- Cross-file `use` resolution (analysis is single-file today)
+- AST-accurate spans (declaration ranges use a text-search heuristic)
+
+## Library
+
+The crate is also an **analysis library**. `--no-default-features` drops the
+`server` feature (`tower-lsp`, `tokio`, the doc store, the `comline-lsp` bin),
+leaving `parser` + `analysis` + `handlers` over `lsp-types` and `comline-core` —
+which **builds for `wasm32-unknown-unknown`**. The Comline playground links it
+that way so its browser editor runs the *same* diagnostics, hover, completion
+and highlighting as the LSP.
 
 ## Installation
 

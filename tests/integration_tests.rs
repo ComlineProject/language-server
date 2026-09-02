@@ -3,7 +3,7 @@
 mod fixtures;
 
 use comline_language_server::document::DocumentStore;
-use tower_lsp::lsp_types::*;
+use lsp_types::*;
 
 #[test]
 fn test_document_store() {

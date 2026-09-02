@@ -1,6 +1,6 @@
 // Signature help handler - provides function signature information
 
-use tower_lsp::lsp_types::{
+use lsp_types::{
     Position, SignatureHelp, Url,
 };
 

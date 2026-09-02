@@ -4,7 +4,7 @@ use crate::analysis::symbols;
 use crate::parser;
 use crate::util::{byte_range_to_lsp_range, position_to_offset};
 use comline_core::schema::idl::grammar::{Declaration, Type};
-use tower_lsp::lsp_types::{Location, Position, Url};
+use lsp_types::{Location, Position, Url};
 
 /// Find all references to a symbol at a position
 pub fn find_references(

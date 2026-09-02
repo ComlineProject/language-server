@@ -2,7 +2,7 @@
 
 use crate::analysis::symbols;
 use crate::parser;
-use tower_lsp::lsp_types::{DocumentSymbol, Range, SymbolInformation, SymbolKind, Url};
+use lsp_types::{DocumentSymbol, Range, SymbolInformation, SymbolKind, Url};
 
 /// Get document symbols for outline view
 #[allow(deprecated)] // DocumentSymbol uses deprecated fields
@@ -104,7 +104,7 @@ fn find_child_range(source: &str, child_name: &str, parent_name: &str) -> Range 
 
 /// Convert byte offset to LSP Range
 fn byte_offset_to_range(source: &str, offset: usize, length: usize) -> Range {
-    use tower_lsp::lsp_types::Position;
+    use lsp_types::Position;
     
     let line_starts: Vec<usize> = std::iter::once(0)
         .chain(source.match_indices('\n').map(|(i, _)| i + 1))

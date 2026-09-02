@@ -1,6 +1,6 @@
 // Code actions handler - provides quick fixes and refactorings
 
-use tower_lsp::lsp_types::{CodeActionOrCommand, CodeActionParams, Url};
+use lsp_types::{CodeActionOrCommand, CodeActionParams, Url};
 
 /// Get code actions for a given range
 pub fn get_code_actions(
@@ -28,9 +28,9 @@ mod tests {
         let source = "struct User {}";
         let uri = Url::parse("file:///test.ids").unwrap();
         let params = CodeActionParams {
-            text_document: tower_lsp::lsp_types::TextDocumentIdentifier { uri: uri.clone() },
-            range: tower_lsp::lsp_types::Range::default(),
-            context: tower_lsp::lsp_types::CodeActionContext {
+            text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
+            range: lsp_types::Range::default(),
+            context: lsp_types::CodeActionContext {
                 diagnostics: vec![],
                 only: None,
                 trigger_kind: None,

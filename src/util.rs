@@ -1,4 +1,4 @@
-use tower_lsp::lsp_types::{Position, Range};
+use lsp_types::{Position, Range};
 
 /// Convert LSP Position to byte offset in text
 pub fn position_to_offset(text: &str, position: Position) -> Option<usize> {

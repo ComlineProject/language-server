@@ -1,6 +1,6 @@
 // Basic test fixtures for the LSP server
 
-use tower_lsp::lsp_types::*;
+use lsp_types::*;
 
 /// Create a simple test document
 pub fn create_test_document() -> (Url, String) {

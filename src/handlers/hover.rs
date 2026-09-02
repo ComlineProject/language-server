@@ -4,7 +4,7 @@ use crate::analysis::symbols;
 use crate::parser;
 use crate::util::position_to_offset;
 use comline_core::schema::idl::grammar::{Declaration, Type};
-use tower_lsp::lsp_types::{Hover, HoverContents, MarkedString, Position, Url};
+use lsp_types::{Hover, HoverContents, MarkedString, Position, Url};
 
 /// Get hover information at a position
 pub fn get_hover_info(source: &str, uri: &Url, position: Position) -> Option<Hover> {
@@ -41,7 +41,7 @@ pub fn get_hover_info(source: &str, uri: &Url, position: Position) -> Option<Hov
 
 /// Create hover for a symbol (struct, enum, protocol, const)
 fn create_symbol_hover(symbol: &symbols::Symbol, document: &comline_core::schema::idl::grammar::Document) -> Hover {
-    use tower_lsp::lsp_types::SymbolKind;
+    use lsp_types::SymbolKind;
     
     let mut contents = vec![];
     
