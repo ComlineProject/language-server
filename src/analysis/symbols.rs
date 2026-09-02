@@ -65,11 +65,11 @@ pub fn build_symbol_table(document: &Document, uri: &Url, source: &str) -> Symbo
     let mut table = SymbolTable::new();
     
     // Track line starts for position calculation
-    let line_starts = build_line_starts(source);
+    let _line_starts = build_line_starts(source);
     
-    // Walk through all declarations
+    // Walk through all declarations (each is `Spanned<Declaration>` — deref to match)
     for declaration in &document.0 {
-        match declaration {
+        match &**declaration {
             Declaration::Struct(s) => {
                 let name = s.name();
                 let children: Vec<String> = s.fields().iter().map(|f| f.name()).collect();
@@ -146,8 +146,12 @@ pub fn build_symbol_table(document: &Document, uri: &Url, source: &str) -> Symbo
                     },
                 );
             }
-            Declaration::Import(_) | Declaration::Use(_) => {
-                // Imports don't go in the symbol table (for now)
+            Declaration::Import(_)
+            | Declaration::Use(_)
+            | Declaration::Error(_)
+            | Declaration::Settings(_)
+            | Declaration::Validator(_) => {
+                // Not surfaced in the outline (for now)
             }
         }
     }

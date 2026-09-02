@@ -1,6 +1,6 @@
 // Code actions handler - provides quick fixes and refactorings
 
-use tower_lsp::lsp_types::{CodeAction, CodeActionOrCommand, CodeActionParams, Url};
+use tower_lsp::lsp_types::{CodeActionOrCommand, CodeActionParams, Url};
 
 /// Get code actions for a given range
 pub fn get_code_actions(
