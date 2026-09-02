@@ -1,6 +1,6 @@
 use dashmap::DashMap;
 use std::sync::Arc;
-use tower_lsp::lsp_types::Url;
+use lsp_types::Url;
 
 /// Represents a document in the workspace
 #[derive(Debug, Clone)]

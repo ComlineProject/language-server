@@ -1,6 +1,6 @@
 // Formatting handler - formats Comline code
 
-use tower_lsp::lsp_types::{Position, Range, TextEdit};
+use lsp_types::{Position, Range, TextEdit};
 
 /// Format an entire document
 pub fn format_document(source: &str) -> Vec<TextEdit> {

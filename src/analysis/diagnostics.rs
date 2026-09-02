@@ -5,7 +5,7 @@ use comline_core::schema::idl::grammar::Document;
 use comline_core::schema::ir::compiler::interpreter::incremental::IncrementalInterpreter;
 use comline_core::schema::ir::compiler::Compile;
 use comline_core::schema::ir::validation;
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
+use lsp_types::{Diagnostic, DiagnosticSeverity};
 
 /// Semantic diagnostics from `comline-core`'s validation pass — undefined type
 /// references, duplicate declarations, and the like: the same checks

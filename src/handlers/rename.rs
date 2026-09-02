@@ -4,7 +4,7 @@ use crate::analysis::symbols;
 use crate::parser;
 use crate::util::position_to_offset;
 use std::collections::HashMap;
-use tower_lsp::lsp_types::{Position, TextEdit, Url, WorkspaceEdit};
+use lsp_types::{Position, TextEdit, Url, WorkspaceEdit};
 
 /// Rename a symbol at a position to a new name
 pub fn rename_symbol(

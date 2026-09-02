@@ -1,36 +1,12 @@
+//! The `comline-lsp` binary — a `tower-lsp` stdio server over the analysis
+//! library. Built only with the `server` feature (see Cargo.toml).
+
+use comline_language_server::backend::Backend;
 use tower_lsp::{LspService, Server};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-mod backend;
-mod document;
-mod parser;
-mod util;
-
-mod analysis {
-    pub mod diagnostics;
-    pub mod imports;
-    pub mod symbols;
-    pub mod types;
-}
-
-mod handlers {
-    pub mod code_actions;
-    pub mod completion;
-    pub mod definition;
-    pub mod formatting;
-    pub mod hover;
-    pub mod references;
-    pub mod rename;
-    pub mod semantic_tokens;
-    pub mod signature_help;
-    pub mod symbols;
-}
-
-use backend::Backend;
-
 #[tokio::main]
 async fn main() {
-    // Initialize tracing for logging
     tracing_subscriber::registry()
         .with(fmt::layer().with_writer(std::io::stderr))
         .with(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
@@ -38,10 +14,7 @@ async fn main() {
 
     tracing::info!("Starting Comline Language Server");
 
-    // Create the LSP service
-    let (service, socket) = LspService::new(|client| Backend::new(client));
-
-    // Start the server using stdio
+    let (service, socket) = LspService::new(Backend::new);
     Server::new(tokio::io::stdin(), tokio::io::stdout(), socket)
         .serve(service)
         .await;

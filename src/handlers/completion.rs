@@ -3,7 +3,7 @@
 use crate::analysis::symbols;
 use crate::parser;
 use crate::util::position_to_offset;
-use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, Position, Url};
+use lsp_types::{CompletionItem, CompletionItemKind, Position, Url};
 
 /// Get completion suggestions at a position
 pub fn get_completions(source: &str, uri: &Url, position: Position) -> Vec<CompletionItem> {
@@ -113,7 +113,7 @@ fn get_keyword_completions() -> Vec<CompletionItem> {
             kind: Some(CompletionItemKind::KEYWORD),
             detail: Some("Define a structure".to_string()),
             insert_text: Some("struct $1 {\n\t$0\n}".to_string()),
-            insert_text_format: Some(tower_lsp::lsp_types::InsertTextFormat::SNIPPET),
+            insert_text_format: Some(lsp_types::InsertTextFormat::SNIPPET),
             ..Default::default()
         },
         CompletionItem {
@@ -121,7 +121,7 @@ fn get_keyword_completions() -> Vec<CompletionItem> {
             kind: Some(CompletionItemKind::KEYWORD),
             detail: Some("Define an enumeration".to_string()),
             insert_text: Some("enum $1 {\n\t$0\n}".to_string()),
-            insert_text_format: Some(tower_lsp::lsp_types::InsertTextFormat::SNIPPET),
+            insert_text_format: Some(lsp_types::InsertTextFormat::SNIPPET),
             ..Default::default()
         },
         CompletionItem {
@@ -129,7 +129,7 @@ fn get_keyword_completions() -> Vec<CompletionItem> {
             kind: Some(CompletionItemKind::KEYWORD),
             detail: Some("Define a protocol".to_string()),
             insert_text: Some("protocol $1 {\n\t$0\n}".to_string()),
-            insert_text_format: Some(tower_lsp::lsp_types::InsertTextFormat::SNIPPET),
+            insert_text_format: Some(lsp_types::InsertTextFormat::SNIPPET),
             ..Default::default()
         },
         CompletionItem {
@@ -137,7 +137,7 @@ fn get_keyword_completions() -> Vec<CompletionItem> {
             kind: Some(CompletionItemKind::KEYWORD),
             detail: Some("Define a constant".to_string()),
             insert_text: Some("const $1: $2 = $0".to_string()),
-            insert_text_format: Some(tower_lsp::lsp_types::InsertTextFormat::SNIPPET),
+            insert_text_format: Some(lsp_types::InsertTextFormat::SNIPPET),
             ..Default::default()
         },
         CompletionItem {
@@ -250,9 +250,9 @@ fn get_type_completions(symbol_table: &symbols::SymbolTable) -> Vec<CompletionIt
         .iter()
         .map(|symbol| {
             let kind = match symbol.kind {
-                tower_lsp::lsp_types::SymbolKind::STRUCT => CompletionItemKind::STRUCT,
-                tower_lsp::lsp_types::SymbolKind::ENUM => CompletionItemKind::ENUM,
-                tower_lsp::lsp_types::SymbolKind::INTERFACE => CompletionItemKind::INTERFACE,
+                lsp_types::SymbolKind::STRUCT => CompletionItemKind::STRUCT,
+                lsp_types::SymbolKind::ENUM => CompletionItemKind::ENUM,
+                lsp_types::SymbolKind::INTERFACE => CompletionItemKind::INTERFACE,
                 _ => CompletionItemKind::CLASS,
             };
             

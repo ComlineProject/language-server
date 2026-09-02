@@ -6,7 +6,7 @@ use crate::document::DocumentStore;
 
 //
 use tower_lsp::jsonrpc::Result;
-use tower_lsp::lsp_types::*;
+use lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
 pub struct Backend {
@@ -51,17 +51,17 @@ impl LanguageServer for Backend {
                     SemanticTokensServerCapabilities::SemanticTokensOptions(
                         SemanticTokensOptions {
                             legend: SemanticTokensLegend {
+                                // Order must match the indices in
+                                // `handlers::semantic_tokens` (`LEGEND_TYPES`).
                                 token_types: vec![
                                     SemanticTokenType::KEYWORD,
                                     SemanticTokenType::TYPE,
-                                    SemanticTokenType::STRUCT,
-                                    SemanticTokenType::ENUM,
-                                    SemanticTokenType::INTERFACE,
-                                    SemanticTokenType::FUNCTION,
-                                    SemanticTokenType::VARIABLE,
-                                    SemanticTokenType::PROPERTY,
+                                    SemanticTokenType::STRING,
+                                    SemanticTokenType::COMMENT,
+                                    SemanticTokenType::NUMBER,
+                                    SemanticTokenType::DECORATOR,
                                 ],
-                                token_modifiers: vec![SemanticTokenModifier::DECLARATION],
+                                token_modifiers: vec![],
                             },
                             range: Some(false),
                             full: Some(SemanticTokensFullOptions::Bool(true)),

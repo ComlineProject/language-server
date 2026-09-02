@@ -2,7 +2,7 @@
 
 use comline_core::schema::idl::grammar::{Declaration, Document};
 use std::collections::HashMap;
-use tower_lsp::lsp_types::{Location, Position, Range, SymbolKind, Url};
+use lsp_types::{Location, Position, Range, SymbolKind, Url};
 
 #[derive(Debug, Clone)]
 pub struct Symbol {
