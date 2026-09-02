@@ -1,5 +1,10 @@
-use crate::document::DocumentStore;
+//
 use std::sync::Arc;
+
+//
+use crate::document::DocumentStore;
+
+//
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
@@ -287,9 +292,14 @@ impl Backend {
         // Parse the document
         match parser::parse(&document.text) {
             Ok(result) => {
-                // Generate LSP diagnostics from parse errors
-                let lsp_diagnostics = diagnostics::generate_diagnostics(&document.text, &result.errors);
-                
+                // Parse-error diagnostics, plus `comline-core`'s validation
+                // pass once the tree is well-formed.
+                let lsp_diagnostics = diagnostics::all_diagnostics(
+                    &document.text,
+                    &result.errors,
+                    result.document.as_ref(),
+                );
+
                 // Log parse results
                 if result.is_ok() {
                     if let Some(doc) = &result.document {

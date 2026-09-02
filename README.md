@@ -6,7 +6,7 @@ A Language Server Protocol (LSP) implementation for [Comline](https://github.com
 
 ### ✅ Fully Implemented
 
-- **Diagnostics** - Real-time syntax error detection and reporting
+- **Diagnostics** - Real-time syntax errors plus `comline-core`'s validation pass (undefined types, duplicate declarations, ...) — the same checks `comline build` runs
 - **Document Symbols** - Hierarchical outline view of structs, enums, protocols, and constants
 - **Hover Information** - Rich tooltips showing full type definitions and signatures
 - **Go to Definition** - Jump from type references to their declarations
