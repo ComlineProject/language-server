@@ -14,7 +14,13 @@ pub fn get_completions(source: &str, uri: &Url, position: Position) -> Vec<Compl
         Some(o) => o,
         None => return get_keyword_completions(),
     };
-    
+
+    // No code completion inside a `//` comment (docstrings included) or a
+    // string literal — the text there isn't Comline.
+    if in_comment_or_string(source, offset) {
+        return Vec::new();
+    }
+
     // Parse the document to get available types
     if let Ok(parse_result) = parser::parse(source) {
         if let Some(document) = parse_result.document {
@@ -58,6 +64,30 @@ pub fn get_completions(source: &str, uri: &Url, position: Position) -> Vec<Compl
     completions.extend(get_primitive_type_completions());
     
     completions
+}
+
+/// Is `offset` inside a `//` line comment or a `"…"` string on its line?
+/// Comline has no block comments and strings don't span lines, so a scan of
+/// the current line's prefix is enough.
+fn in_comment_or_string(source: &str, offset: usize) -> bool {
+    let offset = offset.min(source.len());
+    let line_start = source[..offset].rfind('\n').map_or(0, |i| i + 1);
+    let bytes = source.as_bytes();
+    let mut in_str = false;
+    let mut i = line_start;
+    while i < offset {
+        match bytes[i] {
+            b'\\' if in_str => {
+                i += 2;
+                continue;
+            }
+            b'"' => in_str = !in_str,
+            b'/' if !in_str && bytes.get(i + 1) == Some(&b'/') => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    in_str
 }
 
 /// Determine completion context based on position
@@ -320,11 +350,43 @@ mod tests {
         let source = "\n";
         let uri = Url::parse("file:///test.ids").unwrap();
         let position = Position::new(0, 0);
-        
+
         let completions = get_completions(source, &uri, position);
         // Should include keywords
         assert!(completions.iter().any(|c| c.label == "struct"));
         assert!(completions.iter().any(|c| c.label == "enum"));
+    }
+
+    #[test]
+    fn no_completions_inside_comments_or_strings() {
+        let uri = Url::parse("file:///test.ids").unwrap();
+
+        // inside a `///` docstring
+        let src = "/// Message that can be se\nstruct M {}\n";
+        assert!(get_completions(src, &uri, Position::new(0, 25)).is_empty());
+
+        // inside a `//` comment after code
+        let src = "struct M { a: u8 } // note he\n";
+        assert!(get_completions(src, &uri, Position::new(0, 27)).is_empty());
+
+        // inside a string literal
+        let src = "error E {\n    message = \"oops re\n}\n";
+        assert!(get_completions(src, &uri, Position::new(1, 20)).is_empty());
+
+        // code before a trailing comment on the same line still completes
+        let src = "struct M {\n    name:  // a field\n}\n";
+        assert!(!get_completions(src, &uri, Position::new(1, 10)).is_empty());
+    }
+
+    #[test]
+    fn in_comment_or_string_scans_one_line() {
+        assert!(in_comment_or_string("/// doc", 5));
+        assert!(in_comment_or_string("a: u8 // c", 9));
+        assert!(in_comment_or_string("x = \"unclosed", 10));
+        assert!(!in_comment_or_string("x = \"done\" ", 11));
+        assert!(!in_comment_or_string("struct M {", 9));
+        // a `//` inside a string is not a comment
+        assert!(in_comment_or_string("x = \"a // b", 8)); // still in the string
     }
     
     #[test]
