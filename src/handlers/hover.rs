@@ -6,36 +6,64 @@ use crate::util::position_to_offset;
 use comline_core::schema::idl::grammar::{Declaration, Type};
 use lsp_types::{Hover, HoverContents, MarkedString, Position, Url};
 
-/// Get hover information at a position
+/// Get hover information at a position, considering only this file.
 pub fn get_hover_info(source: &str, uri: &Url, position: Position) -> Option<Hover> {
+    get_hover_info_with_project(source, uri, position, &[])
+}
+
+/// Get hover information at a position, also searching `other_files` (every
+/// other file in the project, as `(uri, source)` pairs) for a struct/enum/
+/// protocol/const the hovered word might name if it isn't declared in this
+/// file. This is a flat, project-wide name lookup — first match wins — not a
+/// `use`-scoped resolution (mirrors the same simplification the playground's
+/// `describe_project` already uses for cross-file type references). Good
+/// enough to answer "what is this token", not a claim that it's actually
+/// imported here.
+pub fn get_hover_info_with_project(
+    source: &str,
+    uri: &Url,
+    position: Position,
+    other_files: &[(Url, String)],
+) -> Option<Hover> {
     // Convert position to byte offset
     let offset = position_to_offset(source, position)?;
-    
+
     // Parse the document
     let parse_result = parser::parse(source).ok()?;
     let document = parse_result.document?;
-    
+
     // Build symbol table
     let symbol_table = symbols::build_symbol_table(&document, uri, source);
-    
+
     // Find what's at this position
     let word = get_word_at_offset(source, offset)?;
-    
-    // Check if it's a symbol
+
+    // Check if it's a symbol in this file
     if let Some(symbol) = symbol_table.get(&word) {
         return Some(create_symbol_hover(symbol, &document));
     }
-    
+
+    // Check if it's a symbol declared in another project file
+    for (other_uri, other_source) in other_files {
+        let Some(other_document) = parser::parse(other_source).ok().and_then(|r| r.document) else {
+            continue; // a sibling file that doesn't currently parse shouldn't break this hover
+        };
+        let other_table = symbols::build_symbol_table(&other_document, other_uri, other_source);
+        if let Some(symbol) = other_table.get(&word) {
+            return Some(create_symbol_hover(symbol, &other_document));
+        }
+    }
+
     // Check if it's a type reference
     if let Some(type_info) = find_type_at_position(&document, &word) {
         return Some(create_type_hover(&word, type_info));
     }
-    
+
     // Check if it's a field reference
     if let Some(field_info) = find_field_info(&document, &word, offset, source) {
         return Some(create_field_hover(&field_info));
     }
-    
+
     None
 }
 
@@ -44,9 +72,9 @@ fn create_symbol_hover(symbol: &symbols::Symbol, document: &comline_core::schema
     use lsp_types::SymbolKind;
     
     let mut contents = vec![];
-    
-    // Add symbol signature
-    let signature = match symbol.kind {
+
+    // Add symbol signature, plus its doc-comment when the declaration has one
+    let (signature, doc) = match symbol.kind {
         SymbolKind::STRUCT => {
             // Find the struct to get its fields
             if let Some(s) = find_struct_declaration(document, &symbol.name) {
@@ -57,10 +85,10 @@ fn create_symbol_hover(symbol: &symbols::Symbol, document: &comline_core::schema
                         format!("  {}{}: {}", opt, f.name(), format_type(f.field_type()))
                     })
                     .collect();
-                
-                format!("struct {} {{\n{}\n}}", symbol.name, fields.join("\n"))
+
+                (format!("struct {} {{\n{}\n}}", symbol.name, fields.join("\n")), s.docstring())
             } else {
-                format!("struct {}", symbol.name)
+                (format!("struct {}", symbol.name), None)
             }
         }
         SymbolKind::ENUM => {
@@ -69,10 +97,10 @@ fn create_symbol_hover(symbol: &symbols::Symbol, document: &comline_core::schema
                     .iter()
                     .map(|v| format!("  {}", v.identifier().text))
                     .collect();
-                
-                format!("enum {} {{\n{}\n}}", symbol.name, variants.join("\n"))
+
+                (format!("enum {} {{\n{}\n}}", symbol.name, variants.join("\n")), e.docstring())
             } else {
-                format!("enum {}", symbol.name)
+                (format!("enum {}", symbol.name), None)
             }
         }
         SymbolKind::INTERFACE => {
@@ -90,34 +118,37 @@ fn create_symbol_hover(symbol: &symbols::Symbol, document: &comline_core::schema
                         } else {
                             String::new()
                         };
-                        
+
                         let ret = if let Some(rt) = f.return_type() {
                             format!(" -> {}", format_type(rt.return_type()))
                         } else {
                             String::new()
                         };
-                        
+
                         format!("  function {}({}){}", f.name(), args, ret)
                     })
                     .collect();
-                
-                format!("protocol {} {{\n{}\n}}", symbol.name, functions.join("\n"))
+
+                (format!("protocol {} {{\n{}\n}}", symbol.name, functions.join("\n")), p.docstring())
             } else {
-                format!("protocol {}", symbol.name)
+                (format!("protocol {}", symbol.name), None)
             }
         }
         SymbolKind::CONSTANT => {
             if let Some(c) = find_const_declaration(document, &symbol.name) {
-                format!("const {}: {}", c.name(), format_type(c.type_def()))
+                (format!("const {}: {}", c.name(), format_type(c.type_def())), c.docstring())
             } else {
-                format!("const {}", symbol.name)
+                (format!("const {}", symbol.name), None)
             }
         }
-        _ => symbol.name.clone()
+        _ => (symbol.name.clone(), None),
     };
-    
+
     contents.push(MarkedString::from_language_code("comline".to_string(), signature));
-    
+    if let Some(doc) = doc {
+        contents.push(MarkedString::from_markdown(doc));
+    }
+
     // Add detail
     if !symbol.children.is_empty() {
         let detail = match symbol.kind {
@@ -219,7 +250,7 @@ fn get_word_at_offset(source: &str, offset: usize) -> Option<String> {
 fn find_type_at_position(document: &comline_core::schema::idl::grammar::Document, word: &str) -> Option<&'static str> {
     // Check if it's a primitive type
     match word {
-        "i8" | "i16" | "i32" | "i64" => Some("integer type"),
+        "s8" | "s16" | "s32" | "s64" => Some("integer type"),
         "u8" | "u16" | "u32" | "u64" => Some("unsigned integer type"),
         "f32" | "f64" => Some("floating point type"),
         "bool" => Some("boolean type"),
@@ -340,8 +371,78 @@ struct User {
         let uri = Url::parse("file:///test.ids").unwrap();
         // Hover over "string" type
         let position = Position::new(2, 11);
-        
+
         let hover = get_hover_info(source, &uri, position);
         assert!(hover.is_some());
+    }
+
+    fn hover_text(hover: Hover) -> String {
+        match hover.contents {
+            HoverContents::Array(parts) => parts
+                .into_iter()
+                .map(|p| match p {
+                    MarkedString::String(s) => s,
+                    MarkedString::LanguageString(ls) => ls.value,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            HoverContents::Scalar(MarkedString::String(s)) => s,
+            HoverContents::Scalar(MarkedString::LanguageString(ls)) => ls.value,
+            HoverContents::Markup(m) => m.value,
+        }
+    }
+
+    #[test]
+    fn test_hover_on_struct_declared_in_another_file() {
+        // `chat.ids` references `Message`, declared only in `types.ids`.
+        let chat_source = r#"
+protocol Chat {
+    function send(text: string) -> Message;
+}
+"#;
+        let types_source = "struct Message {\n    text: string\n    seq: u64\n}\n";
+
+        let chat_uri = Url::parse("file:///chat.ids").unwrap();
+        let types_uri = Url::parse("file:///types.ids").unwrap();
+
+        // Hover over "Message" in the return-type position.
+        let position = Position::new(2, 38);
+
+        let hover = get_hover_info_with_project(
+            chat_source,
+            &chat_uri,
+            position,
+            &[(types_uri, types_source.to_string())],
+        );
+
+        let hover = hover.expect("cross-file struct hover should resolve");
+        let text = hover_text(hover);
+        assert!(text.contains("struct Message"), "got: {text}");
+        assert!(text.contains("text"), "got: {text}");
+        assert!(text.contains("seq"), "got: {text}");
+    }
+
+    #[test]
+    fn test_hover_shows_docstring() {
+        let source = "/// Hello\nstruct Message {\n    text: string\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        // Hover over "Message" in the declaration itself.
+        let position = Position::new(1, 8);
+
+        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let text = hover_text(hover);
+        assert!(text.contains("Hello"), "got: {text}");
+    }
+
+    #[test]
+    fn test_hover_on_signed_int_keyword() {
+        let source = "struct Sample {\n    value: s16\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        // Hover over "s16" on line 1.
+        let position = Position::new(1, 12);
+
+        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let text = hover_text(hover);
+        assert!(text.contains("integer type"), "got: {text}");
     }
 }

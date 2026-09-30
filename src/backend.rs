@@ -131,10 +131,26 @@ impl LanguageServer for Backend {
             Some(doc) => doc,
             None => return Ok(None),
         };
-        
+
+        // Every other file currently open as a buffer, so a cross-file type
+        // reference can still resolve (only covers open buffers, not the
+        // whole workspace — there's no workspace scan on `initialize`).
+        let other_files: Vec<(Url, String)> = self
+            .documents
+            .get_all_uris()
+            .into_iter()
+            .filter(|u| u != &uri)
+            .filter_map(|u| self.documents.get(&u).map(|d| (u, d.text)))
+            .collect();
+
         // Use our hover handler
         use crate::handlers::hover;
-        Ok(hover::get_hover_info(&document.text, &uri, position))
+        Ok(hover::get_hover_info_with_project(
+            &document.text,
+            &uri,
+            position,
+            &other_files,
+        ))
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
