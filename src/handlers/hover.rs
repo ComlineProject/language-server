@@ -3,7 +3,8 @@
 use crate::analysis::symbols;
 use crate::parser;
 use crate::util::position_to_offset;
-use comline_core::schema::idl::grammar::{Declaration, Type};
+use comline_core::schema::idl::grammar::{Declaration, Document, Type};
+use comline_core::schema::idl::size::{self, SizeLookup, SizeTarget, WireSize};
 use lsp_types::{Hover, HoverContents, MarkedString, Position, Url};
 
 /// Get hover information at a position, considering only this file.
@@ -38,19 +39,28 @@ pub fn get_hover_info_with_project(
     // Find what's at this position
     let word = get_word_at_offset(source, offset)?;
 
+    // Parse every sibling file once, up front, and keep them all alive for
+    // the rest of this call — not just whichever one happens to match the
+    // hovered word. A struct's fields can reference types declared in *any*
+    // other file, so size computation needs the whole set, not just the
+    // document the matched symbol itself lives in.
+    let other_docs: Vec<(&Url, &String, Document)> = other_files
+        .iter()
+        .filter_map(|(u, s)| parser::parse(s).ok()?.document.map(|d| (u, s, d)))
+        .collect();
+
+    let lookup = HoverSizeLookup { local: &document, others: &other_docs };
+
     // Check if it's a symbol in this file
     if let Some(symbol) = symbol_table.get(&word) {
-        return Some(create_symbol_hover(symbol, &document));
+        return Some(create_symbol_hover(symbol, &document, &lookup));
     }
 
     // Check if it's a symbol declared in another project file
-    for (other_uri, other_source) in other_files {
-        let Some(other_document) = parser::parse(other_source).ok().and_then(|r| r.document) else {
-            continue; // a sibling file that doesn't currently parse shouldn't break this hover
-        };
-        let other_table = symbols::build_symbol_table(&other_document, other_uri, other_source);
+    for (other_uri, other_source, other_document) in &other_docs {
+        let other_table = symbols::build_symbol_table(other_document, other_uri, other_source);
         if let Some(symbol) = other_table.get(&word) {
-            return Some(create_symbol_hover(symbol, &other_document));
+            return Some(create_symbol_hover(symbol, other_document, &lookup));
         }
     }
 
@@ -67,14 +77,81 @@ pub fn get_hover_info_with_project(
     None
 }
 
+/// Resolves a bare type name to its declaration across the active document
+/// plus every other project file — a flat, first-match scan (local document
+/// first, then `others` in order), the same simplification already used for
+/// cross-file *symbol* hover above. Backs [`size::size_of_type`] /
+/// [`size::size_of_struct`] for the size block in [`create_symbol_hover`].
+struct HoverSizeLookup<'a> {
+    local: &'a Document,
+    others: &'a [(&'a Url, &'a String, Document)],
+}
+
+impl<'a> SizeLookup for HoverSizeLookup<'a> {
+    fn resolve(&self, bare_name: &str) -> Option<SizeTarget<'_>> {
+        if let Some(s) = find_struct_declaration(self.local, bare_name) {
+            return Some(SizeTarget::Struct(s));
+        }
+        if let Some(e) = find_enum_declaration(self.local, bare_name) {
+            return Some(SizeTarget::Enum(e));
+        }
+        for (_, _, doc) in self.others {
+            if let Some(s) = find_struct_declaration(doc, bare_name) {
+                return Some(SizeTarget::Struct(s));
+            }
+            if let Some(e) = find_enum_declaration(doc, bare_name) {
+                return Some(SizeTarget::Enum(e));
+            }
+        }
+        None
+    }
+}
+
+/// Render a computed size as the one-line summary hover shows for a struct
+/// or enum: `*wire size (fixed, raw-packed estimate): 16 bytes*`, `*wire
+/// size: variable*`, or nothing printable (`*wire size: unknown*`) when a
+/// reference doesn't resolve or a cycle was hit.
+fn format_wire_size(size: WireSize) -> String {
+    match size {
+        WireSize::Fixed(bytes) => {
+            format!("*wire size (fixed, raw-packed estimate): {bytes} bytes ({} bits)*", bytes * 8)
+        }
+        WireSize::Variable => "*wire size: variable*".to_string(),
+        WireSize::Unknown => "*wire size: unknown*".to_string(),
+    }
+}
+
+/// Per-field breakdown line for a struct's size block, one field per line:
+/// `- name: 8 bytes` / `- name: variable`.
+fn render_field_sizes(s: &comline_core::schema::idl::grammar::Struct, lookup: &HoverSizeLookup) -> String {
+    s.fields()
+        .iter()
+        .map(|f| {
+            let field_size = if f.optional() {
+                WireSize::Variable
+            } else {
+                size::size_of_type(f.field_type(), lookup)
+            };
+            let rendered = match field_size {
+                WireSize::Fixed(bytes) => format!("{bytes} bytes"),
+                WireSize::Variable => "variable".to_string(),
+                WireSize::Unknown => "unknown".to_string(),
+            };
+            format!("- {}: {}", f.name(), rendered)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Create hover for a symbol (struct, enum, protocol, const)
-fn create_symbol_hover(symbol: &symbols::Symbol, document: &comline_core::schema::idl::grammar::Document) -> Hover {
+fn create_symbol_hover(symbol: &symbols::Symbol, document: &Document, lookup: &HoverSizeLookup) -> Hover {
     use lsp_types::SymbolKind;
-    
+
     let mut contents = vec![];
 
-    // Add symbol signature, plus its doc-comment when the declaration has one
-    let (signature, doc) = match symbol.kind {
+    // Add symbol signature, its doc-comment when present, and (struct/enum
+    // only — where "total size" is meaningful) a wire-size estimate block.
+    let (signature, doc, size_block) = match symbol.kind {
         SymbolKind::STRUCT => {
             // Find the struct to get its fields
             if let Some(s) = find_struct_declaration(document, &symbol.name) {
@@ -86,9 +163,16 @@ fn create_symbol_hover(symbol: &symbols::Symbol, document: &comline_core::schema
                     })
                     .collect();
 
-                (format!("struct {} {{\n{}\n}}", symbol.name, fields.join("\n")), s.docstring())
+                let total = size::size_of_struct(s, lookup);
+                let size_block = format!("{}\n{}", format_wire_size(total), render_field_sizes(s, lookup));
+
+                (
+                    format!("struct {} {{\n{}\n}}", symbol.name, fields.join("\n")),
+                    s.docstring(),
+                    Some(size_block),
+                )
             } else {
-                (format!("struct {}", symbol.name), None)
+                (format!("struct {}", symbol.name), None, None)
             }
         }
         SymbolKind::ENUM => {
@@ -98,9 +182,15 @@ fn create_symbol_hover(symbol: &symbols::Symbol, document: &comline_core::schema
                     .map(|v| format!("  {}", v.identifier().text))
                     .collect();
 
-                (format!("enum {} {{\n{}\n}}", symbol.name, variants.join("\n")), e.docstring())
+                let size_block = format_wire_size(size::size_of_enum(e));
+
+                (
+                    format!("enum {} {{\n{}\n}}", symbol.name, variants.join("\n")),
+                    e.docstring(),
+                    Some(size_block),
+                )
             } else {
-                (format!("enum {}", symbol.name), None)
+                (format!("enum {}", symbol.name), None, None)
             }
         }
         SymbolKind::INTERFACE => {
@@ -129,24 +219,27 @@ fn create_symbol_hover(symbol: &symbols::Symbol, document: &comline_core::schema
                     })
                     .collect();
 
-                (format!("protocol {} {{\n{}\n}}", symbol.name, functions.join("\n")), p.docstring())
+                (format!("protocol {} {{\n{}\n}}", symbol.name, functions.join("\n")), p.docstring(), None)
             } else {
-                (format!("protocol {}", symbol.name), None)
+                (format!("protocol {}", symbol.name), None, None)
             }
         }
         SymbolKind::CONSTANT => {
             if let Some(c) = find_const_declaration(document, &symbol.name) {
-                (format!("const {}: {}", c.name(), format_type(c.type_def())), c.docstring())
+                (format!("const {}: {}", c.name(), format_type(c.type_def())), c.docstring(), None)
             } else {
-                (format!("const {}", symbol.name), None)
+                (format!("const {}", symbol.name), None, None)
             }
         }
-        _ => (symbol.name.clone(), None),
+        _ => (symbol.name.clone(), None, None),
     };
 
     contents.push(MarkedString::from_language_code("comline".to_string(), signature));
     if let Some(doc) = doc {
         contents.push(MarkedString::from_markdown(doc));
+    }
+    if let Some(size_block) = size_block {
+        contents.push(MarkedString::from_markdown(size_block));
     }
 
     // Add detail
@@ -339,13 +432,50 @@ struct User {
         
         let hover = get_hover_info(source, &uri, position);
         assert!(hover.is_some());
-        
+
         let hover = hover.unwrap();
         if let HoverContents::Array(contents) = hover.contents {
             assert!(!contents.is_empty());
         }
     }
-    
+
+    #[test]
+    fn test_hover_shows_fixed_struct_size() {
+        let source = "struct Point {\n    x: u32\n    y: u32\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        // Hover over "Point" on line 0.
+        let position = Position::new(0, 8);
+
+        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let text = hover_text(hover);
+        assert!(text.contains("8 bytes"), "got: {text}");
+        assert!(text.contains("64 bits"), "got: {text}");
+    }
+
+    #[test]
+    fn test_hover_shows_variable_size_for_a_string_field() {
+        let source = "struct Note {\n    body: string\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        // Hover over "Note" on line 0.
+        let position = Position::new(0, 7);
+
+        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let text = hover_text(hover);
+        assert!(text.contains("variable"), "got: {text}");
+    }
+
+    #[test]
+    fn test_hover_shows_variable_size_for_an_optional_field() {
+        let source = "struct Thing {\n    optional id: u64\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        // Hover over "Thing" on line 0.
+        let position = Position::new(0, 8);
+
+        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let text = hover_text(hover);
+        assert!(text.contains("variable"), "got: {text}");
+    }
+
     #[test]
     fn test_hover_on_enum() {
         let source = r#"
@@ -420,6 +550,38 @@ protocol Chat {
         assert!(text.contains("struct Message"), "got: {text}");
         assert!(text.contains("text"), "got: {text}");
         assert!(text.contains("seq"), "got: {text}");
+        // `text: string` is unbounded, so the whole struct's size is too —
+        // the direct regression guard for the `other_docs`-retention
+        // restructuring that threads a cross-file SizeLookup through.
+        assert!(text.contains("variable"), "got: {text}");
+    }
+
+    #[test]
+    fn test_hover_on_a_cross_file_cycle_does_not_hang() {
+        // `A` (the active file) refers to `B`, declared only in a second
+        // file, which refers back to `A` — nothing else in the codebase
+        // guards this shape (comline-core's own cycle check is scoped to
+        // one file's units). This must resolve to *something* sane, not
+        // hang or panic.
+        let a_source = "struct A {\n    b: B\n}\n";
+        let b_source = "struct B {\n    a: A\n}\n";
+
+        let a_uri = Url::parse("file:///a.ids").unwrap();
+        let b_uri = Url::parse("file:///b.ids").unwrap();
+
+        // Hover over "A" in its own declaration.
+        let position = Position::new(0, 8);
+
+        let hover = get_hover_info_with_project(
+            a_source,
+            &a_uri,
+            position,
+            &[(b_uri, b_source.to_string())],
+        );
+
+        let hover = hover.expect("hover should resolve even through a cross-file cycle");
+        let text = hover_text(hover);
+        assert!(text.contains("unknown"), "got: {text}");
     }
 
     #[test]
