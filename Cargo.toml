@@ -43,3 +43,7 @@ dashmap = { version = "5.5", optional = true }
 # Re-comment before pushing; CI has no sibling checkout.
 # [patch."https://github.com/ComlineProject/core"]
 # comline-core = { path = "../core/core" }
+
+[profile.release]
+strip = true
+lto = true
