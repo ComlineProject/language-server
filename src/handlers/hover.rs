@@ -108,16 +108,19 @@ impl<'a> SizeLookup for HoverSizeLookup<'a> {
 }
 
 /// Render a computed size as the one-line summary hover shows for a struct
-/// or enum: `*wire size (fixed, raw-packed estimate): 16 bytes*`, `*wire
-/// size: variable*`, or nothing printable (`*wire size: unknown*`) when a
-/// reference doesn't resolve or a cycle was hit.
+/// or enum: `wire size (fixed, raw-packed estimate): 16 bytes (128 bits)`,
+/// `wire size: variable`, or `wire size: unknown` when a reference doesn't
+/// resolve or a cycle was hit. Plain text, not markdown emphasis — this
+/// joins the per-field breakdown into one multi-line prose block (see
+/// `create_symbol_hover`), not a single-line caption like the "*N fields*"
+/// detail line.
 fn format_wire_size(size: WireSize) -> String {
     match size {
         WireSize::Fixed(bytes) => {
-            format!("*wire size (fixed, raw-packed estimate): {bytes} bytes ({} bits)*", bytes * 8)
+            format!("wire size (fixed, raw-packed estimate): {bytes} bytes ({} bits)", bytes * 8)
         }
-        WireSize::Variable => "*wire size: variable*".to_string(),
-        WireSize::Unknown => "*wire size: unknown*".to_string(),
+        WireSize::Variable => "wire size: variable".to_string(),
+        WireSize::Unknown => "wire size: unknown".to_string(),
     }
 }
 
