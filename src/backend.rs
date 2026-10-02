@@ -23,6 +23,17 @@ impl Backend {
     }
 }
 
+/// Whether `uri` is a `.idp` (package/congregation config) document, as
+/// opposed to a `.ids` schema. `DocumentStore` carries no language id (just
+/// `{uri, version, text}`), so this is a plain extension check wherever it
+/// matters — every handler below except diagnostics is `.ids`-only (built
+/// against `comline_core::schema::idl::grammar::Document`) and must not run
+/// on `.idp` text, which the client's completion/hover providers already
+/// handle correctly on their own (see `comline-vscode`'s `idpSchema.ts`).
+fn is_idp(uri: &Url) -> bool {
+    uri.path().ends_with(".idp")
+}
+
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, _params: InitializeParams) -> Result<InitializeResult> {
@@ -124,9 +135,13 @@ impl LanguageServer for Backend {
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
-        
+
+        if is_idp(&uri) {
+            return Ok(None); // handled client-side — see idpSchema.ts
+        }
+
         tracing::debug!("Hover request for {} at {:?}", uri, position);
-        
+
         let document = match self.documents.get(&uri) {
             Some(doc) => doc,
             None => return Ok(None),
@@ -156,7 +171,11 @@ impl LanguageServer for Backend {
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
-        
+
+        if is_idp(&uri) {
+            return Ok(None); // handled client-side — see idpSchema.ts
+        }
+
         tracing::debug!("Completion request for {} at {:?}", uri, position);
         
         let document = match self.documents.get(&uri) {
@@ -181,7 +200,11 @@ impl LanguageServer for Backend {
     ) -> Result<Option<GotoDefinitionResponse>> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
-        
+
+        if is_idp(&uri) {
+            return Ok(None);
+        }
+
         tracing::debug!("Go-to-definition request for {} at {:?}", uri, position);
         
         let document = match self.documents.get(&uri) {
@@ -198,7 +221,11 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         let include_declaration = params.context.include_declaration;
-        
+
+        if is_idp(&uri) {
+            return Ok(None);
+        }
+
         tracing::debug!("Find references request for {} at {:?}", uri, position);
         
         let document = match self.documents.get(&uri) {
@@ -222,6 +249,11 @@ impl LanguageServer for Backend {
         params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>> {
         let uri = params.text_document.uri;
+
+        if is_idp(&uri) {
+            return Ok(None);
+        }
+
         tracing::debug!("Document symbols request for {}", uri);
         
         let document = match self.documents.get(&uri) {
@@ -242,6 +274,11 @@ impl LanguageServer for Backend {
 
     async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
         let uri = params.text_document.uri;
+
+        if is_idp(&uri) {
+            return Ok(None); // no formatter for .idp yet — see comline-vscode's stub provider
+        }
+
         tracing::debug!("Format request for {}", uri);
         
         let document = match self.documents.get(&uri) {
@@ -264,7 +301,11 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         let new_name = params.new_name;
-        
+
+        if is_idp(&uri) {
+            return Ok(None);
+        }
+
         tracing::debug!("Rename request for {} at {:?} to '{}'", uri, position, new_name);
         
         let document = match self.documents.get(&uri) {
@@ -282,6 +323,11 @@ impl LanguageServer for Backend {
         params: SemanticTokensParams,
     ) -> Result<Option<SemanticTokensResult>> {
         let uri = params.text_document.uri;
+
+        if is_idp(&uri) {
+            return Ok(None);
+        }
+
         tracing::debug!("Semantic tokens request for {}", uri);
         
         let document = match self.documents.get(&uri) {
@@ -295,11 +341,22 @@ impl LanguageServer for Backend {
 }
 
 impl Backend {
-    /// Parse a document and publish diagnostics
+    /// Parse a document and publish diagnostics — `.idp` and `.ids` take
+    /// different paths (different grammars, and `.idp` gets parse-error
+    /// diagnostics only, no semantic validation pass — see
+    /// `parser::IdpParseResult`'s doc comment for why).
     async fn parse_and_publish_diagnostics(&self, uri: &Url) {
+        if is_idp(uri) {
+            self.parse_and_publish_idp_diagnostics(uri).await;
+        } else {
+            self.parse_and_publish_ids_diagnostics(uri).await;
+        }
+    }
+
+    async fn parse_and_publish_ids_diagnostics(&self, uri: &Url) {
         use crate::analysis::diagnostics;
         use crate::parser;
-        
+
         let document = match self.documents.get(uri) {
             Some(doc) => doc,
             None => return,
@@ -324,7 +381,7 @@ impl Backend {
                 } else {
                     tracing::debug!("Parse errors for {}: {} error(s)", uri, result.errors.len());
                 }
-                
+
                 // Publish diagnostics to client
                 self.client
                     .publish_diagnostics(uri.clone(), lsp_diagnostics, Some(document.version))
@@ -333,6 +390,38 @@ impl Backend {
             Err(e) => {
                 tracing::error!("Failed to parse {}: {}", uri, e);
                 // Clear diagnostics on internal error
+                self.client
+                    .publish_diagnostics(uri.clone(), vec![], Some(document.version))
+                    .await;
+            }
+        }
+    }
+
+    async fn parse_and_publish_idp_diagnostics(&self, uri: &Url) {
+        use crate::analysis::diagnostics;
+        use crate::parser;
+
+        let document = match self.documents.get(uri) {
+            Some(doc) => doc,
+            None => return,
+        };
+
+        match parser::parse_idp(&document.text) {
+            Ok(result) => {
+                let lsp_diagnostics = diagnostics::generate_diagnostics(&document.text, &result.errors);
+
+                if result.has_errors() {
+                    tracing::debug!(".idp parse errors for {}: {} error(s)", uri, result.errors.len());
+                } else {
+                    tracing::debug!("Successfully parsed .idp {}", uri);
+                }
+
+                self.client
+                    .publish_diagnostics(uri.clone(), lsp_diagnostics, Some(document.version))
+                    .await;
+            }
+            Err(e) => {
+                tracing::error!("Failed to parse .idp {}: {}", uri, e);
                 self.client
                     .publish_diagnostics(uri.clone(), vec![], Some(document.version))
                     .await;

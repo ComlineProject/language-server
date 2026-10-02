@@ -310,5 +310,28 @@ struct User {
         };
         assert_eq!(format_error_message(&error), "Unexpected token: '???'");
     }
+
+    #[test]
+    fn idp_parse_errors_flow_through_generate_diagnostics() {
+        // generate_diagnostics takes a plain `&[ParseError]`, not an
+        // `.ids`-specific type — confirms it's genuinely reusable for
+        // `.idp`'s parse errors, not just incidentally compatible.
+        let source = "congregation test\nspecification_version =\n";
+        let result = crate::parser::parse_idp(source).unwrap();
+        assert!(result.has_errors());
+
+        let diagnostics = generate_diagnostics(source, &result.errors);
+        assert!(!diagnostics.is_empty());
+        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(diagnostics[0].source, Some("comline".to_string()));
+    }
+
+    #[test]
+    fn a_well_formed_idp_file_has_no_parse_errors() {
+        let source = "congregation test\nspecification_version = 1\n";
+        let result = crate::parser::parse_idp(source).unwrap();
+        assert!(!result.has_errors());
+        assert!(generate_diagnostics(source, &result.errors).is_empty());
+    }
 }
 

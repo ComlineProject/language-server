@@ -1,4 +1,5 @@
 use anyhow::Result;
+use comline_core::package::config::idl::grammar::{self as idp_grammar, Congregation};
 use comline_core::schema::idl::grammar::{self, Document};
 
 /// Parse result containing AST or errors
@@ -13,7 +14,7 @@ impl ParseResult {
     pub fn has_errors(&self) -> bool {
         !self.errors.is_empty()
     }
-    
+
     pub fn is_ok(&self) -> bool {
         self.document.is_some() && self.errors.is_empty()
     }
@@ -22,7 +23,7 @@ impl ParseResult {
 /// Parse Comline schema source code
 pub fn parse(source: &str) -> Result<ParseResult> {
     tracing::debug!("Parsing {} bytes of source", source.len());
-    
+
     match grammar::parse(source) {
         Ok(document) => {
             tracing::debug!("Parse successful, {} declarations", document.0.len());
@@ -34,6 +35,46 @@ pub fn parse(source: &str) -> Result<ParseResult> {
         Err(errors) => {
             tracing::debug!("Parse errors: {} error(s)", errors.len());
             Ok(ParseResult {
+                document: None,
+                errors,
+            })
+        }
+    }
+}
+
+/// Parse result for a `.idp` (package/congregation config) source — same
+/// shape as [`ParseResult`], over `Congregation` instead of `Document`.
+/// Diagnostics-only today: unlike `.ids`, there is no safe semantic
+/// validation pass to run alongside this — `comline-core`'s interpreter
+/// (`package::config::ir::interpreter::freezing`) `panic!`s on malformed
+/// input rather than returning a recoverable error, so it is never called
+/// from here (would crash the server on every malformed `.idp` keystroke).
+pub struct IdpParseResult {
+    pub document: Option<Congregation>,
+    pub errors: Vec<rust_sitter::errors::ParseError>,
+}
+
+impl IdpParseResult {
+    pub fn has_errors(&self) -> bool {
+        !self.errors.is_empty()
+    }
+}
+
+/// Parse `.idp` package/congregation config source code.
+pub fn parse_idp(source: &str) -> Result<IdpParseResult> {
+    tracing::debug!("Parsing {} bytes of .idp source", source.len());
+
+    match idp_grammar::parse(source) {
+        Ok(congregation) => {
+            tracing::debug!("Parse successful: congregation '{}'", congregation.name.value);
+            Ok(IdpParseResult {
+                document: Some(congregation),
+                errors: vec![],
+            })
+        }
+        Err(errors) => {
+            tracing::debug!(".idp parse errors: {} error(s)", errors.len());
+            Ok(IdpParseResult {
                 document: None,
                 errors,
             })
@@ -124,5 +165,21 @@ protocol Service {
         assert!(result.is_ok());
         let doc = result.document.unwrap();
         assert_eq!(get_declaration_count(&doc), 3);
+    }
+
+    #[test]
+    fn test_parse_idp() {
+        let source = "congregation test\nspecification_version = 1\n";
+        let result = parse_idp(source).unwrap();
+        assert!(!result.has_errors());
+        assert_eq!(result.document.unwrap().name.value, "test");
+    }
+
+    #[test]
+    fn test_parse_idp_error() {
+        let source = "congregation test\nspecification_version =\n";
+        let result = parse_idp(source).unwrap();
+        assert!(result.has_errors());
+        assert!(result.document.is_none());
     }
 }
