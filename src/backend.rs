@@ -275,10 +275,11 @@ impl LanguageServer for Backend {
     async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
         let uri = params.text_document.uri;
 
-        if is_idp(&uri) {
-            return Ok(None); // no formatter for .idp yet — see comline-vscode's stub provider
-        }
-
+        // No `is_idp` guard here, deliberately unlike every other handler —
+        // `handlers::formatting`'s brace-depth indentation pass is already
+        // fully language-agnostic (plain line/brace text processing, no
+        // dependency on `.ids`'s grammar types at all), and `.idp` nests
+        // with `{}` the same way `.ids` does, so it applies correctly as-is.
         tracing::debug!("Format request for {}", uri);
         
         let document = match self.documents.get(&uri) {

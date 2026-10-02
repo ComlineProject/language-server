@@ -2,7 +2,11 @@
 
 use lsp_types::{Position, Range, TextEdit};
 
-/// Format an entire document
+/// Format an entire document. Shared by `.ids` and `.idp` (see
+/// `backend.rs::formatting`, the only handler with no `is_idp` guard) —
+/// `basic_format` below is plain brace-depth text processing with no
+/// dependency on `.ids`'s grammar types, and `.idp` nests with `{}` the
+/// same way `.ids` does, so it applies correctly to both unchanged.
 pub fn format_document(source: &str) -> Vec<TextEdit> {
     // Basic formatting: normalize whitespace and indentation
     let formatted = basic_format(source);
@@ -84,8 +88,28 @@ mod tests {
     fn test_format_no_changes() {
         let source = "struct User {\n    name: string\n}\n";
         let edits = format_document(source);
-        
+
         // Should return no edits if already formatted
+        assert!(edits.is_empty() || edits[0].new_text == source);
+    }
+
+    #[test]
+    fn test_format_idp() {
+        // `.idp` nests with `{}` the same way `.ids` does — same formatter,
+        // no `.idp`-specific logic needed.
+        let source = "congregation test\ncode_generation = {\nlanguages = {\nrust#1.70.0 = {}\n}\n}";
+        let formatted = basic_format(source);
+
+        assert!(formatted.contains("    languages = {"));
+        assert!(formatted.contains("        rust#1.70.0 = {}"));
+    }
+
+    #[test]
+    fn test_format_idp_already_formatted_is_a_no_op() {
+        let source =
+            "congregation test\nspecification_version = 1\n\ncode_generation = {\n    languages = {\n        rust#1.70.0 = {}\n    }\n}\n";
+        let edits = format_document(source);
+
         assert!(edits.is_empty() || edits[0].new_text == source);
     }
 }
