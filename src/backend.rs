@@ -46,7 +46,21 @@ impl LanguageServer for Backend {
                 )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 completion_provider: Some(CompletionOptions {
-                    trigger_characters: Some(vec![".".to_string(), ":".to_string()]),
+                    // `:` / `(` / `>` (the back half of `->`) each mark the
+                    // start of a type position; ` ` re-triggers a fresh
+                    // request on every space so the suggestion list doesn't
+                    // just vanish when a type position's `:`/`->`/`(` is
+                    // followed by whitespace before the type itself (the
+                    // default "trigger on word characters only" behavior
+                    // otherwise closes the widget the moment a space is
+                    // typed, with nothing re-opening it) — safe to request
+                    // on every space since `completion::determine_context`
+                    // is itself whitespace-tolerant and returns an
+                    // appropriately narrow (often empty) list everywhere
+                    // else.
+                    trigger_characters: Some(
+                        [".", ":", "(", ">", " "].iter().map(|s| s.to_string()).collect(),
+                    ),
                     ..Default::default()
                 }),
                 definition_provider: Some(OneOf::Left(true)),
