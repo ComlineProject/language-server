@@ -95,6 +95,9 @@ impl<'a> SizeLookup for HoverSizeLookup<'a> {
         if let Some(e) = find_enum_declaration(self.local, bare_name) {
             return Some(SizeTarget::Enum(e));
         }
+        if let Some(t) = find_type_alias_declaration(self.local, bare_name) {
+            return Some(SizeTarget::Alias(t.target_type()));
+        }
         for (_, _, doc) in self.others {
             if let Some(s) = find_struct_declaration(doc, bare_name) {
                 return Some(SizeTarget::Struct(s));
@@ -102,9 +105,37 @@ impl<'a> SizeLookup for HoverSizeLookup<'a> {
             if let Some(e) = find_enum_declaration(doc, bare_name) {
                 return Some(SizeTarget::Enum(e));
             }
+            if let Some(t) = find_type_alias_declaration(doc, bare_name) {
+                return Some(SizeTarget::Alias(t.target_type()));
+            }
         }
         None
     }
+}
+
+/// Follow a type through any `type` alias chain it starts as, to the final
+/// non-alias type - same local-then-others search order as
+/// `HoverSizeLookup::resolve`, for the same reason (a chain can cross
+/// files). A small depth cap guards against a cyclic alias that somehow
+/// reached hover without going through `core`'s own cycle check.
+fn fully_resolve_alias_chain(
+    ty: &Type,
+    local: &Document,
+    others: &[(&Url, &String, Document)],
+) -> Type {
+    let mut current = ty.clone();
+    for _ in 0..16 {
+        let Type::Named(id) = &current else { break };
+        let name = id.to_string();
+        let next = find_type_alias_declaration(local, &name)
+            .or_else(|| others.iter().find_map(|(_, _, doc)| find_type_alias_declaration(doc, &name)))
+            .map(|t| t.target_type().clone());
+        match next {
+            Some(t) => current = t,
+            None => break,
+        }
+    }
+    current
 }
 
 /// Render a computed size as the one-line summary hover shows for a struct
@@ -234,6 +265,33 @@ fn create_symbol_hover(symbol: &symbols::Symbol, document: &Document, lookup: &H
                 (format!("const {}", symbol.name), None, None)
             }
         }
+        SymbolKind::TYPE_PARAMETER => {
+            if let Some(t) = find_type_alias_declaration(document, &symbol.name) {
+                let target = t.target_type();
+                let target_text = format_type(target);
+                let signature = format!("type {} = {}", symbol.name, target_text);
+                let resolved_text =
+                    format_type(&fully_resolve_alias_chain(target, lookup.local, lookup.others));
+
+                // Only call out the fully-resolved type when it differs from
+                // the one-level target written in the source - matching
+                // Rust-IDE hover-reveals-the-aliased-type behavior, without
+                // a redundant second line for the common `type X =
+                // <primitive>` case.
+                let doc = if resolved_text != target_text {
+                    let resolves_to = format!("*resolves to* `{}`", resolved_text);
+                    Some(match t.docstring() {
+                        Some(d) => format!("{}\n\n{}", d, resolves_to),
+                        None => resolves_to,
+                    })
+                } else {
+                    t.docstring()
+                };
+                (signature, doc, None)
+            } else {
+                (format!("type {}", symbol.name), None, None)
+            }
+        }
         _ => (symbol.name.clone(), None, None),
     };
 
@@ -358,6 +416,7 @@ fn find_type_at_position(document: &comline_core::schema::idl::grammar::Document
                     Declaration::Struct(s) if s.name() == word => return Some("struct"),
                     Declaration::Enum(e) if e.name() == word => return Some("enum"),
                     Declaration::Protocol(p) if p.name() == word => return Some("protocol"),
+                    Declaration::TypeAlias(t) if t.name() == word => return Some("type alias"),
                     _ => {}
                 }
             }
@@ -411,6 +470,17 @@ fn find_const_declaration<'a>(document: &'a comline_core::schema::idl::grammar::
         if let Declaration::Const(c) = &**decl {
             if c.name() == name {
                 return Some(c);
+            }
+        }
+    }
+    None
+}
+
+fn find_type_alias_declaration<'a>(document: &'a comline_core::schema::idl::grammar::Document, name: &str) -> Option<&'a comline_core::schema::idl::grammar::TypeAlias> {
+    for decl in &document.0 {
+        if let Declaration::TypeAlias(t) = &**decl {
+            if t.name() == name {
+                return Some(t);
             }
         }
     }
@@ -609,5 +679,34 @@ protocol Chat {
         let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
         let text = hover_text(hover);
         assert!(text.contains("integer type"), "got: {text}");
+    }
+
+    #[test]
+    fn test_hover_on_type_alias_shows_signature() {
+        let source = "type UserId = u64\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        // Hover over "UserId" in the declaration itself.
+        let position = Position::new(0, 7);
+
+        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let text = hover_text(hover);
+        assert!(text.contains("type UserId") && text.contains("u64"), "got: {text}");
+    }
+
+    #[test]
+    fn test_hover_on_type_alias_chain_shows_fully_resolved_type() {
+        let source = "type A = B\ntype B = u32\nstruct X {\n    id: A\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        // Hover over "A" in its own declaration ("type A = B", "A" at
+        // column 5).
+        let position = Position::new(0, 5);
+
+        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let text = hover_text(hover);
+        // The one-level signature names "B"; the fully-resolved chain
+        // should also surface "u32" since it differs from the written
+        // target.
+        assert!(text.contains("type A = B"), "got: {text}");
+        assert!(text.contains("u32"), "got: {text}");
     }
 }

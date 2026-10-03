@@ -146,6 +146,27 @@ pub fn build_symbol_table(document: &Document, uri: &Url, source: &str) -> Symbo
                     },
                 );
             }
+            Declaration::TypeAlias(t) => {
+                let name = t.name();
+                let range = find_declaration_range(source, &name);
+
+                // `TYPE_PARAMETER` is the closest LSP-standard fit for a
+                // transparent type alias - LSP 3.17's `SymbolKind` has no
+                // dedicated "type alias" entry, and other LSPs (e.g.
+                // rust-analyzer, for Rust's own `type`) use this same kind.
+                table.insert(
+                    name.clone(),
+                    Symbol {
+                        name: name.clone(),
+                        kind: SymbolKind::TYPE_PARAMETER,
+                        location: Location {
+                            uri: uri.clone(),
+                            range,
+                        },
+                        children: vec![],
+                    },
+                );
+            }
             Declaration::Import(_)
             | Declaration::Use(_)
             | Declaration::Error(_)
@@ -229,6 +250,20 @@ enum Role {
         assert_eq!(role_symbol.children.len(), 2);
     }
     
+    #[test]
+    fn test_symbol_table_with_type_alias() {
+        let source = "type UserId = u64\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let result = parser::parse(source).unwrap();
+
+        let table = build_symbol_table(&result.document.unwrap(), &uri, source);
+
+        assert_eq!(table.len(), 1);
+        let alias = table.get("UserId").unwrap();
+        assert_eq!(alias.kind, SymbolKind::TYPE_PARAMETER);
+        assert!(alias.children.is_empty());
+    }
+
     #[test]
     fn test_symbol_table_with_protocol() {
         let source = r#"

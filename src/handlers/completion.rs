@@ -171,6 +171,14 @@ fn get_keyword_completions() -> Vec<CompletionItem> {
             ..Default::default()
         },
         CompletionItem {
+            label: "type".to_string(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            detail: Some("Define a transparent type alias".to_string()),
+            insert_text: Some("type $1 = $0".to_string()),
+            insert_text_format: Some(lsp_types::InsertTextFormat::SNIPPET),
+            ..Default::default()
+        },
+        CompletionItem {
             label: "use".to_string(),
             kind: Some(CompletionItemKind::KEYWORD),
             detail: Some("Import statement".to_string()),
@@ -322,6 +330,7 @@ mod tests {
         assert!(completions.iter().any(|c| c.label == "struct"));
         assert!(completions.iter().any(|c| c.label == "enum"));
         assert!(completions.iter().any(|c| c.label == "protocol"));
+        assert!(completions.iter().any(|c| c.label == "type"));
     }
     
     #[test]
