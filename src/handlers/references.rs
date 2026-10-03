@@ -97,6 +97,13 @@ pub fn find_references(
                     references.push(loc);
                 }
             }
+            Declaration::TypeAlias(t) => {
+                // A reference inside another alias's own target, e.g.
+                // `type Y = UserId`.
+                if let Some(loc) = check_type_reference(t.target_type(), &word, source, uri) {
+                    references.push(loc);
+                }
+            }
             _ => {}
         }
     }

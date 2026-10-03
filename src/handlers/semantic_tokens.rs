@@ -24,7 +24,7 @@ pub const LEGEND_TYPES: &[&str] = &["keyword", "type", "string", "comment", "num
 
 const KEYWORDS: &[&str] = &[
     "struct", "enum", "protocol", "error", "const", "use", "import", "validator", "settings",
-    "function", "optional",
+    "function", "optional", "type",
 ];
 const PRIMITIVES: &[&str] = &[
     "s8", "s16", "s32", "s64", "u8", "u16", "u32", "u64", "f32", "f64", "bool", "str", "string",
@@ -158,6 +158,19 @@ mod tests {
         assert!(ty.contains(&KEYWORD)); // struct
         assert!(ty.contains(&TYPE)); // Msg, string
         assert!(ty.contains(&COMMENT)); // // a note
+    }
+
+    #[test]
+    fn type_alias_keyword_classifies_as_keyword_not_type() {
+        let src = "type UserId = u64\n";
+        let r = get_semantic_tokens(src, &Url::parse("file:///t.ids").unwrap()).unwrap();
+        let SemanticTokensResult::Tokens(t) = r else {
+            panic!()
+        };
+        // First token on the line is `type` itself - must classify as
+        // KEYWORD (it's in the declaration-keyword list), not TYPE (which
+        // `UserId`/`u64` later on the same line correctly do get).
+        assert_eq!(t.data[0].token_type, KEYWORD);
     }
 
     #[test]
