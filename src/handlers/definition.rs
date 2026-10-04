@@ -1,12 +1,13 @@
 // Definition handler - provides go-to-definition functionality
 
 use crate::analysis::project::Project;
+use crate::analysis::source::ProjectSource;
 use crate::util::{position_to_offset, word_range_at};
 use lsp_types::{GotoDefinitionResponse, Position, Url};
 
 /// Find the definition of a symbol at a position, considering only this file.
 pub fn find_definition(source: &str, uri: &Url, position: Position) -> Option<GotoDefinitionResponse> {
-    find_definition_with_project(source, uri, position, &[])
+    find_definition_with_project::<(Url, String)>(source, uri, position, &[])
 }
 
 /// Find the definition of a symbol at a position, also searching
@@ -14,11 +15,11 @@ pub fn find_definition(source: &str, uri: &Url, position: Position) -> Option<Go
 /// pairs) when it isn't declared in this file. See [`Project::resolve`]
 /// for the lookup order (local, then `use`-scoped, then a flat fallback) -
 /// shared with find-references and rename, so the three always agree.
-pub fn find_definition_with_project(
+pub fn find_definition_with_project<S: ProjectSource>(
     source: &str,
     uri: &Url,
     position: Position,
-    other_files: &[(Url, String)],
+    other_files: &[S],
 ) -> Option<GotoDefinitionResponse> {
     let offset = position_to_offset(source, position)?;
     let (start, end) = word_range_at(source, offset)?;
@@ -235,5 +236,34 @@ struct User {
         ));
 
         assert_eq!(location.uri, active_uri);
+    }
+
+    fn package_with_dependency(active_uri: &str) -> Vec<crate::analysis::source::SourceFile> {
+        use crate::analysis::source::SourceFile;
+        let _ = active_uri;
+        vec![
+            SourceFile::local(
+                Url::parse("file:///pkg/config.idp").unwrap(),
+                "congregation app\nspecification_version = 1\n\ndependencies = {\n    shared = {\n        path = \"../shared\"\n    }\n}\n".to_string(),
+            ),
+            SourceFile::local(Url::parse("file:///pkg/src/types.ids").unwrap(), "struct User {\n    id: u64\n}\n".to_string()),
+            SourceFile::of_dependency(
+                Url::parse("file:///shared/src/models.ids").unwrap(),
+                "/// A shared thing\nstruct Thing {\n    id: u64\n}\n".to_string(),
+                "shared",
+                vec!["shared".to_string(), "models".to_string()],
+            ),
+        ]
+    }
+
+    #[test]
+    fn test_goto_definition_into_a_dependency() {
+        let chat = "use shared::models::Thing\n\nstruct S {\n    t: Thing\n}\n";
+        let chat_uri = Url::parse("file:///pkg/src/chat.ids").unwrap();
+        let others = package_with_dependency("file:///pkg/src/chat.ids");
+
+        let location = scalar(find_definition_with_project(chat, &chat_uri, Position::new(3, 8), &others));
+        assert_eq!(location.uri.as_str(), "file:///shared/src/models.ids");
+        assert_eq!(location.range.start.line, 1);
     }
 }

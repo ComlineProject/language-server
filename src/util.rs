@@ -92,6 +92,34 @@ pub fn word_occurrences(text: &str, word: &str) -> Vec<usize> {
         .collect()
 }
 
+/// The candidate closest to `target` within a plausible-typo distance (half
+/// the target's length, at least 1) - `None` when nothing is that close. The
+/// same rule as core's "did you mean" suggestions.
+pub fn closest<'a>(target: &str, candidates: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let max_distance = target.chars().count().div_ceil(2).max(1);
+    candidates
+        .into_iter()
+        .filter(|&candidate| candidate != target)
+        .map(|candidate| (candidate, levenshtein(target, candidate)))
+        .filter(|&(_, distance)| distance <= max_distance)
+        .min_by_key(|&(_, distance)| distance)
+        .map(|(candidate, _)| candidate.to_string())
+}
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut previous: Vec<usize> = (0..=b.len()).collect();
+    for (i, a_char) in a.chars().enumerate() {
+        let mut current = vec![i + 1; b.len() + 1];
+        for (j, &b_char) in b.iter().enumerate() {
+            let substitution = previous[j] + usize::from(a_char != b_char);
+            current[j + 1] = substitution.min(previous[j + 1] + 1).min(current[j] + 1);
+        }
+        previous = current;
+    }
+    previous[b.len()]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,5 +155,13 @@ mod tests {
     fn test_word_occurrences_are_whole_words_only() {
         let text = "struct UserId { user: User, u: my_User, v: User[] }";
         assert_eq!(word_occurrences(text, "User"), vec![22, 43]);
+    }
+
+    #[test]
+    fn closest_suggests_plausible_typos_only() {
+        assert_eq!(closest("typse", ["types", "chat"]), Some("types".to_string()));
+        assert_eq!(closest("Thign", ["Thing", "Other"]), Some("Thing".to_string()));
+        assert_eq!(closest("zzzz", ["types", "chat"]), None);
+        assert_eq!(closest("types", ["types"]), None, "an exact match isn't a suggestion");
     }
 }

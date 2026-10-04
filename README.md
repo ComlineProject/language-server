@@ -8,6 +8,7 @@ A Language Server Protocol (LSP) implementation for [Comline](https://github.com
 
 - **Diagnostics** - Real-time syntax errors plus `comline-core`'s validation pass (undefined types, duplicate declarations, ...) — the same checks `comline build` runs. A type from another file of the package used without a `use` gets a specific error with an **"Add `use ...`" quick fix**
 - **Whole-package analysis** - every `.ids` file in a package's `src/` takes part, open or not, kept current through file watching; each package only sees its own files
+- **Dependency packages** - the dependencies `config.idp` declares are indexed (path dependencies, and git pins `comline check` has fetched; the editor never fetches), so imports, hover, go-to-definition and completion work into them under the dependency's name. Unresolved imports are errors, worded like `comline check`'s, with a "did you mean" quick fix; imports of a dependency that isn't fetched yet are marked as not checked, and its `config.idp` entry says why
 - **Document Symbols** - Hierarchical outline view of structs, enums, protocols, and constants
 - **Workspace Symbols** - Fuzzy search over every schema in the workspace
 - **Hover Information** - Rich tooltips showing full type definitions and signatures
@@ -18,7 +19,7 @@ A Language Server Protocol (LSP) implementation for [Comline](https://github.com
 ### 🚧 Rougher / next
 
 - Code Formatting, Signature Help — present but thin
-- Dependency packages (`use dep::...` for a `config.idp` dependency) aren't resolved by the editor yet; their names get the benefit of the doubt
+- `std::` imports aren't checked (std isn't part of a build yet either)
 
 ## Library
 
@@ -301,7 +302,7 @@ The server advertises the following capabilities:
 - **Workspace Symbol Provider** - Global symbol search
 - **Document Formatting** - Auto-formatting
 - **Rename Provider** - Symbol renaming across files, with prepare-rename
-- **Code Action Provider** - Quick fixes (add a missing `use`)
+- **Code Action Provider** - Quick fixes (add a missing `use`, apply an unresolved import's "did you mean")
 - **Semantic Tokens** - Enhanced highlighting
 - **Workspace Folders** - Multi-root workspaces; `workspace/didChangeWatchedFiles` keeps the index current
 
@@ -318,10 +319,9 @@ The server advertises the following capabilities:
 
 Contributions are welcome! Areas for improvement:
 
-1. **Dependency packages** - Resolve `use` across `config.idp` dependencies
-2. **Signature Help** - Function argument hints
-3. **Formatting** - A fuller Comline code formatter
-4. **Code Actions** - More quick fixes and refactorings
+1. **Signature Help** - Function argument hints
+2. **Formatting** - A fuller Comline code formatter
+3. **Code Actions** - More quick fixes and refactorings
 
 ## License
 

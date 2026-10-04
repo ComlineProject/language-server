@@ -10,8 +10,9 @@ use comline_core::schema::idl::grammar::{Declaration, Document, Type};
 use lsp_types::{Location, Url};
 
 use crate::analysis::imports::{self, ProjectFile, ResolvedUse};
-use crate::analysis::symbols::{self, SymbolTable};
 use crate::analysis::parse_cache;
+use crate::analysis::source::{self, DeclaredDependency, ProjectSource};
+use crate::analysis::symbols::{self, SymbolTable};
 use crate::util::{byte_range_to_lsp_range, word_occurrences};
 
 /// One parsed project file.
@@ -22,13 +23,26 @@ pub struct ProjectDoc<'a> {
     pub symbols: SymbolTable,
     pub imports: Vec<ResolvedUse>,
     pub namespace: Vec<String>,
+    /// The dependency this file belongs to (see [`ProjectSource::dependency`]):
+    /// read-only to the package being edited, and not part of it.
+    pub dependency: Option<&'a str>,
 }
 
-/// Every file that parses, in the order given. The order matters only for
+/// Every schema that parses, in the order given. The order matters only for
 /// the flat fallback in [`Project::resolve`]: from a given file, the first
 /// *other* file (in this order) declaring the name wins.
 pub struct Project<'a> {
     pub docs: Vec<ProjectDoc<'a>>,
+    /// The namespaces of schemas that were given but don't parse (mid-edit):
+    /// they exist, so a `use` of one isn't unresolved, but what they declare
+    /// is unknown.
+    pub unparsed: Vec<Vec<String>>,
+    /// Whether the package's `config.idp` was given - the sign this is the
+    /// whole package, not just whatever files happened to be at hand, so an
+    /// import nothing here matches really is unresolved.
+    pub has_manifest: bool,
+    /// What that `config.idp` declares.
+    pub dependencies: Vec<DeclaredDependency>,
 }
 
 /// A declaration [`Project::resolve`] found: which file (an index into
@@ -48,37 +62,62 @@ pub struct Reference {
 }
 
 impl<'a> Project<'a> {
-    /// Parse `files` (`(uri, source)` pairs, through
-    /// [`parse_cache`](crate::analysis::parse_cache)); files that don't parse
-    /// are left out.
-    pub fn new(files: impl IntoIterator<Item = (&'a Url, &'a str)>) -> Self {
-        Self::from_parsed(files.into_iter().filter_map(|(uri, source)| {
-            parse_cache::parse(uri, source).map(|document| (uri, source, document))
+    /// A project over `files`. Schemas are parsed through
+    /// [`parse_cache`](crate::analysis::parse_cache); the ones that don't
+    /// parse are left out of [`Project::docs`] (their namespaces kept in
+    /// [`Project::unparsed`]). A manifest (`config.idp`) among them supplies
+    /// [`Project::dependencies`].
+    pub fn new<S: ProjectSource + 'a>(files: impl IntoIterator<Item = &'a S>) -> Self {
+        Self::build(files.into_iter().map(|file| Input {
+            uri: file.uri(),
+            text: file.text(),
+            namespace: file.namespace(),
+            dependency: file.dependency(),
         }))
-    }
-
-    /// Like [`Project::new`], from files the caller already parsed.
-    pub fn from_parsed(files: impl IntoIterator<Item = (&'a Url, &'a str, Arc<Document>)>) -> Self {
-        let docs = files
-            .into_iter()
-            .map(|(uri, source, document)| {
-                let symbols = symbols::build_symbol_table(&document, uri, source);
-                let namespace = imports::namespace_of(uri);
-                let imports = imports::resolved_imports(&document, &namespace);
-                ProjectDoc { uri, source, document, symbols, imports, namespace }
-            })
-            .collect();
-
-        Self { docs }
     }
 
     /// The active file first, then every other file - the shape every
     /// handler has.
-    pub fn with_active(uri: &'a Url, source: &'a str, other_files: &'a [(Url, String)]) -> Self {
-        Self::new(
-            std::iter::once((uri, source))
-                .chain(other_files.iter().map(|(u, s)| (u, s.as_str()))),
-        )
+    pub fn with_active<S: ProjectSource>(uri: &'a Url, source: &'a str, other_files: &'a [S]) -> Self {
+        let active = Input { uri, text: source, namespace: None, dependency: None };
+        Self::build(std::iter::once(active).chain(other_files.iter().map(|file| Input {
+            uri: file.uri(),
+            text: file.text(),
+            namespace: file.namespace(),
+            dependency: file.dependency(),
+        })))
+    }
+
+    /// Like [`Project::new`], from schemas the caller already parsed.
+    pub fn from_parsed(files: impl IntoIterator<Item = (&'a Url, &'a str, Arc<Document>)>) -> Self {
+        let docs = files
+            .into_iter()
+            .map(|(uri, source, document)| ProjectDoc::new(uri, source, document, imports::namespace_of(uri), None))
+            .collect();
+
+        Self { docs, unparsed: vec![], has_manifest: false, dependencies: vec![] }
+    }
+
+    fn build(inputs: impl Iterator<Item = Input<'a>>) -> Self {
+        let mut project = Self { docs: vec![], unparsed: vec![], has_manifest: false, dependencies: vec![] };
+
+        for input in inputs {
+            if source::is_manifest(input.uri) {
+                project.has_manifest = true;
+                project.dependencies = source::declared_dependencies(input.text);
+                continue;
+            }
+
+            let namespace = input.namespace.map(<[String]>::to_vec).unwrap_or_else(|| imports::namespace_of(input.uri));
+            match parse_cache::parse(input.uri, input.text) {
+                Some(document) => {
+                    project.docs.push(ProjectDoc::new(input.uri, input.text, document, namespace, input.dependency))
+                }
+                None => project.unparsed.push(namespace),
+            }
+        }
+
+        project
     }
 
     pub fn index_of(&self, uri: &Url) -> Option<usize> {
@@ -128,6 +167,11 @@ impl<'a> Project<'a> {
         let mut found = Vec::new();
 
         for (index, doc) in self.docs.iter().enumerate() {
+            // A dependency's own files aren't this package's to search: their
+            // `use`s are written against the dependency, not under its name.
+            if doc.dependency.is_some() {
+                continue;
+            }
             let mut seen = BTreeSet::new();
 
             for span in type_spans(&doc.document) {
@@ -192,7 +236,27 @@ impl<'a> Project<'a> {
     }
 }
 
+/// One file handed to [`Project::build`].
+struct Input<'a> {
+    uri: &'a Url,
+    text: &'a str,
+    namespace: Option<&'a [String]>,
+    dependency: Option<&'a str>,
+}
+
 impl<'a> ProjectDoc<'a> {
+    fn new(
+        uri: &'a Url,
+        source: &'a str,
+        document: Arc<Document>,
+        namespace: Vec<String>,
+        dependency: Option<&'a str>,
+    ) -> Self {
+        let symbols = symbols::build_symbol_table(&document, uri, source);
+        let imports = imports::resolved_imports(&document, &namespace);
+        Self { uri, source, document, symbols, imports, namespace, dependency }
+    }
+
     fn as_file(&self) -> ProjectFile<'a> {
         ProjectFile { uri: self.uri, source: self.source, namespace: self.namespace.clone() }
     }
@@ -340,7 +404,7 @@ mod tests {
             "file:///a.ids",
             "struct User {\n    name: string\n}\n\nstruct A {\n    u: User\n}\n\nstruct B {\n    list: User[]\n}\n",
         )]);
-        let project = Project::new(all.iter().map(|(u, s)| (u, s.as_str())));
+        let project = Project::new(all.iter());
         let target = project.resolve(0, "User").unwrap();
 
         let refs = project.references(&target);
@@ -355,7 +419,7 @@ mod tests {
             ("file:///chat.ids", "use types::Message\n\nprotocol Chat {\n    function send(Message) -> Message;\n}\n"),
             ("file:///unrelated.ids", "use other::Message\n\nstruct S {\n    m: Message\n}\n"),
         ]);
-        let project = Project::new(all.iter().map(|(u, s)| (u, s.as_str())));
+        let project = Project::new(all.iter());
         let target = project.resolve(0, "Message").unwrap();
 
         let refs = project.references(&target);
@@ -372,7 +436,7 @@ mod tests {
             ("file:///types.ids", "struct Message {\n    text: string\n}\n"),
             ("file:///chat.ids", "use types::Message as Msg\n\nstruct S {\n    m: Msg\n}\n"),
         ]);
-        let project = Project::new(all.iter().map(|(u, s)| (u, s.as_str())));
+        let project = Project::new(all.iter());
         let target = project.resolve(1, "Msg").unwrap();
         assert_eq!(target, Target { doc: 0, name: "Message".into() });
 
@@ -391,7 +455,7 @@ mod tests {
             ("file:///pkg/src/User.ids", "struct User {\n    name: string\n}\n"),
             ("file:///pkg/src/app.ids", "use User::User\n\nstruct S {\n    u: User\n}\n"),
         ]);
-        let project = Project::new(all.iter().map(|(u, s)| (u, s.as_str())));
+        let project = Project::new(all.iter());
         let target = project.resolve(0, "User").unwrap();
 
         let refs = project.references(&target);
@@ -408,7 +472,7 @@ mod tests {
             ("file:///types.ids", "struct Message {\n    text: string\n}\n"),
             ("file:///chat.ids", "use types::Message\n\nstruct Message {\n    local: bool\n}\n\nstruct S {\n    m: Message\n}\n"),
         ]);
-        let project = Project::new(all.iter().map(|(u, s)| (u, s.as_str())));
+        let project = Project::new(all.iter());
         let target = project.resolve(0, "Message").unwrap();
 
         let refs = project.references(&target);

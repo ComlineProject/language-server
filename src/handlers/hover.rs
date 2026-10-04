@@ -1,6 +1,7 @@
 // Hover handler - provides type information on hover
 
 use crate::analysis::imports::{self, ProjectFile};
+use crate::analysis::source::{self, ProjectSource};
 use crate::analysis::symbols;
 use crate::parser;
 use crate::util::position_to_offset;
@@ -12,7 +13,7 @@ use lsp_types::{Hover, HoverContents, MarkedString, Position, Url};
 
 /// Get hover information at a position, considering only this file.
 pub fn get_hover_info(source: &str, uri: &Url, position: Position) -> Option<Hover> {
-    get_hover_info_with_project(source, uri, position, &[])
+    get_hover_info_with_project::<(Url, String)>(source, uri, position, &[])
 }
 
 /// Get hover information at a position, also searching `other_files` (every
@@ -27,11 +28,11 @@ pub fn get_hover_info(source: &str, uri: &Url, position: Position) -> Option<Hov
 /// mid-edit, or a `use` being typed just as often as a real miss), with one
 /// appended note when the fallback match is in a
 /// sibling no `use` here actually reaches.
-pub fn get_hover_info_with_project(
+pub fn get_hover_info_with_project<S: ProjectSource>(
     source: &str,
     uri: &Url,
     position: Position,
-    other_files: &[(Url, String)],
+    other_files: &[S],
 ) -> Option<Hover> {
     // Convert position to byte offset
     let offset = position_to_offset(source, position)?;
@@ -63,9 +64,20 @@ pub fn get_hover_info_with_project(
     // hovered word. A struct's fields can reference types declared in *any*
     // other file, so size computation needs the whole set, not just the
     // document the matched symbol itself lives in.
-    let mut other_docs: Vec<(&Url, &String, Document)> = other_files
+    // Each with the namespace it's seen under and the dependency (if any)
+    // it comes from - a dependency's file can't say either by its path (see
+    // `analysis::source`). The package manifest isn't a schema.
+    let mut parsed: Vec<(Sibling, Origin)> = other_files
         .iter()
-        .filter_map(|(u, s)| parser::parse(s).ok()?.document.map(|d| (u, s, d)))
+        .filter(|file| !source::is_manifest(file.uri()))
+        .filter_map(|file| {
+            let document = parser::parse(file.text()).ok()?.document?;
+            let namespace = file
+                .namespace()
+                .map(<[String]>::to_vec)
+                .unwrap_or_else(|| imports::namespace_of(file.uri()));
+            Some(((file.uri(), file.text(), document), (namespace, file.dependency())))
+        })
         .collect();
 
     // Check if a `use`/`import` here actually brings a symbol named `word`
@@ -78,11 +90,10 @@ pub fn get_hover_info_with_project(
     // otherwise unchanged) so a name collision with an unimported sibling
     // resolves to the one actually in scope, while still falling back to
     // the unimported sibling's estimate over `Unknown`.
-    other_docs.sort_by_key(|(u, _, _)| {
-        !own_imports
-            .iter()
-            .any(|i| i.resolved.absolute_namespace.starts_with(&imports::namespace_of(u)))
+    parsed.sort_by_key(|(_, (namespace, _))| {
+        !own_imports.iter().any(|i| i.resolved.absolute_namespace.starts_with(namespace))
     });
+    let (other_docs, origins): (Vec<Sibling>, Vec<Origin>) = parsed.into_iter().unzip();
 
     let lookup = HoverSizeLookup { local: &document, others: &other_docs };
 
@@ -91,8 +102,11 @@ pub fn get_hover_info_with_project(
         return Some(create_symbol_hover(symbol, &document, &lookup));
     }
 
-    let siblings: Vec<ProjectFile> =
-        other_docs.iter().map(|(u, s, _)| ProjectFile::new(u, s)).collect();
+    let siblings: Vec<ProjectFile> = other_docs
+        .iter()
+        .zip(&origins)
+        .map(|((u, s, _), (namespace, _))| ProjectFile { uri: u, source: s, namespace: namespace.clone() })
+        .collect();
 
     if let Some(resolved) = imports::resolve_symbol(&word, &own_imports, &siblings) {
         let sibling = resolved.file;
@@ -114,18 +128,16 @@ pub fn get_hover_info_with_project(
     // so append a note when the match isn't one any `use` here actually
     // reaches (never for a `std::` import: that's a different, legitimate
     // kind of not-locally-resolvable, not a "you forgot the use" case).
-    for (other_uri, other_source, other_document) in &other_docs {
+    for ((other_uri, other_source, other_document), (_, dependency)) in other_docs.iter().zip(&origins) {
         let other_table = symbols::build_symbol_table(other_document, other_uri, other_source);
         if let Some(symbol) = other_table.get(&word) {
             let mut hover = create_symbol_hover(symbol, other_document, &lookup);
             if !resolves_via_std_import(&word, &own_imports) {
-                append_note(
-                    &mut hover,
-                    format!(
-                        "declared in `{}` — no `use` here brings it into scope",
-                        file_label(other_uri)
-                    ),
-                );
+                let place = match dependency {
+                    Some(name) => format!("`{}` (dependency `{name}`)", file_label(other_uri)),
+                    None => format!("`{}`", file_label(other_uri)),
+                };
+                append_note(&mut hover, format!("declared in {place} — no `use` here brings it into scope"));
             }
             return Some(hover);
         }
@@ -143,6 +155,13 @@ pub fn get_hover_info_with_project(
 
     None
 }
+
+/// A parsed sibling file: its URI, text and tree.
+type Sibling<'a> = (&'a Url, &'a str, Document);
+
+/// Where a sibling sits: the namespace it's seen under, and the dependency
+/// it comes from (if any).
+type Origin<'a> = (Vec<String>, Option<&'a str>);
 
 /// Whether the active file's own imports bring `word` into scope from
 /// `std::` — the one case the fallback-match note (above) must stay quiet
@@ -185,7 +204,7 @@ fn append_note(hover: &mut Hover, note: String) {
 /// [`create_symbol_hover`].
 struct HoverSizeLookup<'a> {
     local: &'a Document,
-    others: &'a [(&'a Url, &'a String, Document)],
+    others: &'a [(&'a Url, &'a str, Document)],
 }
 
 impl<'a> SizeLookup for HoverSizeLookup<'a> {
@@ -222,7 +241,7 @@ impl<'a> SizeLookup for HoverSizeLookup<'a> {
 fn fully_resolve_alias_chain(
     ty: &Type,
     local: &Document,
-    others: &[(&Url, &String, Document)],
+    others: &[(&Url, &str, Document)],
 ) -> Type {
     let mut current = ty.clone();
     for _ in 0..16 {
@@ -1304,5 +1323,37 @@ protocol Chat {
             !text.contains("no `use` here brings it into scope"),
             "a std:: import coincidentally sharing a name shouldn't get the not-use-scoped note, got: {text}"
         );
+    }
+
+    fn package_with_dependency(active_uri: &str) -> Vec<crate::analysis::source::SourceFile> {
+        use crate::analysis::source::SourceFile;
+        let _ = active_uri;
+        vec![
+            SourceFile::local(
+                Url::parse("file:///pkg/config.idp").unwrap(),
+                "congregation app\nspecification_version = 1\n\ndependencies = {\n    shared = {\n        path = \"../shared\"\n    }\n}\n".to_string(),
+            ),
+            SourceFile::local(Url::parse("file:///pkg/src/types.ids").unwrap(), "struct User {\n    id: u64\n}\n".to_string()),
+            SourceFile::of_dependency(
+                Url::parse("file:///shared/src/models.ids").unwrap(),
+                "/// A shared thing\nstruct Thing {\n    id: u64\n}\n".to_string(),
+                "shared",
+                vec!["shared".to_string(), "models".to_string()],
+            ),
+        ]
+    }
+
+    #[test]
+    fn hover_on_a_type_from_a_dependency() {
+        let chat = "use shared::models::Thing\n\nstruct S {\n    t: Thing\n}\n";
+        let chat_uri = Url::parse("file:///pkg/src/chat.ids").unwrap();
+        let others = package_with_dependency("file:///pkg/src/chat.ids");
+
+        let hover = get_hover_info_with_project(chat, &chat_uri, Position::new(3, 8), &others)
+            .expect("a `use`-resolved type from a dependency hovers");
+        let text = hover_text(hover);
+        assert!(text.contains("struct Thing"), "got: {text}");
+        assert!(text.contains("A shared thing"), "got: {text}");
+        assert!(!text.contains("no `use` here"), "it is imported: {text}");
     }
 }

@@ -4,6 +4,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 //
+use crate::analysis::imports::namespace_of;
+use crate::analysis::source::SourceFile;
+use crate::dependencies;
 use crate::document::DocumentStore;
 use crate::workspace::{self, WorkspaceIndex};
 
@@ -31,30 +34,82 @@ impl Backend {
         }
     }
 
-    /// Every other `.ids` file in `uri`'s package as `(uri, text)`: the open
-    /// buffers, plus every file on disk that isn't open (an open buffer wins
-    /// over its disk copy). A file outside any package sees only the other
-    /// open files outside any package.
-    fn other_project_files(&self, uri: &Url) -> Vec<(Url, String)> {
-        let root = workspace::package_root(uri);
+    /// The project view `uri` is analysed in, minus `uri` itself: see
+    /// [`Backend::package_view`].
+    fn other_project_files(&self, uri: &Url) -> Vec<SourceFile> {
         let own = workspace::path_key(uri);
+        self.package_view(uri).into_iter().filter(|f| workspace::path_key(&f.uri) != own).collect()
+    }
 
-        let open: Vec<(Url, String)> = self
+    /// Everything `uri`'s package is analysed with: its schemas (open
+    /// buffers, else their disk copies), its `config.idp` (which says what
+    /// its dependencies are), and its dependencies' schemas under their
+    /// declared names (see `dependencies`). A file outside any package sees
+    /// only the open files outside any package.
+    fn package_view(&self, uri: &Url) -> Vec<SourceFile> {
+        let root = workspace::package_root(uri);
+        let open: Vec<crate::document::Document> = self
             .documents
             .get_all_uris()
             .into_iter()
-            .filter(|u| !is_idp(u) && workspace::path_key(u) != own && workspace::package_root(u) == root)
-            .filter_map(|u| self.documents.get(&u).map(|d| (u, d.text)))
+            .filter_map(|u| self.documents.get(&u))
             .collect();
-        let open_keys: HashSet<Option<String>> = open.iter().map(|(u, _)| workspace::path_key(u)).collect();
+        let open_text = |url: &Url| {
+            let key = workspace::path_key(url);
+            open.iter().find(|d| workspace::path_key(&d.uri) == key).map(|d| d.text.clone())
+        };
 
-        let disk = self
-            .workspace
-            .package_files(uri)
-            .into_iter()
-            .filter(|(u, _)| !open_keys.contains(&workspace::path_key(u)));
+        let mut files: Vec<SourceFile> = open
+            .iter()
+            .filter(|d| !is_idp(&d.uri) && workspace::package_root(&d.uri) == root)
+            .map(|d| SourceFile::local(d.uri.clone(), d.text.clone()))
+            .collect();
+        if root.is_none() {
+            return files;
+        }
 
-        open.into_iter().chain(disk).collect()
+        let open_keys: HashSet<Option<String>> = files.iter().map(|f| workspace::path_key(&f.uri)).collect();
+        files.extend(
+            self.workspace
+                .package_files(uri)
+                .into_iter()
+                .filter(|(u, _)| !open_keys.contains(&workspace::path_key(u)))
+                .map(|(u, text)| SourceFile::local(u, text)),
+        );
+
+        if let Some(manifest) = manifest_url(uri) {
+            let text = open_text(&manifest).or_else(|| std::fs::read_to_string(manifest.to_file_path().ok()?).ok());
+            if let Some(text) = text {
+                files.push(SourceFile::local(manifest, text));
+            }
+        }
+
+        for dependency in self.workspace.dependencies_of(uri) {
+            for (url, text) in dependency.files {
+                let mut namespace = vec![dependency.name.clone()];
+                namespace.extend(namespace_of(&url));
+                let text = open_text(&url).unwrap_or(text);
+                files.push(SourceFile::of_dependency(url, text, &dependency.name, namespace));
+            }
+        }
+
+        files
+    }
+
+    /// Re-read the dependencies of the package whose `src/` is `src_root`,
+    /// from its `config.idp` buffer if open, else from disk.
+    fn reindex_dependencies(&self, src_root: &std::path::Path) {
+        let manifest = src_root.parent().map(|dir| dir.join(dependencies::MANIFEST));
+        let open_text = manifest.and_then(|path| {
+            let key = Url::from_file_path(&path).ok().and_then(|u| workspace::path_key(&u));
+            self.documents
+                .get_all_uris()
+                .into_iter()
+                .find(|u| workspace::path_key(u) == key)
+                .and_then(|u| self.documents.get(&u))
+                .map(|d| d.text)
+        });
+        self.workspace.index_dependencies(src_root, open_text.as_deref());
     }
 
     /// Every `.ids` file, all packages: open buffers first, then the disk
@@ -85,6 +140,9 @@ impl Backend {
         let index = Arc::clone(&self.workspace);
         let scanned = tokio::task::spawn_blocking(move || {
             index.scan(&roots);
+            for src_root in index.package_roots() {
+                index.index_dependencies(&src_root, None);
+            }
             index.len()
         })
         .await
@@ -104,6 +162,22 @@ impl Backend {
 /// handle correctly on their own (see `comline-vscode`'s `idpSchema.ts`).
 fn is_idp(uri: &Url) -> bool {
     uri.path().ends_with(".idp")
+}
+
+/// The `config.idp` of `uri`'s package (next to its `src/`), if it has one.
+fn manifest_url(uri: &Url) -> Option<Url> {
+    let path = uri.to_file_path().ok()?;
+    let package_dir = comline_core::package::layout::schemas_root_for(&path)?.parent()?;
+    Url::from_file_path(package_dir.join(dependencies::MANIFEST)).ok()
+}
+
+/// For a package manifest (`config.idp`), its package's `src/` directory.
+fn manifest_package_src(uri: &Url) -> Option<PathBuf> {
+    let path = uri.to_file_path().ok()?;
+    if path.file_name()? != dependencies::MANIFEST {
+        return None;
+    }
+    Some(path.parent()?.join(comline_core::package::layout::SCHEMAS_DIR))
 }
 
 #[tower_lsp::async_trait]
@@ -240,30 +314,50 @@ impl LanguageServer for Backend {
         tracing::debug!("Document closed: {}", uri);
         self.documents.remove(&uri);
 
-        if !is_idp(&uri) {
-            // Its declarations are gone from the project view, which can
-            // change what the remaining files' imports resolve to.
-            self.client.publish_diagnostics(uri, vec![], None).await;
-            self.publish_ids_diagnostics().await;
+        // Its buffer is gone from the project view (back to the disk copy,
+        // if any), which can change what the other files' imports resolve to.
+        self.client.publish_diagnostics(uri.clone(), vec![], None).await;
+        if let Some(src_root) = manifest_package_src(&uri) {
+            self.reindex_dependencies(&src_root);
         }
+        self.publish_ids_diagnostics().await;
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
-        let mut schemas_changed = false;
+        let mut changed = false;
+        let mut reindex: Vec<PathBuf> = Vec::new();
+
         for change in params.changes {
+            if let Some(src_root) = manifest_package_src(&change.uri) {
+                reindex.push(src_root);
+                changed = true;
+                continue;
+            }
             if !change.uri.path().ends_with(".ids") {
                 continue;
             }
-            schemas_changed = true;
+            changed = true;
             if change.typ == FileChangeType::DELETED {
                 self.workspace.remove(&change.uri);
             } else {
                 self.workspace.refresh(&change.uri);
             }
+            // A schema of some package's dependency (a sibling package, or a
+            // pin `comline check` just fetched into the deps cache).
+            if let Ok(path) = change.uri.to_file_path() {
+                reindex.extend(self.workspace.packages_depending_on(&path));
+            }
         }
 
-        if schemas_changed {
+        reindex.sort();
+        reindex.dedup();
+        for src_root in &reindex {
+            self.reindex_dependencies(src_root);
+        }
+
+        if changed {
             self.publish_ids_diagnostics().await;
+            self.publish_open_manifest_diagnostics().await;
         }
     }
 
@@ -562,6 +656,12 @@ impl Backend {
     async fn parse_and_publish_diagnostics(&self, uri: &Url) {
         if is_idp(uri) {
             self.parse_and_publish_idp_diagnostics(uri).await;
+            // A package manifest says what its dependencies are: what the
+            // package's schemas resolve against changes with it.
+            if let Some(src_root) = manifest_package_src(uri) {
+                self.reindex_dependencies(&src_root);
+                self.publish_ids_diagnostics().await;
+            }
         } else {
             self.publish_ids_diagnostics().await;
         }
@@ -591,21 +691,8 @@ impl Backend {
         }
 
         for documents in packages.values() {
-            let open_keys: HashSet<Option<String>> =
-                documents.iter().map(|d| workspace::path_key(&d.uri)).collect();
-            let disk: Vec<(Url, String)> = self
-                .workspace
-                .package_files(&documents[0].uri)
-                .into_iter()
-                .filter(|(u, _)| !open_keys.contains(&workspace::path_key(u)))
-                .collect();
-
-            let project = Project::new(
-                documents
-                    .iter()
-                    .map(|d| (&d.uri, d.text.as_str()))
-                    .chain(disk.iter().map(|(u, s)| (u, s.as_str()))),
-            );
+            let view = self.package_view(&documents[0].uri);
+            let project = Project::new(view.iter());
 
             for document in documents {
                 // In the project exactly when it parsed cleanly.
@@ -623,6 +710,16 @@ impl Backend {
         }
     }
 
+    /// Re-publish every open `config.idp`'s diagnostics - whether a
+    /// dependency is fetched can change without the manifest itself changing.
+    async fn publish_open_manifest_diagnostics(&self) {
+        for uri in self.documents.get_all_uris() {
+            if is_idp(&uri) {
+                self.parse_and_publish_idp_diagnostics(&uri).await;
+            }
+        }
+    }
+
     async fn parse_and_publish_idp_diagnostics(&self, uri: &Url) {
         use crate::analysis::diagnostics;
         use crate::parser;
@@ -634,7 +731,12 @@ impl Backend {
 
         match parser::parse_idp(&document.text) {
             Ok(result) => {
-                let lsp_diagnostics = diagnostics::generate_diagnostics(&document.text, &result.errors);
+                let mut lsp_diagnostics = diagnostics::generate_diagnostics(&document.text, &result.errors);
+                if !result.has_errors() {
+                    if let Some(package_dir) = uri.to_file_path().ok().and_then(|p| p.parent().map(PathBuf::from)) {
+                        lsp_diagnostics.extend(dependencies::manifest_diagnostics(&package_dir, &document.text));
+                    }
+                }
 
                 if result.has_errors() {
                     tracing::debug!(".idp parse errors for {}: {} error(s)", uri, result.errors.len());

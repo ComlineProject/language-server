@@ -3,6 +3,7 @@
 use crate::analysis::import_check::{self, declares_type, file_name, is_type_kind, Target};
 use crate::analysis::imports::{self, add_use_edit, ResolvedUse};
 use crate::analysis::project::{Project, ProjectDoc};
+use crate::analysis::source::ProjectSource;
 use crate::analysis::symbols;
 use crate::parser;
 use crate::util::position_to_offset;
@@ -13,7 +14,7 @@ use std::collections::BTreeSet;
 
 /// Get completion suggestions at a position, considering only this file.
 pub fn get_completions(source: &str, uri: &Url, position: Position) -> Vec<CompletionItem> {
-    get_completions_with_project(source, uri, position, &[])
+    get_completions_with_project::<(Url, String)>(source, uri, position, &[])
 }
 
 /// Get completion suggestions at a position, with `other_files` (every
@@ -21,11 +22,11 @@ pub fn get_completions(source: &str, uri: &Url, position: Position) -> Vec<Compl
 /// position, the types this file's `use`s bring in from them, and then
 /// every other type they declare - picking one of those also adds its
 /// `use` line.
-pub fn get_completions_with_project(
+pub fn get_completions_with_project<S: ProjectSource>(
     source: &str,
     uri: &Url,
     position: Position,
-    other_files: &[(Url, String)],
+    other_files: &[S],
 ) -> Vec<CompletionItem> {
     let offset = match position_to_offset(source, position) {
         Some(o) => o,
@@ -109,13 +110,13 @@ pub fn get_completions_with_project(
 /// other type those files declare, sorted after everything else, which
 /// inserts the missing `use` line along with the name. Names already
 /// declared here, or already in scope, aren't offered again.
-fn get_import_completions(
+fn get_import_completions<S: ProjectSource>(
     source: &str,
     uri: &Url,
-    other_files: &[(Url, String)],
+    other_files: &[S],
     symbol_table: Option<&symbols::SymbolTable>,
 ) -> Vec<CompletionItem> {
-    let siblings = Project::new(other_files.iter().map(|(u, s)| (u, s.as_str())));
+    let siblings = Project::new(other_files.iter());
     let mut in_scope: BTreeSet<String> = symbol_table
         .map(|t| t.all_symbols().into_iter().map(|s| s.name.clone()).collect())
         .unwrap_or_default();
@@ -147,8 +148,8 @@ fn get_import_completions(
             imported.insert((sibling, real.clone()));
             if in_scope.insert(label.clone()) {
                 let detail = match label == real {
-                    true => format!("from `{}`", file_name(doc)),
-                    false => format!("`{real}` from `{}`", file_name(doc)),
+                    true => format!("from {}", origin(doc)),
+                    false => format!("`{real}` from {}", origin(doc)),
                 };
                 items.push(type_item(doc, &real, label, detail));
             }
@@ -161,8 +162,12 @@ fn get_import_completions(
                 continue;
             }
             let path = format!("{}::{}", doc.namespace.join("::"), name);
-            let mut item = type_item(doc, &name, name.clone(), format!("from `{}` — adds `use {path}`", file_name(doc)));
-            item.sort_text = Some(format!("~{name}"));
+            let mut item = type_item(doc, &name, name.clone(), format!("from {} — adds `use {path}`", origin(doc)));
+            // After everything in scope; a dependency's after the package's own.
+            item.sort_text = Some(match doc.dependency {
+                Some(_) => format!("~~{name}"),
+                None => format!("~{name}"),
+            });
             item.additional_text_edits = Some(vec![add_use_edit(source, &path)]);
             items.push(item);
         }
@@ -182,6 +187,15 @@ fn uses_in(source: &str, uri: &Url) -> Vec<ResolvedUse> {
         .filter_map(|line| parser::parse(line).ok()?.document)
         .flat_map(|document| imports::resolved_imports(&document, &namespace))
         .collect()
+}
+
+/// Where a type comes from, for an item's detail: `` `types.ids` ``, or
+/// `` `models.ids` (dependency `shared_types`) ``.
+fn origin(doc: &ProjectDoc) -> String {
+    match doc.dependency {
+        Some(dependency) => format!("`{}` (dependency `{dependency}`)", file_name(doc)),
+        None => format!("`{}`", file_name(doc)),
+    }
 }
 
 /// Every struct, enum and type alias `doc` declares.
@@ -1057,5 +1071,46 @@ mod tests {
             .map(|c| c.detail)
             .collect();
         assert_eq!(labels.len(), 1, "only the local `Message`: {labels:?}");
+    }
+
+    fn package_with_dependency(active_uri: &str) -> Vec<crate::analysis::source::SourceFile> {
+        use crate::analysis::source::SourceFile;
+        let _ = active_uri;
+        vec![
+            SourceFile::local(
+                Url::parse("file:///pkg/config.idp").unwrap(),
+                "congregation app\nspecification_version = 1\n\ndependencies = {\n    shared = {\n        path = \"../shared\"\n    }\n}\n".to_string(),
+            ),
+            SourceFile::local(Url::parse("file:///pkg/src/types.ids").unwrap(), "struct User {\n    id: u64\n}\n".to_string()),
+            SourceFile::of_dependency(
+                Url::parse("file:///shared/src/models.ids").unwrap(),
+                "/// A shared thing\nstruct Thing {\n    id: u64\n}\n".to_string(),
+                "shared",
+                vec!["shared".to_string(), "models".to_string()],
+            ),
+        ]
+    }
+
+    #[test]
+    fn dependency_types_are_offered_after_the_packages_own() {
+        let source = "struct S {\n    m: ";
+        let uri = Url::parse("file:///pkg/src/chat.ids").unwrap();
+        let others = package_with_dependency("file:///pkg/src/chat.ids");
+        let end = crate::util::offset_to_position(source, source.len());
+
+        let items = get_completions_with_project(source, &uri, end, &others);
+        let user = items.iter().find(|c| c.label == "User").expect("the package's own type");
+        let thing = items.iter().find(|c| c.label == "Thing").expect("the dependency's type");
+
+        assert_eq!(user.sort_text.as_deref(), Some("~User"));
+        assert_eq!(thing.sort_text.as_deref(), Some("~~Thing"));
+        assert_eq!(
+            thing.detail.as_deref(),
+            Some("from `models.ids` (dependency `shared`) — adds `use shared::models::Thing`")
+        );
+        assert_eq!(
+            thing.additional_text_edits.as_ref().unwrap()[0].new_text,
+            "use shared::models::Thing\n\n"
+        );
     }
 }

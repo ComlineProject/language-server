@@ -19,6 +19,7 @@ pub mod analysis {
     pub mod imports;
     pub mod parse_cache;
     pub mod project;
+    pub mod source;
     pub mod symbols;
 }
 
@@ -37,6 +38,8 @@ pub mod handlers {
 
 #[cfg(feature = "server")]
 pub mod backend;
+#[cfg(feature = "server")]
+pub mod dependencies;
 #[cfg(feature = "server")]
 pub mod document;
 #[cfg(feature = "server")]

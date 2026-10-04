@@ -18,15 +18,17 @@
 //! it are given the benefit of the doubt - `comline build` sees everything
 //! and still catches a real mistake there; the editor shouldn't invent one.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use std::collections::BTreeMap;
-
+use comline_core::schema::idl::grammar::{Declaration, UsePath};
+use comline_core::schema::ir::compiler::import_resolver::ImportResolver;
 use comline_core::schema::ir::frozen::unit::FrozenUnit;
 use lsp_types::SymbolKind;
 
 use crate::analysis::imports::ResolvedUse;
 use crate::analysis::project::{named_type_sites, Project, ProjectDoc};
+use crate::analysis::source::DependencyKind;
+use crate::util::{closest, word_occurrences};
 
 /// What [`check`] found for one file.
 pub struct ImportCheck {
@@ -36,6 +38,30 @@ pub struct ImportCheck {
     /// Each use of a bare type name that's declared in another project file
     /// but not brought into scope by any `use` here.
     pub missing: Vec<MissingImport>,
+    /// Each `use` that doesn't resolve - `comline check` / `build` reject it.
+    pub unresolved: Vec<UnresolvedImport>,
+    /// Each `use` of a declared dependency there are no files for, so it
+    /// can't be checked here.
+    pub unverified: Vec<UnverifiedImport>,
+}
+
+/// A `use` that doesn't resolve, the way core's `check_imports` sees it.
+pub struct UnresolvedImport {
+    /// Byte range to underline: the segment or item that doesn't resolve
+    /// when it can be pinned down, else the whole `use`.
+    pub range: (usize, usize),
+    /// Core's wording: `no schema in this package or its dependencies
+    /// matches 'typse::User'`, `schema 'types' doesn't declare 'Nope'`.
+    pub detail: String,
+    /// A close name that could replace `range` (the "did you mean").
+    pub suggestion: Option<String>,
+}
+
+/// A `use` of a declared dependency there are no files for.
+pub struct UnverifiedImport {
+    pub range: (usize, usize),
+    /// Why there are no files: not fetched yet, a registry source, ...
+    pub reason: String,
 }
 
 /// One occurrence of a type name that needs a `use`.
@@ -173,7 +199,168 @@ pub fn check(project: &Project, doc: usize) -> ImportCheck {
         }
     }
 
-    ImportCheck { scope, missing }
+    let (unresolved, unverified) = resolution(project, doc);
+    ImportCheck { scope, missing, unresolved, unverified }
+}
+
+/// Every `use` in `docs[doc]` that doesn't resolve, by core's own rule
+/// (`check_imports`): a path no schema of the project matches, or an item
+/// the matched schema doesn't declare. `std::` paths aren't checked (std
+/// isn't part of a build yet), and two cases get the benefit of the doubt:
+/// a schema that exists but doesn't parse right now, and a declared
+/// dependency the project has no files for (reported as unverified, with the
+/// reason).
+///
+/// Only with the package's `config.idp` in the project: without it, the
+/// files at hand may not be the whole package (a single file in the
+/// playground), and nothing could be called unresolved.
+fn resolution(project: &Project, doc: usize) -> (Vec<UnresolvedImport>, Vec<UnverifiedImport>) {
+    if !project.has_manifest {
+        return (vec![], vec![]);
+    }
+    let here = &project.docs[doc];
+    let resolver = ImportResolver::new(vec![], HashMap::new(), None);
+
+    let top_level: BTreeSet<&str> = project
+        .docs
+        .iter()
+        .map(|d| &d.namespace)
+        .chain(&project.unparsed)
+        .filter_map(|namespace| namespace.first().map(String::as_str))
+        .collect();
+    let declared: BTreeMap<&str, &DependencyKind> =
+        project.dependencies.iter().map(|d| (d.name.as_str(), &d.kind)).collect();
+    let indexed: BTreeSet<&str> = project.docs.iter().filter_map(|d| d.dependency).collect();
+
+    let mut unresolved = Vec::new();
+    let mut unverified = Vec::new();
+
+    for decl in &here.document.0 {
+        let Declaration::Use(use_stmt) = &decl.value else {
+            continue;
+        };
+        if use_path_root(&use_stmt.path) == Some("std") {
+            continue;
+        }
+
+        let span = decl.span;
+        let text = &here.source[span.0.min(here.source.len())..span.1.min(here.source.len())];
+
+        let resolved = match resolver.resolve_namespace(&use_stmt.path, &here.namespace) {
+            Ok(resolved) => resolved,
+            Err(detail) => {
+                unresolved.push(UnresolvedImport { range: span, detail, suggestion: None });
+                continue;
+            }
+        };
+        let namespace = resolved.absolute_namespace.clone();
+        let first = namespace.first().map(String::as_str).unwrap_or_default();
+        let use_decl = ResolvedUse {
+            resolved,
+            alias: use_stmt.alias.as_ref().map(|a| a.name.text.clone()),
+            span,
+        };
+
+        match target_of(project, Some(doc), &use_decl) {
+            Target::Found(sibling, remaining) => {
+                let target = &project.docs[sibling];
+                let symbols = &use_decl.resolved.symbols;
+                let named: Vec<String> = if symbols == &["*"] || (symbols.is_empty() && remaining.is_empty()) {
+                    vec![]
+                } else if !symbols.is_empty() {
+                    symbols.clone()
+                } else {
+                    vec![remaining.join("::")]
+                };
+
+                let importable = importable_names(target);
+                for name in named.iter().filter(|name| !importable.contains(*name)) {
+                    let item = name.rsplit("::").next().unwrap_or(name);
+                    let range = find_in(text, span.0, item, false);
+                    unresolved.push(UnresolvedImport {
+                        range: range.unwrap_or(span),
+                        detail: format!("schema '{}' doesn't declare '{name}'", target.namespace.join("::")),
+                        suggestion: range.and(closest(item, importable.iter().map(String::as_str))),
+                    });
+                }
+            }
+            Target::Outside => {
+                // A schema that exists but doesn't parse right now.
+                if project.unparsed.iter().any(|u| !u.is_empty() && namespace.starts_with(u)) {
+                    continue;
+                }
+
+                if let Some(kind) = declared.get(first) {
+                    if !indexed.contains(first) {
+                        unverified.push(UnverifiedImport { range: span, reason: unverified_reason(first, kind) });
+                        continue;
+                    }
+                }
+
+                let known = top_level.contains(first) || declared.contains_key(first);
+                let range = if known { None } else { find_in(text, span.0, first, true) };
+                unresolved.push(UnresolvedImport {
+                    range: range.unwrap_or(span),
+                    detail: format!(
+                        "no schema in this package or its dependencies matches '{}'",
+                        namespace.join("::")
+                    ),
+                    suggestion: range.and(closest(first, top_level.iter().copied().chain(declared.keys().copied()))),
+                });
+            }
+        }
+    }
+
+    (unresolved, unverified)
+}
+
+fn unverified_reason(name: &str, kind: &DependencyKind) -> String {
+    match kind {
+        DependencyKind::Git => format!("dependency `{name}` isn't fetched yet — run `comline check` to fetch it"),
+        DependencyKind::Registry => {
+            format!("dependency `{name}` comes from a registry, which isn't supported yet")
+        }
+        DependencyKind::Path(path) => format!("dependency `{name}` has no schemas at `{path}`"),
+    }
+}
+
+/// The first segment of a `use` path as written (`std` in `use std::x::Y`).
+fn use_path_root(path: &UsePath) -> Option<&str> {
+    let text = match path {
+        UsePath::Absolute(scoped) => &scoped.text,
+        UsePath::Glob(glob) => &glob.path.text,
+        UsePath::Multi(multi) => &multi.path.text,
+        UsePath::Relative(_) => return None,
+    };
+    text.split("::").next()
+}
+
+/// The byte range of `word` in a `use` line's `text` (starting at `base`):
+/// a namespace segment (followed by `::`) or an item (not followed by `::`,
+/// and not the alias after `as`).
+fn find_in(text: &str, base: usize, word: &str, segment: bool) -> Option<(usize, usize)> {
+    word_occurrences(text, word)
+        .into_iter()
+        .find(|&i| {
+            let followed_by_path = text[i + word.len()..].starts_with("::");
+            let after_as = text[..i].trim_end().strip_suffix("as").is_some_and(|before| before.ends_with(char::is_whitespace));
+            followed_by_path == segment && !after_as
+        })
+        .map(|i| (base + i, base + i + word.len()))
+}
+
+/// Every name a `use` can import from a schema: its types, protocols and
+/// consts, plus errors (`! Name` throws), validators and settings - what
+/// core's `check_imports` accepts.
+fn importable_names(doc: &ProjectDoc) -> BTreeSet<String> {
+    let mut names: BTreeSet<String> = doc.symbols.all_symbols().into_iter().map(|s| s.name.clone()).collect();
+    names.extend(doc.document.0.iter().filter_map(|decl| match &decl.value {
+        Declaration::Error(e) => Some(e.name.text.clone()),
+        Declaration::Validator(v) => Some(v.name.text.clone()),
+        Declaration::Settings(s) => Some(s.name.text.clone()),
+        _ => None,
+    }));
+    names
 }
 
 /// The project file a `use` points at: the longest prefix of its namespace
@@ -252,7 +439,7 @@ mod tests {
     }
 
     fn missing_names(files: &[(Url, String)], doc: usize) -> Vec<(String, Vec<String>)> {
-        let project = Project::new(files.iter().map(|(u, s)| (u, s.as_str())));
+        let project = Project::new(files.iter());
         let doc = project.index_of(&files[doc].0).unwrap();
         check(&project, doc)
             .missing
@@ -292,7 +479,7 @@ mod tests {
     fn an_alias_binds_only_the_alias() {
         let aliased = "use types::Message as Msg\n\nstruct S {\n    a: Msg\n    b: Message\n}\n";
         let files = project(&[("file:///pkg/src/chat.ids", aliased), TYPES]);
-        let project = Project::new(files.iter().map(|(u, s)| (u, s.as_str())));
+        let project = Project::new(files.iter());
 
         let missing = check(&project, 0).missing;
         assert_eq!(missing.len(), 1, "`Msg` is fine; `Message` isn't bound");
@@ -357,4 +544,132 @@ mod tests {
         ]);
         assert_eq!(missing_names(&files, 0), vec![]);
     }
+
+    // --- Resolution, with the package's manifest in the view ---
+
+    use crate::analysis::source::SourceFile;
+
+    const MANIFEST: &str = "congregation app\nspecification_version = 1\n\n\
+        dependencies = {\n    \
+            shared = {\n        path = \"../shared\"\n    }\n    \
+            net = {\n        version = \"1.0.0\"\n        uri = \"https://example.test/net\"\n        commit = \"abc\"\n    }\n\
+        }\n";
+
+    /// `chat.ids` (the file checked) with `body`, plus `types.ids`, the
+    /// manifest, and the `shared` dependency's `models.ids`.
+    /// (underlined text, detail, suggestion) per unresolved import.
+    type Found = Vec<(String, String, Option<String>)>;
+
+    fn resolution_of(body: &str) -> (Found, Vec<String>) {
+        let files = [
+            SourceFile::local(Url::parse("file:///pkg/src/chat.ids").unwrap(), body.to_string()),
+            SourceFile::local(
+                Url::parse("file:///pkg/src/types.ids").unwrap(),
+                "struct User {\n    id: u64\n}\n\nerror Gone {\n    message = \"gone\"\n}\n".to_string(),
+            ),
+            SourceFile::local(Url::parse("file:///pkg/src/broken.ids").unwrap(), "struct {".to_string()),
+            SourceFile::local(Url::parse("file:///pkg/config.idp").unwrap(), MANIFEST.to_string()),
+            SourceFile::of_dependency(
+                Url::parse("file:///shared/src/models.ids").unwrap(),
+                "struct Thing {\n    id: u64\n}\n".to_string(),
+                "shared",
+                vec!["shared".to_string(), "models".to_string()],
+            ),
+        ];
+        let project = Project::new(files.iter());
+        let check = check(&project, 0);
+        let unresolved = check
+            .unresolved
+            .iter()
+            .map(|u| (body[u.range.0..u.range.1].to_string(), u.detail.clone(), u.suggestion.clone()))
+            .collect();
+        (unresolved, check.unverified.iter().map(|u| u.reason.clone()).collect())
+    }
+
+    #[test]
+    fn a_typo_in_the_namespace_is_unresolved_with_a_suggestion() {
+        let (unresolved, _) = resolution_of("use typse::User\n\nstruct S {\n    u: User\n}\n");
+        assert_eq!(
+            unresolved,
+            vec![(
+                "typse".to_string(),
+                "no schema in this package or its dependencies matches 'typse::User'".to_string(),
+                Some("types".to_string())
+            )]
+        );
+    }
+
+    #[test]
+    fn an_item_the_schema_does_not_declare_is_unresolved() {
+        let (unresolved, _) = resolution_of("use types::{User, Usr}\n\nstruct S {\n    u: User\n}\n");
+        assert_eq!(
+            unresolved,
+            vec![("Usr".to_string(), "schema 'types' doesn't declare 'Usr'".to_string(), Some("User".to_string()))]
+        );
+    }
+
+    #[test]
+    fn imports_that_resolve_or_cannot_be_checked_are_not_unresolved() {
+        for body in [
+            "use types::User\n\nstruct S {\n    u: User\n}\n",
+            "use types::Gone\n\nstruct S {\n    id: u64\n}\n",
+            "use types\n\nstruct S {\n    u: User\n}\n",
+            "use std::collections::HashMap\n\nstruct S {\n    id: u64\n}\n",
+            "use broken::Anything\n\nstruct S {\n    id: u64\n}\n",
+            "use shared::models::Thing\n\nstruct S {\n    t: Thing\n}\n",
+        ] {
+            let (unresolved, unverified) = resolution_of(body);
+            assert!(unresolved.is_empty() && unverified.is_empty(), "{body}: {unresolved:?} {unverified:?}");
+        }
+    }
+
+    #[test]
+    fn a_dependency_with_files_is_checked_like_the_package() {
+        let (unresolved, _) = resolution_of("use shared::models::Thign\n\nstruct S {\n    id: u64\n}\n");
+        assert_eq!(
+            unresolved,
+            vec![(
+                "Thign".to_string(),
+                "schema 'shared::models' doesn't declare 'Thign'".to_string(),
+                Some("Thing".to_string())
+            )]
+        );
+
+        let (unresolved, _) = resolution_of("use shared::nothing::X\n\nstruct S {\n    id: u64\n}\n");
+        assert_eq!(unresolved.len(), 1, "{unresolved:?}");
+        assert_eq!(unresolved[0].1, "no schema in this package or its dependencies matches 'shared::nothing::X'");
+    }
+
+    #[test]
+    fn a_dependency_without_files_is_not_checked_and_says_why() {
+        let (unresolved, unverified) = resolution_of("use net::wire::Frame\n\nstruct S {\n    id: u64\n}\n");
+        assert!(unresolved.is_empty(), "{unresolved:?}");
+        assert_eq!(unverified, vec!["dependency `net` isn't fetched yet — run `comline check` to fetch it".to_string()]);
+    }
+
+    #[test]
+    fn without_the_manifest_nothing_is_called_unresolved() {
+        let files = project(&[("file:///pkg/src/chat.ids", "use typse::User\n\nstruct S {\n    id: u64\n}\n")]);
+        let project = Project::new(files.iter());
+        assert!(check(&project, 0).unresolved.is_empty());
+    }
+
+    #[test]
+    fn a_type_from_a_dependency_is_a_missing_import_candidate() {
+        let files = [
+            SourceFile::local(Url::parse("file:///pkg/src/chat.ids").unwrap(), "struct S {\n    t: Thing\n}\n".to_string()),
+            SourceFile::local(Url::parse("file:///pkg/config.idp").unwrap(), MANIFEST.to_string()),
+            SourceFile::of_dependency(
+                Url::parse("file:///shared/src/models.ids").unwrap(),
+                "struct Thing {\n    id: u64\n}\n".to_string(),
+                "shared",
+                vec!["shared".to_string(), "models".to_string()],
+            ),
+        ];
+        let project = Project::new(files.iter());
+        let missing = check(&project, 0).missing;
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].candidates[0].use_path("Thing"), "shared::models::Thing");
+    }
 }
+
