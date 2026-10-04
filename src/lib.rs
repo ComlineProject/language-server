@@ -17,7 +17,6 @@ pub mod analysis {
     pub mod diagnostics;
     pub mod imports;
     pub mod symbols;
-    pub mod types;
 }
 
 pub mod handlers {

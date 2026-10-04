@@ -7,6 +7,7 @@
 //! AST walk. Token positions are in characters (== UTF-16 units for ASCII
 //! schemas, which is the common case).
 
+use comline_core::schema::idl::vocabulary;
 use lsp_types::{SemanticToken, SemanticTokens, SemanticTokensResult, Url};
 
 // Indices into the `SemanticTokensLegend` declared in `backend.rs` — keep in
@@ -21,15 +22,6 @@ const DECORATOR: u32 = 5;
 /// The token-type names, in legend order. `backend.rs` turns these into
 /// `SemanticTokenType`s.
 pub const LEGEND_TYPES: &[&str] = &["keyword", "type", "string", "comment", "number", "decorator"];
-
-const KEYWORDS: &[&str] = &[
-    "struct", "enum", "protocol", "error", "const", "use", "import", "validator", "settings",
-    "function", "optional", "type",
-];
-const PRIMITIVES: &[&str] = &[
-    "s8", "s16", "s32", "s64", "u8", "u16", "u32", "u64", "f32", "f64", "bool", "str", "string",
-    "int", "float",
-];
 
 pub fn get_semantic_tokens(source: &str, _uri: &Url) -> Option<SemanticTokensResult> {
     let mut data: Vec<SemanticToken> = Vec::new();
@@ -115,9 +107,21 @@ fn lex_line(line: &str) -> Vec<(u32, u32, u32)> {
                 j += 1;
             }
             let word: String = chars[i..j].iter().collect();
-            let kind = if KEYWORDS.contains(&word.as_str()) {
-                Some(KEYWORD)
-            } else if PRIMITIVES.contains(&word.as_str())
+            let kind = if let Some(info) = vocabulary::keyword(&word) {
+                // `message` is a keyword only in `error { message = ... }` —
+                // a field named `message` is a plain identifier. Gate on the
+                // next non-whitespace char on this line being `=`, same rule
+                // as the `pygments-comline` lexer.
+                if info.contextual {
+                    let mut k = j;
+                    while k < chars.len() && chars[k].is_whitespace() {
+                        k += 1;
+                    }
+                    if chars.get(k) == Some(&'=') { Some(KEYWORD) } else { None }
+                } else {
+                    Some(KEYWORD)
+                }
+            } else if vocabulary::primitive(&word).is_some()
                 || word.starts_with(|c: char| c.is_uppercase())
             {
                 Some(TYPE)
@@ -180,6 +184,55 @@ mod tests {
             panic!()
         };
         assert!(t.data.is_empty());
+    }
+
+    #[test]
+    fn use_path_prefix_keywords_highlight() {
+        let src = "use parent::common\n";
+        let r = get_semantic_tokens(src, &Url::parse("file:///t.ids").unwrap()).unwrap();
+        let SemanticTokensResult::Tokens(t) = r else {
+            panic!()
+        };
+        // `use` (Declaration) and `parent` (PathPrefix) both colour as
+        // KEYWORD; `common` is a lowercase identifier, so it gets no token
+        // at all (not every word on the line is one of the three tokens).
+        assert_eq!(t.data.len(), 2);
+        assert!(t.data.iter().all(|x| x.token_type == KEYWORD));
+    }
+
+    #[test]
+    fn field_named_message_does_not_highlight_as_keyword() {
+        let src = "struct S {\n    message: str\n}\n";
+        let ty = types_on(src);
+        // `struct` (KEYWORD), `S` (TYPE), `str` (TYPE) — three tokens, none
+        // of them `message` itself: it's a field name here (followed by
+        // `:`, not `=`), so it must get no token at all, never KEYWORD.
+        assert_eq!(ty, vec![KEYWORD, TYPE, TYPE]);
+    }
+
+    #[test]
+    fn message_before_equals_highlights_as_keyword() {
+        let src = "error E {\n    message = \"x\"\n}\n";
+        let r = get_semantic_tokens(src, &Url::parse("file:///t.ids").unwrap()).unwrap();
+        let SemanticTokensResult::Tokens(t) = r else {
+            panic!()
+        };
+        assert!(t.data.iter().any(|x| x.token_type == KEYWORD && x.length == 7));
+    }
+
+    #[test]
+    fn signed_primitive_highlights_but_i32_does_not() {
+        let s32 = types_on("struct S {\n    f: s32\n}\n");
+        assert!(s32.contains(&TYPE));
+
+        let i32_src = "struct S {\n    f: i32\n}\n";
+        let r = get_semantic_tokens(i32_src, &Url::parse("file:///t.ids").unwrap()).unwrap();
+        let SemanticTokensResult::Tokens(t) = r else {
+            panic!()
+        };
+        // Only `struct` and `S` get tokens — `f` and `i32` are untouched
+        // since `i32` isn't a real Comline primitive (lowercase, no token).
+        assert_eq!(t.data.len(), 2);
     }
 
     #[test]
