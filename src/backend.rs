@@ -47,9 +47,10 @@ impl LanguageServer for Backend {
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 completion_provider: Some(CompletionOptions {
                     // `:` / `(` / `>` (the back half of `->`) each mark the
-                    // start of a type position; ` ` re-triggers a fresh
-                    // request on every space so the suggestion list doesn't
-                    // just vanish when a type position's `:`/`->`/`(` is
+                    // start of a type position; `@` marks the start of an
+                    // annotation key; ` ` re-triggers a fresh request on
+                    // every space so the suggestion list doesn't just
+                    // vanish when a type position's `:`/`->`/`(` is
                     // followed by whitespace before the type itself (the
                     // default "trigger on word characters only" behavior
                     // otherwise closes the widget the moment a space is
@@ -59,7 +60,7 @@ impl LanguageServer for Backend {
                     // appropriately narrow (often empty) list everywhere
                     // else.
                     trigger_characters: Some(
-                        [".", ":", "(", ">", " "].iter().map(|s| s.to_string()).collect(),
+                        [".", ":", "(", ">", " ", "@"].iter().map(|s| s.to_string()).collect(),
                     ),
                     ..Default::default()
                 }),
