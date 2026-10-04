@@ -1,10 +1,7 @@
 // Definition handler - provides go-to-definition functionality
 
-use crate::analysis::imports::{self, ProjectFile};
-use crate::analysis::symbols;
-use crate::parser;
-use crate::util::position_to_offset;
-use comline_core::schema::idl::grammar::Document;
+use crate::analysis::project::Project;
+use crate::util::{position_to_offset, word_range_at};
 use lsp_types::{GotoDefinitionResponse, Position, Url};
 
 /// Find the definition of a symbol at a position, considering only this file.
@@ -14,95 +11,23 @@ pub fn find_definition(source: &str, uri: &Url, position: Position) -> Option<Go
 
 /// Find the definition of a symbol at a position, also searching
 /// `other_files` (every other file in the project, as `(uri, source)`
-/// pairs) when it isn't declared in this file. Same lookup order as
-/// `hover::get_hover_info_with_project`: the local symbol table, then a
-/// `use`/`import` here that actually brings the word into scope from one
-/// specific sibling (`crate::analysis::imports`), then a flat, first-match
-/// scan across every other file as a fallback (the project view is only
-/// whichever files happen to be open, so "no `use` resolves this" is often
-/// just a sibling that isn't open, or a `use` mid-edit).
+/// pairs) when it isn't declared in this file. See [`Project::resolve`]
+/// for the lookup order (local, then `use`-scoped, then a flat fallback) -
+/// shared with find-references and rename, so the three always agree.
 pub fn find_definition_with_project(
     source: &str,
     uri: &Url,
     position: Position,
     other_files: &[(Url, String)],
 ) -> Option<GotoDefinitionResponse> {
-    // Convert position to byte offset
     let offset = position_to_offset(source, position)?;
+    let (start, end) = word_range_at(source, offset)?;
 
-    // Parse the document
-    let parse_result = parser::parse(source).ok()?;
-    let document = parse_result.document?;
+    let project = Project::with_active(uri, source, other_files);
+    let active = project.index_of(uri)?;
+    let target = project.resolve(active, &source[start..end])?;
 
-    // Build symbol table
-    let symbol_table = symbols::build_symbol_table(&document, uri, source);
-
-    // Extract word at position
-    let word = get_word_at_offset(source, offset)?;
-
-    // Look up the symbol
-    if let Some(symbol) = symbol_table.get(&word) {
-        return Some(GotoDefinitionResponse::Scalar(symbol.location.clone()));
-    }
-
-    let other_docs: Vec<(&Url, &String, Document)> = other_files
-        .iter()
-        .filter_map(|(u, s)| parser::parse(s).ok()?.document.map(|d| (u, s, d)))
-        .collect();
-
-    // A `use`/`import` here that brings `word` into scope from one sibling
-    let own_imports = imports::resolved_imports(&document, &imports::namespace_of(uri));
-    let siblings: Vec<ProjectFile> =
-        other_docs.iter().map(|(u, s, _)| ProjectFile::new(u, s)).collect();
-
-    if let Some(resolved) = imports::resolve_symbol(&word, &own_imports, &siblings) {
-        let sibling = resolved.file;
-        if let Some((_, _, other_document)) =
-            other_docs.iter().find(|(u, _, _)| **u == *sibling.uri)
-        {
-            let other_table =
-                symbols::build_symbol_table(other_document, sibling.uri, sibling.source);
-            // `real_name`, not `word` - they differ for an `as` alias (see
-            // `ResolvedSymbol::real_name`'s doc).
-            if let Some(symbol) = other_table.get(&resolved.real_name) {
-                return Some(GotoDefinitionResponse::Scalar(symbol.location.clone()));
-            }
-        }
-    }
-
-    // Fallback: flat, project-wide, first-match scan - not `use`-scoped
-    for (other_uri, other_source, other_document) in &other_docs {
-        let other_table = symbols::build_symbol_table(other_document, other_uri, other_source);
-        if let Some(symbol) = other_table.get(&word) {
-            return Some(GotoDefinitionResponse::Scalar(symbol.location.clone()));
-        }
-    }
-
-    None
-}
-
-/// Get word at byte offset
-fn get_word_at_offset(source: &str, offset: usize) -> Option<String> {
-    if offset >= source.len() {
-        return None;
-    }
-    
-    // Find word boundaries (alphanumeric + underscore)
-    let start = source[..offset]
-        .rfind(|c: char| !c.is_alphanumeric() && c != '_')
-        .map(|i| i + 1)
-        .unwrap_or(0);
-    
-    let end = source[offset..]
-        .find(|c: char| !c.is_alphanumeric() && c != '_')
-        .map(|i| offset + i)
-        .unwrap_or(source.len());
-    
-    if start < end {
-        Some(source[start..end].to_string())
-    } else {
-        None
-    }
+    project.declaration(&target).map(GotoDefinitionResponse::Scalar)
 }
 
 #[cfg(test)]
@@ -310,15 +235,5 @@ struct User {
         ));
 
         assert_eq!(location.uri, active_uri);
-    }
-
-    #[test]
-    fn test_word_extraction() {
-        let source = "struct User { }";
-        
-        // Test word extraction at different positions
-        assert_eq!(get_word_at_offset(source, 7), Some("User".to_string()));
-        assert_eq!(get_word_at_offset(source, 8), Some("User".to_string()));
-        assert_eq!(get_word_at_offset(source, 0), Some("struct".to_string()));
     }
 }

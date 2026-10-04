@@ -16,6 +16,7 @@ pub mod util;
 pub mod analysis {
     pub mod diagnostics;
     pub mod imports;
+    pub mod project;
     pub mod symbols;
 }
 

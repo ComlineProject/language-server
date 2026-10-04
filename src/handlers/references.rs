@@ -1,168 +1,49 @@
 // References handler - finds all usages of a symbol
 
-use crate::analysis::symbols;
-use crate::parser;
-use crate::util::{byte_range_to_lsp_range, position_to_offset};
-use comline_core::schema::idl::grammar::{Declaration, Type};
+use crate::analysis::project::Project;
+use crate::util::{position_to_offset, word_range_at};
 use lsp_types::{Location, Position, Url};
 
-/// Find all references to a symbol at a position
+/// Find all references to a symbol at a position, considering only this file.
 pub fn find_references(
     source: &str,
     uri: &Url,
     position: Position,
     include_declaration: bool,
 ) -> Vec<Location> {
-    // Convert position to byte offset
-    let offset = match position_to_offset(source, position) {
-        Some(o) => o,
-        None => return vec![],
+    find_references_with_project(source, uri, position, include_declaration, &[])
+}
+
+/// Find all references to the symbol at a position across this file and
+/// `other_files` (every other file in the project, as `(uri, source)`
+/// pairs): every place whose go-to-definition lands on the same
+/// declaration (see [`Project::references`]). Works from the declaration
+/// itself, from any use of it, or from a `use` line importing it.
+pub fn find_references_with_project(
+    source: &str,
+    uri: &Url,
+    position: Position,
+    include_declaration: bool,
+    other_files: &[(Url, String)],
+) -> Vec<Location> {
+    let Some(offset) = position_to_offset(source, position) else {
+        return vec![];
     };
-    
-    // Parse the document
-    let parse_result = match parser::parse(source) {
-        Ok(r) => r,
-        Err(_) => return vec![],
+    let Some((start, end)) = word_range_at(source, offset) else {
+        return vec![];
     };
-    
-    let document = match parse_result.document {
-        Some(doc) => doc,
-        None => return vec![],
+
+    let project = Project::with_active(uri, source, other_files);
+    let Some(target) = project.index_of(uri).and_then(|i| project.resolve(i, &source[start..end])) else {
+        return vec![];
     };
-    
-    // Build symbol table to get the symbol name
-    let symbol_table = symbols::build_symbol_table(&document, uri, source);
-    
-    // Extract word at position
-    let word = match get_word_at_offset(source, offset) {
-        Some(w) => w,
-        None => return vec![],
-    };
-    
-    // Check if it's a known symbol
-    let _symbol = match symbol_table.get(&word) {
-        Some(s) => s,
-        None => return vec![], // Not a defined symbol
-    };
-    
-    // Find all references to this symbol
-    let mut references = Vec::new();
-    
-    // Find declaration location (if requested)
+
+    let mut locations = Vec::new();
     if include_declaration {
-        if let Some(symbol) = symbol_table.get(&word) {
-            references.push(symbol.location.clone());
-        }
+        locations.extend(project.declaration(&target));
     }
-    
-    // Search for type references in all declarations
-    for decl in &document.0 {
-        match &**decl {
-            Declaration::Struct(s) => {
-                // Check each field type
-                for field in s.fields() {
-                    if let Some(loc) = check_type_reference(field.field_type(), &word, source, uri) {
-                        references.push(loc);
-                    }
-                }
-            }
-            Declaration::Protocol(p) => {
-                // Check function arguments and return types
-                for func in p.functions() {
-                    // Check arguments
-                    if let Some(args) = func.args() {
-                        // First argument
-                        if let Some(loc) = check_type_reference(args.first().arg_type(), &word, source, uri) {
-                            references.push(loc);
-                        }
-                        // Rest of arguments
-                        for arg in args.rest() {
-                            if let Some(loc) = check_type_reference(arg.arg_type().arg_type(), &word, source, uri) {
-                                references.push(loc);
-                            }
-                        }
-                    }
-                    
-                    // Check return type
-                    if let Some(ret) = func.return_type() {
-                        if let Some(loc) = check_type_reference(ret.return_type(), &word, source, uri) {
-                            references.push(loc);
-                        }
-                    }
-                }
-            }
-            Declaration::Const(c) => {
-                // Check const type
-                if let Some(loc) = check_type_reference(c.type_def(), &word, source, uri) {
-                    references.push(loc);
-                }
-            }
-            Declaration::TypeAlias(t) => {
-                // A reference inside another alias's own target, e.g.
-                // `type Y = UserId`.
-                if let Some(loc) = check_type_reference(t.target_type(), &word, source, uri) {
-                    references.push(loc);
-                }
-            }
-            _ => {}
-        }
-    }
-    
-    references
-}
-
-/// Check if a type references the target symbol
-fn check_type_reference(ty: &Type, target: &str, source: &str, uri: &Url) -> Option<Location> {
-    match ty {
-        Type::Named(name) if name.text == target => {
-            // Find this reference in the source
-            if let Some(pos) = find_word_in_source(source, &name.text) {
-                let range = byte_range_to_lsp_range(source, pos, name.text.len());
-                Some(Location {
-                    uri: uri.clone(),
-                    range,
-                })
-            } else {
-                None
-            }
-        }
-        Type::Array(arr) => {
-            // Check array element type
-            check_type_reference(arr.elem_type(), target, source, uri)
-        }
-        _ => None,
-    }
-}
-
-/// Find a word in source (returns first occurrence)
-fn find_word_in_source(source: &str, word: &str) -> Option<usize> {
-    // This is simplified - ideally we'd find ALL occurrences
-    // and match them to AST positions
-    source.find(word)
-}
-
-/// Get word at byte offset
-fn get_word_at_offset(source: &str, offset: usize) -> Option<String> {
-    if offset >= source.len() {
-        return None;
-    }
-    
-    // Find word boundaries (alphanumeric + underscore)
-    let start = source[..offset]
-        .rfind(|c: char| !c.is_alphanumeric() && c != '_')
-        .map(|i| i + 1)
-        .unwrap_or(0);
-    
-    let end = source[offset..]
-        .find(|c: char| !c.is_alphanumeric() && c != '_')
-        .map(|i| offset + i)
-        .unwrap_or(source.len());
-    
-    if start < end {
-        Some(source[start..end].to_string())
-    } else {
-        None
-    }
+    locations.extend(project.references(&target).into_iter().map(|r| r.location));
+    locations
 }
 
 #[cfg(test)]
@@ -213,7 +94,7 @@ struct Request {
         let refs = find_references(source, &uri, position, false);
         
         // Should find only usages, not declaration
-        assert!(refs.len() >= 1, "Expected at least 1 reference");
+        assert!(!refs.is_empty(), "Expected at least 1 reference");
     }
     
     #[test]
@@ -251,5 +132,38 @@ struct User {
         
         // Should return empty for primitives
         assert!(refs.is_empty(), "Should not find references for primitive types");
+    }
+
+    #[test]
+    fn test_find_references_returns_each_usage_once_at_its_own_position() {
+        let source = "struct User {\n    name: string\n}\n\nstruct Request {\n    user: User\n}\n\nstruct Response {\n    user: User\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+
+        let refs = find_references(source, &uri, Position::new(0, 8), true);
+        let mut starts: Vec<_> = refs.iter().map(|l| (l.range.start.line, l.range.start.character)).collect();
+        starts.sort();
+
+        assert_eq!(starts, vec![(0, 7), (5, 10), (9, 10)]);
+        assert!(refs.iter().all(|l| l.range.end.character == l.range.start.character + 4));
+    }
+
+    #[test]
+    fn test_find_references_across_files_from_a_usage() {
+        let chat_source = "use types::Message\n\nstruct S {\n    m: Message\n}\n";
+        let types_source = "struct Message {\n    text: string\n}\n";
+        let chat_uri = Url::parse("file:///chat.ids").unwrap();
+        let types_uri = Url::parse("file:///types.ids").unwrap();
+
+        // From `m: Message` in chat.ids
+        let refs = find_references_with_project(
+            chat_source,
+            &chat_uri,
+            Position::new(3, 8),
+            true,
+            &[(types_uri.clone(), types_source.to_string())],
+        );
+
+        assert_eq!(refs.len(), 3, "declaration + `use` line + field: {refs:?}");
+        assert!(refs.iter().any(|l| l.uri == types_uri && l.range.start.line == 0));
     }
 }

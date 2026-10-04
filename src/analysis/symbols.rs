@@ -2,7 +2,8 @@
 
 use comline_core::schema::idl::grammar::{Declaration, Document};
 use std::collections::HashMap;
-use lsp_types::{Location, Position, Range, SymbolKind, Url};
+use crate::util::{byte_range_to_lsp_range, word_occurrences};
+use lsp_types::{Location, Range, SymbolKind, Url};
 
 #[derive(Debug, Clone)]
 pub struct Symbol {
@@ -64,9 +65,6 @@ impl Default for SymbolTable {
 pub fn build_symbol_table(document: &Document, uri: &Url, source: &str) -> SymbolTable {
     let mut table = SymbolTable::new();
     
-    // Track line starts for position calculation
-    let _line_starts = build_line_starts(source);
-    
     // Walk through all declarations (each is `Spanned<Declaration>` — deref to match)
     for declaration in &document.0 {
         match &**declaration {
@@ -74,9 +72,7 @@ pub fn build_symbol_table(document: &Document, uri: &Url, source: &str) -> Symbo
                 let name = s.name();
                 let children: Vec<String> = s.fields().iter().map(|f| f.name()).collect();
                 
-                // For now, use approximate position (we'd need byte offsets from rust-sitter)
-                // This is a simplified version - ideally we'd get exact positions from the AST
-                let range = find_declaration_range(source, &name);
+                let range = declaration_name_range(source, declaration.span, "struct", &name);
                 
                 table.insert(
                     name.clone(),
@@ -95,7 +91,7 @@ pub fn build_symbol_table(document: &Document, uri: &Url, source: &str) -> Symbo
                 let name = e.name();
                 let children: Vec<String> = e.variants().iter().map(|v| v.identifier().text.clone()).collect();
                 
-                let range = find_declaration_range(source, &name);
+                let range = declaration_name_range(source, declaration.span, "enum", &name);
                 
                 table.insert(
                     name.clone(),
@@ -114,7 +110,7 @@ pub fn build_symbol_table(document: &Document, uri: &Url, source: &str) -> Symbo
                 let name = p.name();
                 let children: Vec<String> = p.functions().iter().map(|f| f.name()).collect();
                 
-                let range = find_declaration_range(source, &name);
+                let range = declaration_name_range(source, declaration.span, "protocol", &name);
                 
                 table.insert(
                     name.clone(),
@@ -131,7 +127,7 @@ pub fn build_symbol_table(document: &Document, uri: &Url, source: &str) -> Symbo
             }
             Declaration::Const(c) => {
                 let name = c.name();
-                let range = find_declaration_range(source, &name);
+                let range = declaration_name_range(source, declaration.span, "const", &name);
                 
                 table.insert(
                     name.clone(),
@@ -148,7 +144,7 @@ pub fn build_symbol_table(document: &Document, uri: &Url, source: &str) -> Symbo
             }
             Declaration::TypeAlias(t) => {
                 let name = t.name();
-                let range = find_declaration_range(source, &name);
+                let range = declaration_name_range(source, declaration.span, "type", &name);
 
                 // `TYPE_PARAMETER` is the closest LSP-standard fit for a
                 // transparent type alias - LSP 3.17's `SymbolKind` has no
@@ -180,35 +176,25 @@ pub fn build_symbol_table(document: &Document, uri: &Url, source: &str) -> Symbo
     table
 }
 
-/// Build line starts index for position calculation
-fn build_line_starts(source: &str) -> Vec<usize> {
-    std::iter::once(0)
-        .chain(source.match_indices('\n').map(|(i, _)| i + 1))
-        .collect()
-}
+/// The range of a declaration's own name: the first whole-word `name`
+/// inside the declaration's span that directly follows its `keyword`
+/// (`struct User`) - not just the first `User` anywhere in the file, which
+/// could be inside `UserProfile`, a `use` line, or a docstring. Rename
+/// edits this range, so it has to be exact.
+fn declaration_name_range(source: &str, span: (usize, usize), keyword: &str, name: &str) -> Range {
+    let (start, end) = (span.0.min(source.len()), span.1.min(source.len()));
+    let text = &source[start..end];
 
-/// Find the range of a declaration by searching for its name
-/// This is a simplified heuristic - ideally we'd get exact byte offsets from the parser
-fn find_declaration_range(source: &str, name: &str) -> Range {
-    // Search for the name in the source
-    if let Some(pos) = source.find(name) {
-        // Convert byte offset to line/column
-        let line_starts = build_line_starts(source);
-        let line = line_starts.iter().position(|&start| start > pos).unwrap_or(line_starts.len()) - 1;
-        let line_start = line_starts[line];
-        let column = source[line_start..pos].chars().count();
-        
-        let start = Position::new(line as u32, column as u32);
-        let end = Position::new(line as u32, (column + name.len()) as u32);
-        
-        Range { start, end }
-    } else {
-        // Fallback to 0,0
-        Range {
-            start: Position::new(0, 0),
-            end: Position::new(0, 0),
-        }
-    }
+    let offset = word_occurrences(text, name)
+        .into_iter()
+        .find(|&i| {
+            let before = text[..i].trim_end();
+            word_occurrences(before, keyword).last().is_some_and(|&k| k + keyword.len() == before.len())
+        })
+        .map(|i| start + i)
+        .unwrap_or(start);
+
+    byte_range_to_lsp_range(source, offset, offset + name.len())
 }
 
 #[cfg(test)]
@@ -281,5 +267,20 @@ protocol UserService {
         let protocol = table.get("UserService").unwrap();
         assert_eq!(protocol.kind, SymbolKind::INTERFACE);
         assert_eq!(protocol.children.len(), 2);
+    }
+
+    #[test]
+    fn declaration_range_is_the_declared_name_not_an_earlier_substring() {
+        // `User` appears first inside `UserProfile`, then in the `use`
+        // line, then in a docstring - none of them are the declaration.
+        let source = "use types::User\n\nstruct UserProfile {\n    id: u64\n}\n\n/// The User record\nstruct User {\n    name: string\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let result = parser::parse(source).unwrap();
+
+        let table = build_symbol_table(&result.document.unwrap(), &uri, source);
+        let range = table.get("User").unwrap().location.range;
+
+        assert_eq!(range.start, lsp_types::Position::new(7, 7));
+        assert_eq!(range.end, lsp_types::Position::new(7, 11));
     }
 }

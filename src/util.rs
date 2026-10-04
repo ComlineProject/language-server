@@ -51,6 +51,47 @@ pub fn byte_range_to_lsp_range(text: &str, start: usize, end: usize) -> Range {
     }
 }
 
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// The identifier (alphanumerics + `_`) touching byte `offset`, as its byte
+/// range — `None` when `offset` is past the end or not on an identifier.
+pub fn word_range_at(text: &str, offset: usize) -> Option<(usize, usize)> {
+    if offset >= text.len() {
+        return None;
+    }
+
+    let start = text[..offset]
+        .rfind(|c: char| !is_ident_char(c))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+
+    let end = text[offset..]
+        .find(|c: char| !is_ident_char(c))
+        .map(|i| offset + i)
+        .unwrap_or(text.len());
+
+    (start < end).then_some((start, end))
+}
+
+/// Every whole-identifier occurrence of `word` in `text`, as byte offsets —
+/// `User` matches in `user: User`, but not inside `UserId` or `my_User`.
+pub fn word_occurrences(text: &str, word: &str) -> Vec<usize> {
+    if word.is_empty() {
+        return vec![];
+    }
+
+    text.match_indices(word)
+        .map(|(i, _)| i)
+        .filter(|&i| {
+            let before = text[..i].chars().next_back();
+            let after = text[i + word.len()..].chars().next();
+            !before.is_some_and(is_ident_char) && !after.is_some_and(is_ident_char)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -71,5 +112,20 @@ mod tests {
         assert_eq!(offset_to_position(text, 3), Position::new(0, 3));
         assert_eq!(offset_to_position(text, 6), Position::new(1, 0));
         assert_eq!(offset_to_position(text, 14), Position::new(2, 2));
+    }
+
+    #[test]
+    fn test_word_range_at() {
+        let text = "user: User[]";
+        assert_eq!(word_range_at(text, 8), Some((6, 10)));
+        assert_eq!(word_range_at(text, 0), Some((0, 4)));
+        assert_eq!(word_range_at(text, 4), Some((0, 4)), "just past a word still counts");
+        assert_eq!(word_range_at(text, 5), None);
+    }
+
+    #[test]
+    fn test_word_occurrences_are_whole_words_only() {
+        let text = "struct UserId { user: User, u: my_User, v: User[] }";
+        assert_eq!(word_occurrences(text, "User"), vec![22, 43]);
     }
 }

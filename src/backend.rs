@@ -21,6 +21,18 @@ impl Backend {
             documents: Arc::new(DocumentStore::new()),
         }
     }
+
+    /// Every other open `.ids` buffer as `(uri, text)`, so a cross-file
+    /// reference can resolve (only covers open buffers, not the whole
+    /// workspace — there's no workspace scan on `initialize`).
+    fn other_open_files(&self, uri: &Url) -> Vec<(Url, String)> {
+        self.documents
+            .get_all_uris()
+            .into_iter()
+            .filter(|u| u != uri && !is_idp(u))
+            .filter_map(|u| self.documents.get(&u).map(|d| (u, d.text)))
+            .collect()
+    }
 }
 
 /// Whether `uri` is a `.idp` (package/congregation config) document, as
@@ -162,16 +174,7 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
 
-        // Every other file currently open as a buffer, so a cross-file type
-        // reference can still resolve (only covers open buffers, not the
-        // whole workspace — there's no workspace scan on `initialize`).
-        let other_files: Vec<(Url, String)> = self
-            .documents
-            .get_all_uris()
-            .into_iter()
-            .filter(|u| u != &uri)
-            .filter_map(|u| self.documents.get(&u).map(|d| (u, d.text)))
-            .collect();
+        let other_files = self.other_open_files(&uri);
 
         // Use our hover handler
         use crate::handlers::hover;
@@ -227,15 +230,7 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
         
-        // Every other open buffer, so a cross-file reference can resolve
-        // (same scope as hover - no workspace scan on `initialize`).
-        let other_files: Vec<(Url, String)> = self
-            .documents
-            .get_all_uris()
-            .into_iter()
-            .filter(|u| u != &uri)
-            .filter_map(|u| self.documents.get(&u).map(|d| (u, d.text)))
-            .collect();
+        let other_files = self.other_open_files(&uri);
 
         // Use our definition handler
         use crate::handlers::definition;
@@ -265,7 +260,13 @@ impl LanguageServer for Backend {
         
         // Use our references handler
         use crate::handlers::references;
-        let refs = references::find_references(&document.text, &uri, position, include_declaration);
+        let refs = references::find_references_with_project(
+            &document.text,
+            &uri,
+            position,
+            include_declaration,
+            &self.other_open_files(&uri),
+        );
         
         if refs.is_empty() {
             Ok(None)
@@ -346,7 +347,38 @@ impl LanguageServer for Backend {
         
         // Use our rename handler
         use crate::handlers::rename;
-        Ok(rename::rename_symbol(&document.text, &uri, position, &new_name))
+        Ok(rename::rename_symbol_with_project(
+            &document.text,
+            &uri,
+            position,
+            &new_name,
+            &self.other_open_files(&uri),
+        ))
+    }
+
+    async fn prepare_rename(
+        &self,
+        params: TextDocumentPositionParams,
+    ) -> Result<Option<PrepareRenameResponse>> {
+        let uri = params.text_document.uri;
+
+        if is_idp(&uri) {
+            return Ok(None);
+        }
+
+        let document = match self.documents.get(&uri) {
+            Some(doc) => doc,
+            None => return Ok(None),
+        };
+
+        use crate::handlers::rename;
+        Ok(rename::prepare_rename_with_project(
+            &document.text,
+            &uri,
+            params.position,
+            &self.other_open_files(&uri),
+        )
+        .map(PrepareRenameResponse::Range))
     }
 
     async fn semantic_tokens_full(
