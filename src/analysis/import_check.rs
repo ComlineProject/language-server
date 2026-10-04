@@ -20,7 +20,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use comline_core::schema::idl::grammar::{Declaration, UsePath};
+use comline_core::schema::idl::grammar::Declaration;
 use comline_core::schema::ir::compiler::import_resolver::ImportResolver;
 use comline_core::schema::ir::frozen::unit::FrozenUnit;
 use lsp_types::SymbolKind;
@@ -28,6 +28,7 @@ use lsp_types::SymbolKind;
 use crate::analysis::imports::ResolvedUse;
 use crate::analysis::project::{named_type_sites, Project, ProjectDoc};
 use crate::analysis::source::DependencyKind;
+use crate::analysis::stdlib;
 use crate::util::{closest, word_occurrences};
 
 /// What [`check`] found for one file.
@@ -239,10 +240,6 @@ fn resolution(project: &Project, doc: usize) -> (Vec<UnresolvedImport>, Vec<Unve
         let Declaration::Use(use_stmt) = &decl.value else {
             continue;
         };
-        if use_path_root(&use_stmt.path) == Some("std") {
-            continue;
-        }
-
         let span = decl.span;
         let text = &here.source[span.0.min(here.source.len())..span.1.min(here.source.len())];
 
@@ -297,6 +294,11 @@ fn resolution(project: &Project, doc: usize) -> (Vec<UnresolvedImport>, Vec<Unve
                     }
                 }
 
+                if first == stdlib::NAME {
+                    unresolved.push(unknown_std_path(project, text, span, &namespace));
+                    continue;
+                }
+
                 let known = top_level.contains(first) || declared.contains_key(first);
                 let range = if known { None } else { find_in(text, span.0, first, true) };
                 unresolved.push(UnresolvedImport {
@@ -314,6 +316,25 @@ fn resolution(project: &Project, doc: usize) -> (Vec<UnresolvedImport>, Vec<Unve
     (unresolved, unverified)
 }
 
+/// A `std::` path no std schema matches, worded like the build's, with the
+/// closest std namespace (`std::htp` → `std::http`) as the quick fix for the
+/// two segments written.
+fn unknown_std_path(project: &Project, text: &str, span: (usize, usize), namespace: &[String]) -> UnresolvedImport {
+    let written = namespace.iter().take(2).cloned().collect::<Vec<_>>().join("::");
+    let std_namespaces: BTreeSet<String> = project
+        .docs
+        .iter()
+        .filter(|d| d.dependency == Some(stdlib::NAME))
+        .map(|d| d.namespace.iter().take(2).cloned().collect::<Vec<_>>().join("::"))
+        .collect();
+    let range = text.find(&written).map(|i| (span.0 + i, span.0 + i + written.len()));
+    UnresolvedImport {
+        range: range.unwrap_or(span),
+        detail: format!("std has no schema matching '{}'", namespace.join("::")),
+        suggestion: range.and(closest(&written, std_namespaces.iter().map(String::as_str))),
+    }
+}
+
 fn unverified_reason(name: &str, kind: &DependencyKind) -> String {
     match kind {
         DependencyKind::Git => format!("dependency `{name}` isn't fetched yet — run `comline check` to fetch it"),
@@ -322,17 +343,6 @@ fn unverified_reason(name: &str, kind: &DependencyKind) -> String {
         }
         DependencyKind::Path(path) => format!("dependency `{name}` has no schemas at `{path}`"),
     }
-}
-
-/// The first segment of a `use` path as written (`std` in `use std::x::Y`).
-fn use_path_root(path: &UsePath) -> Option<&str> {
-    let text = match path {
-        UsePath::Absolute(scoped) => &scoped.text,
-        UsePath::Glob(glob) => &glob.path.text,
-        UsePath::Multi(multi) => &multi.path.text,
-        UsePath::Relative(_) => return None,
-    };
-    text.split("::").next()
 }
 
 /// The byte range of `word` in a `use` line's `text` (starting at `base`):
@@ -561,7 +571,7 @@ mod tests {
     type Found = Vec<(String, String, Option<String>)>;
 
     fn resolution_of(body: &str) -> (Found, Vec<String>) {
-        let files = [
+        let mut files = vec![
             SourceFile::local(Url::parse("file:///pkg/src/chat.ids").unwrap(), body.to_string()),
             SourceFile::local(
                 Url::parse("file:///pkg/src/types.ids").unwrap(),
@@ -576,6 +586,7 @@ mod tests {
                 vec!["shared".to_string(), "models".to_string()],
             ),
         ];
+        files.extend(crate::analysis::stdlib::files(&crate::analysis::stdlib::root()));
         let project = Project::new(files.iter());
         let check = check(&project, 0);
         let unresolved = check
@@ -614,13 +625,37 @@ mod tests {
             "use types::User\n\nstruct S {\n    u: User\n}\n",
             "use types::Gone\n\nstruct S {\n    id: u64\n}\n",
             "use types\n\nstruct S {\n    u: User\n}\n",
-            "use std::collections::HashMap\n\nstruct S {\n    id: u64\n}\n",
+            "use std::http::{Request, Response}\n\nstruct S {\n    r: Request\n}\n",
+            "use std::validators::StringBounds\n\nstruct S {\n    id: u64\n}\n",
             "use broken::Anything\n\nstruct S {\n    id: u64\n}\n",
             "use shared::models::Thing\n\nstruct S {\n    t: Thing\n}\n",
         ] {
             let (unresolved, unverified) = resolution_of(body);
             assert!(unresolved.is_empty() && unverified.is_empty(), "{body}: {unresolved:?} {unverified:?}");
         }
+    }
+
+    #[test]
+    fn std_is_checked_like_the_build_checks_it() {
+        let (unresolved, _) = resolution_of("use std::htp::Request\n\nstruct S {\n    id: u64\n}\n");
+        assert_eq!(
+            unresolved,
+            vec![(
+                "std::htp".to_string(),
+                "std has no schema matching 'std::htp::Request'".to_string(),
+                Some("std::http".to_string())
+            )]
+        );
+
+        let (unresolved, _) = resolution_of("use std::http::Reqest\n\nstruct S {\n    id: u64\n}\n");
+        assert_eq!(
+            unresolved,
+            vec![(
+                "Reqest".to_string(),
+                "schema 'std::http' doesn't declare 'Reqest'".to_string(),
+                Some("Request".to_string())
+            )]
+        );
     }
 
     #[test]

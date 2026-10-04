@@ -2,6 +2,7 @@
 
 use crate::analysis::imports::{self, ProjectFile};
 use crate::analysis::source::{self, ProjectSource};
+use crate::analysis::stdlib;
 use crate::analysis::symbols;
 use crate::parser;
 use crate::util::position_to_offset;
@@ -125,20 +126,16 @@ pub fn get_hover_info_with_project<S: ProjectSource>(
     }
 
     // Fallback: flat, project-wide, first-match scan — not `use`-scoped,
-    // so append a note when the match isn't one any `use` here actually
-    // reaches (never for a `std::` import: that's a different, legitimate
-    // kind of not-locally-resolvable, not a "you forgot the use" case).
+    // so append a note: the match isn't one any `use` here actually reaches.
     for ((other_uri, other_source, other_document), (_, dependency)) in other_docs.iter().zip(&origins) {
         let other_table = symbols::build_symbol_table(other_document, other_uri, other_source);
         if let Some(symbol) = other_table.get(&word) {
             let mut hover = create_symbol_hover(symbol, other_document, &lookup);
-            if !resolves_via_std_import(&word, &own_imports) {
-                let place = match dependency {
-                    Some(name) => format!("`{}` (dependency `{name}`)", file_label(other_uri)),
-                    None => format!("`{}`", file_label(other_uri)),
-                };
-                append_note(&mut hover, format!("declared in {place} — no `use` here brings it into scope"));
-            }
+            let place = match dependency {
+                Some(name) => format!("`{}` ({})", file_label(other_uri), stdlib::owner(name)),
+                None => format!("`{}`", file_label(other_uri)),
+            };
+            append_note(&mut hover, format!("declared in {place} — no `use` here brings it into scope"));
             return Some(hover);
         }
     }
@@ -162,20 +159,6 @@ type Sibling<'a> = (&'a Url, &'a str, Document);
 /// Where a sibling sits: the namespace it's seen under, and the dependency
 /// it comes from (if any).
 type Origin<'a> = (Vec<String>, Option<&'a str>);
-
-/// Whether the active file's own imports bring `word` into scope from
-/// `std::` — the one case the fallback-match note (above) must stay quiet
-/// for, since a `std::` symbol is never locally resolvable by design, not
-/// because the author forgot a `use`. A simple last-segment check (not a
-/// full `use_brings_into_scope` call): `std` siblings never exist in this
-/// project, so there's nothing for `imports::resolve_symbol` to match —
-/// this just answers "would it have, if `std` had a schema on disk."
-fn resolves_via_std_import(word: &str, imports: &[imports::ResolvedUse]) -> bool {
-    imports.iter().any(|u| {
-        u.resolved.absolute_namespace.first().map(String::as_str) == Some("std")
-            && u.resolved.absolute_namespace.last().map(String::as_str) == Some(word)
-    })
-}
 
 /// The last path segment of a file's URI, for a short, readable hover note
 /// (`types.ids`, not the full URI). `url.path()`, not `Url::to_file_path()`
@@ -1294,35 +1277,19 @@ protocol Chat {
     }
 
     #[test]
-    fn use_std_import_falls_back_silently_with_no_note() {
-        // `std::` never matches a local sibling (there's no "std" file in
-        // this project), and a coincidental same-named local struct isn't
-        // the author forgetting a `use` - it's a different symbol
-        // entirely, so the fallback must stay quiet here, not suggest a
-        // fix that wouldn't apply.
-        let active_source =
-            "use std::collections::HashMap\n\nstruct S {\n    m: HashMap\n}\n";
-        let unrelated_source = "struct HashMap {\n    unrelated: bool\n}\n";
-
-        let active_uri = Url::parse("file:///active.ids").unwrap();
-        let unrelated_uri = Url::parse("file:///unrelated.ids").unwrap();
-        // Hover over "HashMap" in the field-type position.
+    fn a_std_type_hovers_with_its_std_declaration() {
+        let active_source = "use std::http::Request\n\nstruct S {\n    r: Request\n}\n";
+        let active_uri = Url::parse("file:///pkg/src/active.ids").unwrap();
+        // Hover over "Request" in the field-type position.
         let position = Position::new(3, 9);
+        let std = crate::analysis::stdlib::files(&crate::analysis::stdlib::root());
 
-        let hover = get_hover_info_with_project(
-            active_source,
-            &active_uri,
-            position,
-            &[(unrelated_uri, unrelated_source.to_string())],
-        )
-        .expect("flat-scan fallback should still resolve");
+        let hover = get_hover_info_with_project(active_source, &active_uri, position, &std).expect("std resolves");
         let text = hover_text(hover);
 
-        assert!(text.contains("struct HashMap"), "got: {text}");
-        assert!(
-            !text.contains("no `use` here brings it into scope"),
-            "a std:: import coincidentally sharing a name shouldn't get the not-use-scoped note, got: {text}"
-        );
+        assert!(text.contains("struct Request"), "got: {text}");
+        assert!(text.contains("An HTTP request"), "std's docstring, got: {text}");
+        assert!(!text.contains("no `use` here brings it into scope"), "it is imported, got: {text}");
     }
 
     fn package_with_dependency(active_uri: &str) -> Vec<crate::analysis::source::SourceFile> {

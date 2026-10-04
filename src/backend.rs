@@ -6,6 +6,7 @@ use std::sync::{Arc, RwLock};
 //
 use crate::analysis::imports::namespace_of;
 use crate::analysis::source::SourceFile;
+use crate::analysis::stdlib;
 use crate::dependencies;
 use crate::document::DocumentStore;
 use crate::workspace::{self, WorkspaceIndex};
@@ -25,6 +26,13 @@ pub struct Backend {
 }
 
 impl Backend {
+    /// `comline/stdSource`: the text of a std file (`comline-std:/http.ids`),
+    /// for a client to show it - std's files are virtual, never on disk.
+    /// `null` for a URL that isn't one of them. Params: `{ "uri": ... }`.
+    pub async fn std_source(&self, params: TextDocumentIdentifier) -> Result<Option<String>> {
+        Ok(stdlib::source(&params.uri))
+    }
+
     pub fn new(client: Client) -> Self {
         Self {
             client,
@@ -38,7 +46,14 @@ impl Backend {
     /// [`Backend::package_view`].
     fn other_project_files(&self, uri: &Url) -> Vec<SourceFile> {
         let own = workspace::path_key(uri);
-        self.package_view(uri).into_iter().filter(|f| workspace::path_key(&f.uri) != own).collect()
+        self.package_view(uri)
+            .into_iter()
+            .filter(|f| match (&own, workspace::path_key(&f.uri)) {
+                (Some(own), Some(key)) => *own != key,
+                // Not a file (std's `comline-std:` documents): the URI itself.
+                _ => f.uri != *uri,
+            })
+            .collect()
     }
 
     /// Everything `uri`'s package is analysed with: its schemas (open
@@ -61,9 +76,10 @@ impl Backend {
 
         let mut files: Vec<SourceFile> = open
             .iter()
-            .filter(|d| !is_idp(&d.uri) && workspace::package_root(&d.uri) == root)
+            .filter(|d| !is_idp(&d.uri) && !stdlib::is_std(&d.uri) && workspace::package_root(&d.uri) == root)
             .map(|d| SourceFile::local(d.uri.clone(), d.text.clone()))
             .collect();
+        files.extend(stdlib::files(&stdlib::root()));
         if root.is_none() {
             return files;
         }
@@ -681,7 +697,7 @@ impl Backend {
             .documents
             .get_all_uris()
             .into_iter()
-            .filter(|u| !is_idp(u))
+            .filter(|u| !is_idp(u) && !stdlib::is_std(u))
             .filter_map(|u| self.documents.get(&u))
             .collect();
 
