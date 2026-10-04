@@ -11,7 +11,7 @@ A Language Server Protocol (LSP) implementation for [Comline](https://github.com
 - **Hover Information** - Rich tooltips showing full type definitions and signatures
 - **Go to Definition** - Jump from type references to their declarations
 - **Find References** - Locate all usages of a symbol (with include/exclude declaration option)
-- **Auto-Completion** - Context-aware code suggestions (keywords, primitives, user types)
+- **Auto-Completion** - Context-aware code suggestions (keywords, primitives, user types, `@annotation` keys)
 - **Semantic Tokens** - Comline syntax highlighting from a shared lexer
 
 ### 🚧 Rougher / next
@@ -179,6 +179,34 @@ size: variable
 
 optional: yes
 ```
+
+### Auto-Completion
+
+Typing `@` suggests the keys that are actually known for wherever the
+cursor is — a different list on a field, a function, or a protocol/struct's
+own leading annotation, since the grammar permits `@key=value` in all four
+spots but each reads a different set of keys:
+
+```comline
+struct Message {
+    @v          // → validators
+}
+
+protocol Chat {
+    @t          // → timeout_ms, idempotent
+    function send(msg: string) -> bool;
+}
+
+@f              // → framing (before `protocol`; a no-op before `struct`)
+protocol Chat { ... }
+```
+
+Each suggestion's detail line explains what the key does and where it's
+actually consumed (`@idempotent` is honest that it's advisory-only today —
+see [Per-call settings](https://github.com/ComlineProject/docs/blob/main/docs/docs/design/core-target-contract.md#per-call-settings--decided)).
+This is a curated, known-good subset, not validation — `@key=value` stays
+an open namespace; an unrecognised key still parses, freezes, and is
+silently ignored by whatever doesn't act on it.
 
 ### Go to Definition
 

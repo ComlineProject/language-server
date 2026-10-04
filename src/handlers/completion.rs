@@ -60,6 +60,9 @@ pub fn get_completions(source: &str, uri: &Url, position: Position) -> Vec<Compl
             // `function`.
             completions.push(function_keyword_completion());
         }
+        CompletionContext::AnnotationKey(scope) => {
+            completions.extend(get_annotation_completions(scope));
+        }
         CompletionContext::DeclarationName => {
             // Naming something new — the identifier right after `struct`/
             // `enum`/.../`function`, or an enum's own variant name. It's
@@ -240,6 +243,34 @@ fn determine_context(source: &str, offset: usize) -> CompletionContext {
     if let Some(&(Tok::Word(w), _)) = toks.last() {
         if DECL_KEYWORDS.contains(&w) {
             return CompletionContext::DeclarationName;
+        }
+    }
+
+    // Right after a bare `@` — the start of an annotation key. Which keys
+    // make sense depends on what `@key=value` is about to attach to, which
+    // the grammar ties to the *enclosing* block, not anything about `@`
+    // itself: a struct/error body (a field annotation, e.g. `@validators`),
+    // a protocol body (a function annotation, e.g. `@timeout_ms`), or top
+    // level (a struct's or protocol's own leading annotation, e.g.
+    // `@framing` before `protocol`). `enclosing_block` already answers
+    // exactly that question for `StructBody` / `ProtocolBody` — reused
+    // as-is; it ignores the trailing `@` token like it does any other
+    // non-brace token.
+    if matches!(toks.last(), Some((Tok::Punct('@'), _))) {
+        match enclosing_block(&toks) {
+            Some(EnclosingBlock::Struct) => {
+                return CompletionContext::AnnotationKey(AnnotationScope::Field)
+            }
+            Some(EnclosingBlock::Protocol) => {
+                return CompletionContext::AnnotationKey(AnnotationScope::Function)
+            }
+            None => return CompletionContext::AnnotationKey(AnnotationScope::Leading),
+            // An enum variant or some other block don't take annotations —
+            // fall through to the same handling `enclosing_block` gives
+            // any other token there (nothing for an enum, the broad
+            // fallback otherwise), rather than inventing a separate rule
+            // just for a stray `@`.
+            Some(EnclosingBlock::Enum) | Some(EnclosingBlock::Other) => {}
         }
     }
 
@@ -564,6 +595,79 @@ fn get_type_completions(symbol_table: Option<&symbols::SymbolTable>) -> Vec<Comp
         .collect()
 }
 
+/// Which declaration an `@key=value` annotation is attaching to — decides
+/// which keys are worth suggesting. The grammar permits annotations on a
+/// `struct`, a `Field`, a `protocol`, and a `Function` (see
+/// `core/src/schema/idl/grammar.rs`); `Leading` covers the first two (a
+/// struct's and a protocol's own annotation sit in the same "top level,
+/// right before the keyword" position, indistinguishable without looking
+/// past the cursor at text that doesn't exist yet) and `Field` /
+/// `Function` the other two.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum AnnotationScope {
+    /// Top level, before `struct` or `protocol`.
+    Leading,
+    /// Inside a `struct`/`error` body, before a field.
+    Field,
+    /// Inside a `protocol` body, before a function.
+    Function,
+}
+
+/// Annotation-key completions for `scope`. Every key here is one a real
+/// generator or `core`'s own validation pass actually reads today — not a
+/// guess at the open namespace's eventual shape (`@key=value` accepts any
+/// name; the runtime/generator documents and validates only the keys it
+/// acts on and silently ignores the rest, so this list is deliberately a
+/// known-good subset, not an exhaustive or enforced one).
+fn get_annotation_completions(scope: AnnotationScope) -> Vec<CompletionItem> {
+    match scope {
+        AnnotationScope::Field => vec![CompletionItem {
+            label: "validators".to_string(),
+            kind: Some(CompletionItemKind::PROPERTY),
+            detail: Some("Attach one or more named validators to this field".to_string()),
+            insert_text: Some("validators = [$0]".to_string()),
+            insert_text_format: Some(lsp_types::InsertTextFormat::SNIPPET),
+            ..Default::default()
+        }],
+        AnnotationScope::Function => vec![
+            CompletionItem {
+                label: "timeout_ms".to_string(),
+                kind: Some(CompletionItemKind::PROPERTY),
+                detail: Some(
+                    "Milliseconds the client waits for a response before timing out \
+                     (request/response calls only)"
+                        .to_string(),
+                ),
+                insert_text: Some("timeout_ms = $0".to_string()),
+                insert_text_format: Some(lsp_types::InsertTextFormat::SNIPPET),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "idempotent".to_string(),
+                kind: Some(CompletionItemKind::PROPERTY),
+                detail: Some(
+                    "Marks calling this function twice as safe — advisory metadata only, \
+                     no behavior yet (reserved for a future retry mechanism)"
+                        .to_string(),
+                ),
+                ..Default::default()
+            },
+        ],
+        AnnotationScope::Leading => vec![CompletionItem {
+            label: "framing".to_string(),
+            kind: Some(CompletionItemKind::PROPERTY),
+            detail: Some(
+                "Wire framing the generated client/server use for this protocol \
+                 (protocols only — no effect on a struct)"
+                    .to_string(),
+            ),
+            insert_text: Some("framing = \"${1|jsonrpc,datagram|}\"$0".to_string()),
+            insert_text_format: Some(lsp_types::InsertTextFormat::SNIPPET),
+            ..Default::default()
+        }],
+    }
+}
+
 /// Completion context
 #[derive(Debug, PartialEq)]
 enum CompletionContext {
@@ -577,6 +681,9 @@ enum CompletionContext {
     StructBody,
     /// Inside a `protocol` body, before a member.
     ProtocolBody,
+    /// Right after a bare `@` — naming an annotation key, for the given
+    /// scope.
+    AnnotationKey(AnnotationScope),
     /// Typing an arbitrary new name: right after a declaration keyword, or
     /// an enum variant. Nothing to suggest.
     DeclarationName,
@@ -744,6 +851,65 @@ mod tests {
         let completions = get_completions(source, &uri, position);
         assert!(completions.iter().any(|c| c.label == "u32"));
         assert!(!completions.iter().any(|c| c.label == "struct"));
+    }
+
+    #[test]
+    fn annotation_on_a_field_offers_validators() {
+        let source = "struct X {\n    @";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let position = Position::new(1, 5);
+
+        let completions = get_completions(source, &uri, position);
+        assert!(completions.iter().any(|c| c.label == "validators"));
+        // Function/leading-only keys shouldn't leak into field scope.
+        assert!(!completions.iter().any(|c| c.label == "timeout_ms"));
+        assert!(!completions.iter().any(|c| c.label == "framing"));
+    }
+
+    #[test]
+    fn annotation_on_a_function_offers_timeout_ms_and_idempotent() {
+        let source = "protocol P {\n    @";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let position = Position::new(1, 5);
+
+        let completions = get_completions(source, &uri, position);
+        assert!(completions.iter().any(|c| c.label == "timeout_ms"));
+        assert!(completions.iter().any(|c| c.label == "idempotent"));
+        assert!(!completions.iter().any(|c| c.label == "validators"));
+    }
+
+    #[test]
+    fn annotation_at_top_level_offers_framing() {
+        let source = "@";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let position = Position::new(0, 1);
+
+        let completions = get_completions(source, &uri, position);
+        assert!(completions.iter().any(|c| c.label == "framing"));
+        assert!(!completions.iter().any(|c| c.label == "validators"));
+        assert!(!completions.iter().any(|c| c.label == "timeout_ms"));
+    }
+
+    #[test]
+    fn annotation_key_still_resolves_while_partially_typed() {
+        // Trailing partial word after `@` is dropped the same way any
+        // other in-progress word is, same as `type_position_survives_a_
+        // partial_type_name` for `:`.
+        let source = "protocol P {\n    @time";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let position = Position::new(1, 9);
+
+        let completions = get_completions(source, &uri, position);
+        assert!(completions.iter().any(|c| c.label == "timeout_ms"));
+    }
+
+    #[test]
+    fn annotation_in_an_enum_body_offers_nothing() {
+        let source = "enum Status {\n    @";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let position = Position::new(1, 5);
+
+        assert!(get_completions(source, &uri, position).is_empty());
     }
 
     #[test]
