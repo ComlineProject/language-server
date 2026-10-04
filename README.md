@@ -13,7 +13,7 @@ A Language Server Protocol (LSP) implementation for [Comline](https://github.com
 - **Workspace Symbols** - Fuzzy search over every schema in the workspace
 - **Hover Information** - Rich tooltips showing full type definitions and signatures
 - **Go to Definition / Find References / Rename** - Across files, following each file's `use` statements; rename updates `use` lines and leaves `as` aliases alone
-- **Auto-Completion** - Context-aware code suggestions (keywords, primitives, user and imported types, `@annotation` keys); types from other files that aren't imported yet add their `use` line
+- **Auto-Completion** - Context-aware code suggestions (keywords, primitives, user and imported types, `@annotation` keys, `use` paths); types from other files that aren't imported yet add their `use` line
 - **Semantic Tokens** - Comline syntax highlighting from a shared lexer
 
 ### 🚧 Rougher / next
@@ -225,6 +225,19 @@ value: an integer, in milliseconds
 
 consumed by: the generated Rust client (`comline-rust`)
 ```
+
+A `use` path completes one segment at a time, resolved the way
+`comline check` resolves it:
+
+```comline
+use                        // → the package's namespaces, its dependencies, self / parent / package, std
+use shared::               // → what's under the `shared` dependency
+use api::common::          // → what `api::common` declares, then `*` and `{…}`
+use api::common::{Error,   // → what `api::common` declares that isn't listed yet
+```
+
+A dependency that isn't fetched yet is offered, marked as such, with nothing
+under it until `comline check` fetches it.
 
 ### Go to Definition
 

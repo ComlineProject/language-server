@@ -1,5 +1,7 @@
 // Completion handler - provides auto-completion suggestions
 
+mod use_path;
+
 use crate::analysis::import_check::{self, declares_type, file_name, is_type_kind, Target};
 use crate::analysis::imports::{self, add_use_edit, ResolvedUse};
 use crate::analysis::project::{Project, ProjectDoc};
@@ -37,6 +39,14 @@ pub fn get_completions_with_project<S: ProjectSource>(
     // string literal — the text there isn't Comline.
     if in_comment_or_string(source, offset) {
         return Vec::new();
+    }
+
+    // In a `use` path, only what the path can go on with.
+    if let Some(context) = use_path::context_at(source, offset) {
+        return match context {
+            use_path::UseContext::Path(prefix) => use_path::completions(&prefix, source, uri, offset, other_files),
+            use_path::UseContext::Nothing => Vec::new(),
+        };
     }
 
     // Best-effort: a symbol table of user-declared struct/enum/type-alias
@@ -344,11 +354,7 @@ fn tokenize_prefix(cleaned: &str, offset: usize) -> Vec<(Tok<'_>, usize)> {
 /// while the identifier right after one of these is being typed (see
 /// [`CompletionContext::DeclarationName`]). Sourced from
 /// `vocabulary::KeywordKind::Declaration`, which also includes `use`/
-/// `import` — a deliberate widening over the old hand-maintained list:
-/// typing a partial `use` path used to fall through to the broad
-/// `Unknown` fallback (keywords + primitives + every known type, none of
-/// it relevant), and "nothing" is a strict improvement over that even
-/// though neither is the ideal (path/namespace completions, not built).
+/// `import`; a `use` path never gets here, `use_path` completes it first.
 fn is_declaration_keyword(word: &str) -> bool {
     match vocabulary::keyword(word) {
         // `function` is the one `Member`-kind keyword followed by a
@@ -727,14 +733,15 @@ mod tests {
     }
 
     #[test]
-    fn typing_a_partial_use_path_offers_nothing_not_everything() {
-        // Previously fell through every specific check to `Unknown`,
-        // dumping keywords + primitives + every known type after `use `.
+    fn typing_a_use_path_offers_path_starts_not_everything() {
+        // Once fell through every specific check to `Unknown`, dumping
+        // keywords + primitives + every known type after `use `.
         let source = "use pk";
         let uri = Url::parse("file:///test.ids").unwrap();
         let position = Position::new(0, 6);
 
-        assert!(get_completions(source, &uri, position).is_empty());
+        let labels: Vec<String> = get_completions(source, &uri, position).into_iter().map(|c| c.label).collect();
+        assert_eq!(labels, ["self", "parent", "package", "std"]);
     }
 
     #[test]
