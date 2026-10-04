@@ -75,7 +75,7 @@ pub fn all_diagnostics(
             // A project of one: no siblings, but `use` forms core can't
             // expand alone still aren't reported as unknown types.
             let uri = Url::parse("file:///schema.ids").expect("static URL");
-            let project = Project::from_parsed([(&uri, source, Document(doc.0.clone()))]);
+            let project = Project::from_parsed([(&uri, source, std::sync::Arc::new(Document(doc.0.clone())))]);
             diagnostics.extend(project_diagnostics(&project, 0));
         }
     }
@@ -83,10 +83,10 @@ pub fn all_diagnostics(
 }
 
 /// Validation diagnostics for `project.docs[doc]` (a file that parsed
-/// cleanly), using what the other open files reveal: core's own checks,
+/// cleanly), using what the package's other files reveal: core's own checks,
 /// told about the imports it can't see from one file, plus a
 /// missing-import error - in place of core's bare "Unknown type" - where a
-/// type declared in another open file is used without a `use`.
+/// type declared in another file of the package is used without a `use`.
 pub fn project_diagnostics(project: &Project, doc: usize) -> Vec<Diagnostic> {
     let here = &project.docs[doc];
     let check = import_check::check(project, doc);
@@ -449,7 +449,7 @@ struct User {
     }
 
     #[test]
-    fn a_glob_of_an_open_file_is_expanded_with_what_it_declares() {
+    fn a_glob_of_a_project_file_is_expanded_with_what_it_declares() {
         let chat = "use types::*\n\nstruct S {\n    m: Message\n    n: Nope\n}\n";
         let found = project_messages(&[("file:///pkg/src/chat.ids", chat), TYPES]);
         assert_eq!(found.len(), 1, "{found:?}");

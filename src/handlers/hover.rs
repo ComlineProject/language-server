@@ -22,11 +22,10 @@ pub fn get_hover_info(source: &str, uri: &Url, position: Position) -> Option<Hov
 /// declarations are resolved and checked for one that actually brings the
 /// word into scope from a specific sibling (`crate::analysis::imports`) —
 /// the correct, `use`-scoped answer. Failing that, a flat, project-wide,
-/// first-match scan across every other file still runs as a fallback (the
-/// LSP's project view is only whichever files happen to be open — there's
-/// no workspace scan on `initialize` — so "no `use` resolves this" can mean
-/// not-imported, sibling-not-open, or mid-edit non-parsing just as often as
-/// a real miss), with one appended note when the fallback match is in a
+/// first-match scan across every other file still runs as a fallback ("no
+/// `use` resolves this" can mean not-imported, a sibling that doesn't parse
+/// mid-edit, or a `use` being typed just as often as a real miss), with one
+/// appended note when the fallback match is in a
 /// sibling no `use` here actually reaches.
 pub fn get_hover_info_with_project(
     source: &str,

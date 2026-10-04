@@ -17,7 +17,7 @@ pub fn get_completions(source: &str, uri: &Url, position: Position) -> Vec<Compl
 }
 
 /// Get completion suggestions at a position, with `other_files` (every
-/// other open file, as `(uri, source)` pairs) as the project: in a type
+/// other file in the package, as `(uri, source)` pairs) as the project: in a type
 /// position, the types this file's `use`s bring in from them, and then
 /// every other type they declare - picking one of those also adds its
 /// `use` line.
@@ -104,7 +104,7 @@ pub fn get_completions_with_project(
     completions
 }
 
-/// Type names from the other open files. First the ones this file's `use`s
+/// Type names from the package's other files. First the ones this file's `use`s
 /// bring into scope - under their alias, if they have one - then every
 /// other type those files declare, sorted after everything else, which
 /// inserts the missing `use` line along with the name. Names already
@@ -124,8 +124,8 @@ fn get_import_completions(
     let mut items = Vec::new();
 
     for use_decl in uses_in(source, uri) {
-        let Target::Open(sibling, remaining) = import_check::target_of(&siblings, None, &use_decl) else {
-            continue; // can't list what a file that isn't open declares
+        let Target::Found(sibling, remaining) = import_check::target_of(&siblings, None, &use_decl) else {
+            continue; // can't list what a file outside the project declares
         };
         let doc = &siblings.docs[sibling];
         let symbols = &use_decl.resolved.symbols;

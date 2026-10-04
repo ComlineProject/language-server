@@ -1,8 +1,11 @@
 //
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashSet};
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
 //
 use crate::document::DocumentStore;
+use crate::workspace::{self, WorkspaceIndex};
 
 //
 use tower_lsp::jsonrpc::Result;
@@ -12,6 +15,10 @@ use tower_lsp::{Client, LanguageServer};
 pub struct Backend {
     client: Client,
     documents: Arc<DocumentStore>,
+    /// Every package schema on disk, open or not (see `workspace`).
+    workspace: Arc<WorkspaceIndex>,
+    /// The workspace folders, as filesystem paths.
+    roots: RwLock<Vec<PathBuf>>,
 }
 
 impl Backend {
@@ -19,19 +26,72 @@ impl Backend {
         Self {
             client,
             documents: Arc::new(DocumentStore::new()),
+            workspace: Arc::new(WorkspaceIndex::default()),
+            roots: RwLock::new(Vec::new()),
         }
     }
 
-    /// Every other open `.ids` buffer as `(uri, text)`, so a cross-file
-    /// reference can resolve (only covers open buffers, not the whole
-    /// workspace — there's no workspace scan on `initialize`).
-    fn other_open_files(&self, uri: &Url) -> Vec<(Url, String)> {
-        self.documents
+    /// Every other `.ids` file in `uri`'s package as `(uri, text)`: the open
+    /// buffers, plus every file on disk that isn't open (an open buffer wins
+    /// over its disk copy). A file outside any package sees only the other
+    /// open files outside any package.
+    fn other_project_files(&self, uri: &Url) -> Vec<(Url, String)> {
+        let root = workspace::package_root(uri);
+        let own = workspace::path_key(uri);
+
+        let open: Vec<(Url, String)> = self
+            .documents
             .get_all_uris()
             .into_iter()
-            .filter(|u| u != uri && !is_idp(u))
+            .filter(|u| !is_idp(u) && workspace::path_key(u) != own && workspace::package_root(u) == root)
             .filter_map(|u| self.documents.get(&u).map(|d| (u, d.text)))
-            .collect()
+            .collect();
+        let open_keys: HashSet<Option<String>> = open.iter().map(|(u, _)| workspace::path_key(u)).collect();
+
+        let disk = self
+            .workspace
+            .package_files(uri)
+            .into_iter()
+            .filter(|(u, _)| !open_keys.contains(&workspace::path_key(u)));
+
+        open.into_iter().chain(disk).collect()
+    }
+
+    /// Every `.ids` file, all packages: open buffers first, then the disk
+    /// copies of everything else.
+    fn all_project_files(&self) -> Vec<(Url, String)> {
+        let open: Vec<(Url, String)> = self
+            .documents
+            .get_all_uris()
+            .into_iter()
+            .filter(|u| !is_idp(u))
+            .filter_map(|u| self.documents.get(&u).map(|d| (u, d.text)))
+            .collect();
+        let open_keys: HashSet<Option<String>> = open.iter().map(|(u, _)| workspace::path_key(u)).collect();
+
+        let disk = self
+            .workspace
+            .all_files()
+            .into_iter()
+            .filter(|(u, _)| !open_keys.contains(&workspace::path_key(u)));
+
+        open.into_iter().chain(disk).collect()
+    }
+
+    /// Index every package schema under the workspace folders, off the
+    /// request loop, then re-check the open files against it.
+    async fn scan_workspace(&self) {
+        let roots = self.roots.read().map(|r| r.clone()).unwrap_or_default();
+        let index = Arc::clone(&self.workspace);
+        let scanned = tokio::task::spawn_blocking(move || {
+            index.scan(&roots);
+            index.len()
+        })
+        .await
+        .unwrap_or(0);
+
+        tracing::info!("Indexed {} schema file(s) in the workspace", scanned);
+        self.publish_ids_diagnostics().await;
     }
 }
 
@@ -48,8 +108,17 @@ fn is_idp(uri: &Url) -> bool {
 
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
-    async fn initialize(&self, _params: InitializeParams) -> Result<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         tracing::info!("Initializing Comline Language Server");
+
+        #[allow(deprecated)] // `root_uri`: the fallback for clients without workspace folders
+        let folders: Vec<Url> = match params.workspace_folders {
+            Some(folders) => folders.into_iter().map(|f| f.uri).collect(),
+            None => params.root_uri.into_iter().collect(),
+        };
+        if let Ok(mut roots) = self.roots.write() {
+            *roots = folders.iter().filter_map(|u| u.to_file_path().ok()).collect();
+        }
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -75,6 +144,13 @@ impl LanguageServer for Backend {
                         [".", ":", "(", ">", " ", "@"].iter().map(|s| s.to_string()).collect(),
                     ),
                     ..Default::default()
+                }),
+                workspace: Some(WorkspaceServerCapabilities {
+                    workspace_folders: Some(WorkspaceFoldersServerCapabilities {
+                        supported: Some(true),
+                        change_notifications: Some(OneOf::Left(true)),
+                    }),
+                    file_operations: None,
                 }),
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
@@ -125,6 +201,8 @@ impl LanguageServer for Backend {
         self.client
             .log_message(MessageType::INFO, "Comline LSP ready")
             .await;
+
+        self.scan_workspace().await;
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -170,6 +248,41 @@ impl LanguageServer for Backend {
         }
     }
 
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        let mut schemas_changed = false;
+        for change in params.changes {
+            if !change.uri.path().ends_with(".ids") {
+                continue;
+            }
+            schemas_changed = true;
+            if change.typ == FileChangeType::DELETED {
+                self.workspace.remove(&change.uri);
+            } else {
+                self.workspace.refresh(&change.uri);
+            }
+        }
+
+        if schemas_changed {
+            self.publish_ids_diagnostics().await;
+        }
+    }
+
+    async fn did_change_workspace_folders(&self, params: DidChangeWorkspaceFoldersParams) {
+        if let Ok(mut roots) = self.roots.write() {
+            let removed: Vec<PathBuf> =
+                params.event.removed.iter().filter_map(|f| f.uri.to_file_path().ok()).collect();
+            roots.retain(|r| !removed.contains(r));
+            roots.extend(params.event.added.iter().filter_map(|f| f.uri.to_file_path().ok()));
+        }
+        self.scan_workspace().await;
+    }
+
+    async fn symbol(&self, params: WorkspaceSymbolParams) -> Result<Option<Vec<SymbolInformation>>> {
+        use crate::handlers::symbols;
+        let found = symbols::get_workspace_symbols(&self.all_project_files(), &params.query);
+        Ok((!found.is_empty()).then_some(found))
+    }
+
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
@@ -185,7 +298,7 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
 
-        let other_files = self.other_open_files(&uri);
+        let other_files = self.other_project_files(&uri);
 
         // Use our hover handler
         use crate::handlers::hover;
@@ -218,7 +331,7 @@ impl LanguageServer for Backend {
             &document.text,
             &uri,
             position,
-            &self.other_open_files(&uri),
+            &self.other_project_files(&uri),
         );
         
         if completions.is_empty() {
@@ -246,7 +359,7 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
         
-        let other_files = self.other_open_files(&uri);
+        let other_files = self.other_project_files(&uri);
 
         // Use our definition handler
         use crate::handlers::definition;
@@ -281,7 +394,7 @@ impl LanguageServer for Backend {
             &uri,
             position,
             include_declaration,
-            &self.other_open_files(&uri),
+            &self.other_project_files(&uri),
         );
         
         if refs.is_empty() {
@@ -368,7 +481,7 @@ impl LanguageServer for Backend {
             &uri,
             position,
             &new_name,
-            &self.other_open_files(&uri),
+            &self.other_project_files(&uri),
         ))
     }
 
@@ -392,7 +505,7 @@ impl LanguageServer for Backend {
             &document.text,
             &uri,
             params.position,
-            &self.other_open_files(&uri),
+            &self.other_project_files(&uri),
         )
         .map(PrepareRenameResponse::Range))
     }
@@ -414,7 +527,7 @@ impl LanguageServer for Backend {
             &document.text,
             &uri,
             &params,
-            &self.other_open_files(&uri),
+            &self.other_project_files(&uri),
         );
         Ok((!actions.is_empty()).then_some(actions))
     }
@@ -456,14 +569,15 @@ impl Backend {
 
     /// Re-check every open `.ids` file and publish its diagnostics. All of
     /// them, not just the one that changed: whether a name is imported, or
-    /// declared somewhere at all, depends on the other open files too
-    /// (`analysis::import_check`). Each file is parsed once per refresh.
+    /// declared somewhere at all, depends on the other files of its package
+    /// too (`analysis::import_check`) - open or not. Parsed trees come from
+    /// `analysis::parse_cache`, so only changed files are re-parsed.
     async fn publish_ids_diagnostics(&self) {
         use crate::analysis::diagnostics;
         use crate::analysis::project::Project;
         use crate::parser;
 
-        let documents: Vec<crate::document::Document> = self
+        let open: Vec<crate::document::Document> = self
             .documents
             .get_all_uris()
             .into_iter()
@@ -471,34 +585,41 @@ impl Backend {
             .filter_map(|u| self.documents.get(&u))
             .collect();
 
-        // (document, its parse errors), and the trees of the ones that parsed
-        let mut parsed = Vec::new();
-        let mut trees = Vec::new();
-        for d in &documents {
-            match parser::parse(&d.text) {
-                Ok(result) => {
-                    if let Some(tree) = result.document {
-                        trees.push((&d.uri, d.text.as_str(), tree));
-                    }
-                    parsed.push((d, result.errors));
-                }
-                Err(e) => tracing::error!("Failed to parse {}: {}", d.uri, e),
-            }
+        let mut packages: BTreeMap<Option<String>, Vec<&crate::document::Document>> = BTreeMap::new();
+        for document in &open {
+            packages.entry(workspace::package_root(&document.uri)).or_default().push(document);
         }
-        let project = Project::from_parsed(trees);
 
-        for (d, errors) in &parsed {
-            let lsp_diagnostics = match project.index_of(&d.uri) {
-                Some(index) if errors.is_empty() => diagnostics::project_diagnostics(&project, index),
-                _ => {
-                    tracing::debug!("Parse errors for {}: {} error(s)", d.uri, errors.len());
-                    diagnostics::generate_diagnostics(&d.text, errors)
-                }
-            };
+        for documents in packages.values() {
+            let open_keys: HashSet<Option<String>> =
+                documents.iter().map(|d| workspace::path_key(&d.uri)).collect();
+            let disk: Vec<(Url, String)> = self
+                .workspace
+                .package_files(&documents[0].uri)
+                .into_iter()
+                .filter(|(u, _)| !open_keys.contains(&workspace::path_key(u)))
+                .collect();
 
-            self.client
-                .publish_diagnostics(d.uri.clone(), lsp_diagnostics, Some(d.version))
-                .await;
+            let project = Project::new(
+                documents
+                    .iter()
+                    .map(|d| (&d.uri, d.text.as_str()))
+                    .chain(disk.iter().map(|(u, s)| (u, s.as_str()))),
+            );
+
+            for document in documents {
+                // In the project exactly when it parsed cleanly.
+                let lsp_diagnostics = match project.index_of(&document.uri) {
+                    Some(index) => diagnostics::project_diagnostics(&project, index),
+                    None => parser::parse(&document.text)
+                        .map(|result| diagnostics::generate_diagnostics(&document.text, &result.errors))
+                        .unwrap_or_default(),
+                };
+
+                self.client
+                    .publish_diagnostics(document.uri.clone(), lsp_diagnostics, Some(document.version))
+                    .await;
+            }
         }
     }
 

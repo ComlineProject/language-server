@@ -2,6 +2,7 @@
 
 use crate::analysis::symbols;
 use crate::parser;
+use crate::analysis::project::Project;
 use lsp_types::{DocumentSymbol, Range, SymbolInformation, SymbolKind, Url};
 
 /// Get document symbols for outline view
@@ -124,11 +125,39 @@ fn byte_offset_to_range(source: &str, offset: usize, length: usize) -> Range {
     Range { start, end }
 }
 
-/// Get workspace symbols (basic implementation - searches all symbols by name)
-pub fn get_workspace_symbols(_query: &str) -> Vec<SymbolInformation> {
-    // TODO: Implement workspace-wide symbol search
-    // This would require maintaining a workspace-level symbol index
-    vec![]
+/// Workspace symbol search over `files` (`(uri, source)` pairs): every
+/// declaration whose name contains `query`'s characters in order, ignoring
+/// case (`usrec` finds `UserRecord`), the way editors fuzzy-match. An empty
+/// query lists everything. Each result names its schema's namespace
+/// (`chat::admin`) as its container.
+pub fn get_workspace_symbols(files: &[(Url, String)], query: &str) -> Vec<SymbolInformation> {
+    let project = Project::new(files.iter().map(|(u, s)| (u, s.as_str())));
+    let mut found = Vec::new();
+
+    for doc in &project.docs {
+        let container = doc.namespace.join("::");
+        for symbol in doc.symbols.all_symbols() {
+            if fuzzy_matches(&symbol.name, query) {
+                #[allow(deprecated)] // `deprecated` is a required field
+                found.push(SymbolInformation {
+                    name: symbol.name.clone(),
+                    kind: symbol.kind,
+                    tags: None,
+                    deprecated: None,
+                    location: symbol.location.clone(),
+                    container_name: Some(container.clone()),
+                });
+            }
+        }
+    }
+
+    found
+}
+
+/// Whether `query`'s characters all appear in `name`, in order, ignoring case.
+fn fuzzy_matches(name: &str, query: &str) -> bool {
+    let mut name = name.chars().flat_map(char::to_lowercase);
+    query.chars().flat_map(char::to_lowercase).all(|q| name.any(|c| c == q))
 }
 
 #[cfg(test)]
@@ -184,5 +213,21 @@ protocol UserService {
         let children = symbols[0].children.as_ref().unwrap();
         assert_eq!(children.len(), 2);
         assert_eq!(children[0].kind, SymbolKind::METHOD);
+    }
+
+    #[test]
+    fn workspace_symbols_search_every_file_fuzzily() {
+        let files = vec![
+            (Url::parse("file:///pkg/src/types.ids").unwrap(), "struct UserRecord {\n    x: bool\n}\n\nenum Role {\n    A\n}\n".to_string()),
+            (Url::parse("file:///pkg/src/chat/admin.ids").unwrap(), "protocol UserService {\n    function f();\n}\n".to_string()),
+        ];
+
+        let found = get_workspace_symbols(&files, "usr");
+        let mut names: Vec<_> = found.iter().map(|s| (s.name.as_str(), s.container_name.as_deref().unwrap())).collect();
+        names.sort();
+        assert_eq!(names, vec![("UserRecord", "types"), ("UserService", "chat::admin")]);
+
+        assert_eq!(get_workspace_symbols(&files, "").len(), 3);
+        assert!(get_workspace_symbols(&files, "zzz").is_empty());
     }
 }
