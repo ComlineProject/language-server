@@ -599,16 +599,14 @@ fn get_type_completions(symbol_table: Option<&symbols::SymbolTable>) -> Vec<Comp
 /// The snippet a known annotation key inserts — completion-specific
 /// (editor insertion mechanics), so it lives here rather than in the
 /// shared `analysis::annotations` table, which only describes *meaning*.
-/// `None` falls back to inserting just the bare key name.
+/// `None` falls back to inserting just the bare key name — correct as-is
+/// for a bare-marker annotation like `idempotent` (no `=value`), not just
+/// a fallback for one this function hasn't gotten to yet.
 fn annotation_insert_text(key: &str) -> Option<&'static str> {
     match key {
         "validators" => Some("validators = [$0]"),
         "timeout_ms" => Some("timeout_ms = $0"),
         "framing" => Some("framing = \"${1|jsonrpc,datagram|}\"$0"),
-        // Conceptually a bare marker, but the grammar requires `=value`
-        // unconditionally — see `annotations::KNOWN_ANNOTATIONS`'s own
-        // `idempotent` entry for why `= true` and not a bool literal.
-        "idempotent" => Some("idempotent = ${1:true}$0"),
         _ => None,
     }
 }
@@ -839,8 +837,16 @@ mod tests {
 
         let completions = get_completions(source, &uri, position);
         assert!(completions.iter().any(|c| c.label == "timeout_ms"));
-        assert!(completions.iter().any(|c| c.label == "idempotent"));
         assert!(!completions.iter().any(|c| c.label == "validators"));
+
+        // `idempotent` is a bare marker — no `=value` snippet, just the
+        // key name itself (a client inserts `label` verbatim when
+        // `insert_text` is unset).
+        let idempotent = completions
+            .iter()
+            .find(|c| c.label == "idempotent")
+            .expect("idempotent should be offered");
+        assert!(idempotent.insert_text.is_none());
     }
 
     #[test]
