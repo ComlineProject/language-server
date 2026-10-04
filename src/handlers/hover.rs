@@ -1,11 +1,12 @@
 // Hover handler - provides type information on hover
 
-use crate::analysis::annotations;
 use crate::analysis::symbols;
 use crate::parser;
 use crate::util::position_to_offset;
+use comline_core::schema::idl::annotations;
 use comline_core::schema::idl::grammar::{Declaration, Document, Expression, Field, Type};
 use comline_core::schema::idl::size::{self, SizeLookup, SizeTarget, WireSize};
+use comline_core::schema::idl::vocabulary;
 use lsp_types::{Hover, HoverContents, MarkedString, Position, Url};
 
 /// Get hover information at a position, considering only this file.
@@ -381,9 +382,10 @@ fn is_annotation_key(source: &str, offset: usize) -> bool {
 /// same table `completion` reads for the key's suggestion, so the two
 /// can't describe one key two different ways.
 fn create_annotation_hover(info: &annotations::AnnotationInfo) -> Hover {
-    let consumed = match info.consumed_by {
-        Some(c) => format!("consumed by: {c}"),
-        None => "**not consumed anywhere yet** — decided, advisory metadata only".to_string(),
+    let consumed = if info.consumed_by.is_empty() {
+        "**not consumed anywhere yet** — decided, advisory metadata only".to_string()
+    } else {
+        format!("consumed by: {}", info.consumed_by.join(", "))
     };
     let detail = [
         format!("default: {}", info.default),
@@ -467,22 +469,15 @@ fn create_field_hover(info: &FieldHoverInfo) -> Hover {
     }
 }
 
-/// Format a type for display
+/// Format a type for display. Primitive arms delegate to
+/// `vocabulary::primitive_name_of`; the rest (`Named`/`Array`/`Union`/
+/// `Unit`) stay here since `vocabulary` has no opinion on composite
+/// shapes (the array arm renders a literal `[N]`, which it never would).
 fn format_type(ty: &Type) -> String {
+    if let Some(name) = vocabulary::primitive_name_of(ty) {
+        return name.to_string();
+    }
     match ty {
-        Type::S8(_) => "s8".to_string(),
-        Type::S16(_) => "s16".to_string(),
-        Type::S32(_) => "s32".to_string(),
-        Type::S64(_) => "s64".to_string(),
-        Type::U8(_) => "u8".to_string(),
-        Type::U16(_) => "u16".to_string(),
-        Type::U32(_) => "u32".to_string(),
-        Type::U64(_) => "u64".to_string(),
-        Type::F32(_) => "f32".to_string(),
-        Type::F64(_) => "f64".to_string(),
-        Type::Bool(_) => "bool".to_string(),
-        Type::Str(_) => "str".to_string(),
-        Type::String(_) => "string".to_string(),
         Type::Named(name) => name.text.clone(),
         Type::Array(arr) => {
             if let Some(size) = &arr.size {
@@ -498,6 +493,8 @@ fn format_type(ty: &Type) -> String {
             .collect::<Vec<_>>()
             .join(" | "),
         Type::Unit(_) => "()".to_string(),
+        // Every primitive variant returned above already.
+        _ => unreachable!("primitive_name_of covers every Type variant not matched here"),
     }
 }
 
@@ -523,14 +520,13 @@ fn get_word_at_offset(source: &str, offset: usize) -> Option<String> {
 
 /// Find type at position
 fn find_type_at_position(document: &comline_core::schema::idl::grammar::Document, word: &str) -> Option<&'static str> {
-    // Check if it's a primitive type
-    match word {
-        "s8" | "s16" | "s32" | "s64" => Some("integer type"),
-        "u8" | "u16" | "u32" | "u64" => Some("unsigned integer type"),
-        "f32" | "f64" => Some("floating point type"),
-        "bool" => Some("boolean type"),
-        "str" | "string" => Some("string type"),
-        _ => {
+    // Check if it's a primitive type — delegates to `vocabulary` so this
+    // can't list a name the grammar doesn't actually have (it used to
+    // hand-roll this match, independently of the one in `completion.rs`
+    // that had the `i8` bug).
+    match vocabulary::primitive(word) {
+        Some(p) => Some(p.description),
+        None => {
             // Check if it's a user-defined type
             for decl in &document.0 {
                 match &**decl {
@@ -1019,7 +1015,9 @@ protocol Chat {
 
         let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
         let text = hover_text(hover);
-        assert!(text.contains("integer type"), "got: {text}");
+        // Now the specific vocabulary description, not a generic category
+        // — "16-bit signed integer" rather than "integer type".
+        assert!(text.contains("16-bit signed integer"), "got: {text}");
     }
 
     #[test]
