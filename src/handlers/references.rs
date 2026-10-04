@@ -1,6 +1,7 @@
 // References handler - finds all usages of a symbol
 
 use crate::analysis::project::Project;
+use crate::analysis::source::ProjectSource;
 use crate::util::{position_to_offset, word_range_at};
 use lsp_types::{Location, Position, Url};
 
@@ -11,7 +12,7 @@ pub fn find_references(
     position: Position,
     include_declaration: bool,
 ) -> Vec<Location> {
-    find_references_with_project(source, uri, position, include_declaration, &[])
+    find_references_with_project::<(Url, String)>(source, uri, position, include_declaration, &[])
 }
 
 /// Find all references to the symbol at a position across this file and
@@ -19,12 +20,12 @@ pub fn find_references(
 /// pairs): every place whose go-to-definition lands on the same
 /// declaration (see [`Project::references`]). Works from the declaration
 /// itself, from any use of it, or from a `use` line importing it.
-pub fn find_references_with_project(
+pub fn find_references_with_project<S: ProjectSource>(
     source: &str,
     uri: &Url,
     position: Position,
     include_declaration: bool,
-    other_files: &[(Url, String)],
+    other_files: &[S],
 ) -> Vec<Location> {
     let Some(offset) = position_to_offset(source, position) else {
         return vec![];

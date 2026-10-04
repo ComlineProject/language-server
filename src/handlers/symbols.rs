@@ -131,7 +131,7 @@ fn byte_offset_to_range(source: &str, offset: usize, length: usize) -> Range {
 /// query lists everything. Each result names its schema's namespace
 /// (`chat::admin`) as its container.
 pub fn get_workspace_symbols(files: &[(Url, String)], query: &str) -> Vec<SymbolInformation> {
-    let project = Project::new(files.iter().map(|(u, s)| (u, s.as_str())));
+    let project = Project::new(files.iter());
     let mut found = Vec::new();
 
     for doc in &project.docs {

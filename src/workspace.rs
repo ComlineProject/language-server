@@ -8,6 +8,10 @@
 //! see each other's. The client keeps the index current through
 //! `workspace/didChangeWatchedFiles` (`comline-vscode` watches
 //! `**/*.{ids,idp}`); an open buffer always wins over the disk copy.
+//!
+//! Each package's dependencies are indexed too (see `dependencies`), kept
+//! apart: they're seen under the dependency's name, and only by the package
+//! that declares them.
 
 use std::path::{Path, PathBuf};
 
@@ -15,9 +19,15 @@ use comline_core::package::layout;
 use dashmap::DashMap;
 use lsp_types::Url;
 
+use crate::dependencies::{self, IndexedDependency};
+
 /// Directories never worth descending into: build output, dependency
 /// caches, VCS metadata (hidden directories are skipped too).
 const SKIPPED_DIRS: &[&str] = &["target", "node_modules"];
+
+/// Path components that put a file outside the package index, even when it
+/// arrives through the file watcher: the deps cache lives under `.comline/`.
+const EXCLUDED_COMPONENTS: &[&str] = &[".comline", ".git", "target", "node_modules"];
 
 /// More than any real workspace has; stops a scan of a huge unrelated tree.
 const MAX_FILES: usize = 20_000;
@@ -25,6 +35,8 @@ const MAX_FILES: usize = 20_000;
 #[derive(Default)]
 pub struct WorkspaceIndex {
     files: DashMap<Url, String>,
+    /// Each package's dependencies, keyed like [`package_root`].
+    dependencies: DashMap<String, Vec<IndexedDependency>>,
 }
 
 impl WorkspaceIndex {
@@ -60,7 +72,9 @@ impl WorkspaceIndex {
 
     fn refresh_path(&self, path: &Path) {
         let Ok(uri) = Url::from_file_path(path) else { return };
-        let is_schema = path.extension().is_some_and(|e| e == "ids") && layout::schemas_root_for(path).is_some();
+        let is_schema = path.extension().is_some_and(|e| e == "ids")
+            && layout::schemas_root_for(path).is_some()
+            && !path.components().any(|c| EXCLUDED_COMPONENTS.contains(&c.as_os_str().to_string_lossy().as_ref()));
 
         match std::fs::read_to_string(path) {
             Ok(text) if is_schema => {
@@ -79,6 +93,58 @@ impl WorkspaceIndex {
             .iter()
             .filter(|e| package_root(e.key()) == root && path_key(e.key()) != own)
             .map(|e| (e.key().clone(), e.value().clone()))
+            .collect()
+    }
+
+    /// Every package (its `src/` directory) that has an indexed schema.
+    pub fn package_roots(&self) -> Vec<PathBuf> {
+        let mut roots: Vec<PathBuf> = self
+            .files
+            .iter()
+            .filter_map(|e| Some(layout::schemas_root_for(&e.key().to_file_path().ok()?)?.to_path_buf()))
+            .collect();
+        roots.sort();
+        roots.dedup();
+        roots
+    }
+
+    /// Re-read the dependencies of the package whose `src/` is `src_root`,
+    /// from `manifest` (its `config.idp`'s text) or, when `None`, the file on
+    /// disk. A package without a manifest has none.
+    pub fn index_dependencies(&self, src_root: &Path, manifest: Option<&str>) {
+        let Some(package_dir) = src_root.parent() else { return };
+        let on_disk;
+        let manifest = match manifest {
+            Some(text) => text,
+            None => {
+                on_disk = std::fs::read_to_string(package_dir.join(dependencies::MANIFEST)).unwrap_or_default();
+                &on_disk
+            }
+        };
+        self.dependencies.insert(normalize(src_root), dependencies::index(package_dir, manifest));
+    }
+
+    /// The dependencies of `uri`'s package, indexing them first if no one
+    /// has yet (a file outside the scanned workspace folders).
+    pub fn dependencies_of(&self, uri: &Url) -> Vec<IndexedDependency> {
+        let Some(src_root) = uri.to_file_path().ok().and_then(|p| layout::schemas_root_for(&p).map(Path::to_path_buf))
+        else {
+            return vec![];
+        };
+        let key = normalize(&src_root);
+        if !self.dependencies.contains_key(&key) {
+            self.index_dependencies(&src_root, None);
+        }
+        self.dependencies.get(&key).map(|d| d.clone()).unwrap_or_default()
+    }
+
+    /// Every package (its `src/` directory) one of whose dependencies lives
+    /// at or above `path` - the ones to re-index when `path` changes.
+    pub fn packages_depending_on(&self, path: &Path) -> Vec<PathBuf> {
+        self.dependencies
+            .iter()
+            .filter(|e| e.value().iter().any(|d| d.dir.as_ref().is_some_and(|dir| path.starts_with(dir))))
+            .map(|e| PathBuf::from(e.key()))
             .collect()
     }
 

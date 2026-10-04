@@ -1,6 +1,7 @@
 // Rename handler - renames symbols across the project
 
 use crate::analysis::project::{Project, Target};
+use crate::analysis::source::ProjectSource;
 use crate::util::{byte_range_to_lsp_range, position_to_offset, word_range_at};
 use std::collections::HashMap;
 use lsp_types::{Position, Range, TextEdit, Url, WorkspaceEdit};
@@ -12,7 +13,7 @@ pub fn rename_symbol(
     position: Position,
     new_name: &str,
 ) -> Option<WorkspaceEdit> {
-    rename_symbol_with_project(source, uri, position, new_name, &[])
+    rename_symbol_with_project::<(Url, String)>(source, uri, position, new_name, &[])
 }
 
 /// Rename the symbol at a position across this file and `other_files`
@@ -22,12 +23,12 @@ pub fn rename_symbol(
 /// Started *on* an alias, this returns `None` rather than silently renaming
 /// the aliased declaration out from under every other file - renaming the
 /// alias itself is a different operation this doesn't offer yet.
-pub fn rename_symbol_with_project(
+pub fn rename_symbol_with_project<S: ProjectSource>(
     source: &str,
     uri: &Url,
     position: Position,
     new_name: &str,
-    other_files: &[(Url, String)],
+    other_files: &[S],
 ) -> Option<WorkspaceEdit> {
     if !is_valid_identifier(new_name) {
         return None;
@@ -55,11 +56,11 @@ pub fn rename_symbol_with_project(
 /// `None` when there's nothing renameable there (no resolvable symbol, or
 /// an `as` alias - see [`rename_symbol_with_project`]) - the answer to the
 /// client's `textDocument/prepareRename`.
-pub fn prepare_rename_with_project(
+pub fn prepare_rename_with_project<S: ProjectSource>(
     source: &str,
     uri: &Url,
     position: Position,
-    other_files: &[(Url, String)],
+    other_files: &[S],
 ) -> Option<Range> {
     let project = Project::with_active(uri, source, other_files);
     renameable_at(&project, source, uri, position).map(|(_, range)| range)
@@ -73,6 +74,10 @@ fn renameable_at(project: &Project, source: &str, uri: &Url, position: Position)
     let word = &source[start..end];
 
     let target = project.resolve(project.index_of(uri)?, word)?;
+    // Declared in a dependency: not this package's to rename.
+    if project.docs[target.doc].dependency.is_some() {
+        return None;
+    }
     (target.name == word).then(|| (target, byte_range_to_lsp_range(source, start, end)))
 }
 
@@ -240,5 +245,35 @@ struct Request {
 
         assert!(prepare_rename_with_project(aliased_source, &aliased_uri, Position::new(3, 8), &project).is_none());
         assert!(prepare_rename_with_project(aliased_source, &aliased_uri, Position::new(4, 8), &project).is_none());
+    }
+
+    fn package_with_dependency(active_uri: &str) -> Vec<crate::analysis::source::SourceFile> {
+        use crate::analysis::source::SourceFile;
+        let _ = active_uri;
+        vec![
+            SourceFile::local(
+                Url::parse("file:///pkg/config.idp").unwrap(),
+                "congregation app\nspecification_version = 1\n\ndependencies = {\n    shared = {\n        path = \"../shared\"\n    }\n}\n".to_string(),
+            ),
+            SourceFile::local(Url::parse("file:///pkg/src/types.ids").unwrap(), "struct User {\n    id: u64\n}\n".to_string()),
+            SourceFile::of_dependency(
+                Url::parse("file:///shared/src/models.ids").unwrap(),
+                "/// A shared thing\nstruct Thing {\n    id: u64\n}\n".to_string(),
+                "shared",
+                vec!["shared".to_string(), "models".to_string()],
+            ),
+        ]
+    }
+
+    #[test]
+    fn test_rename_of_a_dependency_symbol_is_refused() {
+        let chat = "use shared::models::Thing\n\nstruct S {\n    t: Thing\n}\n";
+        let chat_uri = Url::parse("file:///pkg/src/chat.ids").unwrap();
+        let others = package_with_dependency("file:///pkg/src/chat.ids");
+
+        assert!(prepare_rename_with_project(chat, &chat_uri, Position::new(3, 8), &others).is_none());
+        assert!(rename_symbol_with_project(chat, &chat_uri, Position::new(3, 8), "Other", &others).is_none());
+        // ...while the package's own symbols still rename.
+        assert!(prepare_rename_with_project(chat, &chat_uri, Position::new(2, 8), &others).is_some());
     }
 }

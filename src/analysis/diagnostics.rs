@@ -1,7 +1,7 @@
 // Diagnostic generation — parse errors, `comline-core`'s validation pass,
 // and missing imports
 
-use crate::analysis::import_check::{self, MissingImport};
+use crate::analysis::import_check::{self, MissingImport, UnresolvedImport, UnverifiedImport};
 use crate::analysis::project::Project;
 use crate::util::byte_range_to_lsp_range;
 use comline_core::schema::idl::grammar::Document;
@@ -14,6 +14,13 @@ use lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Url};
 /// The `code` of a missing-import diagnostic - what the quick fix in
 /// `handlers::code_actions` answers to.
 pub const MISSING_IMPORT: &str = "missing-import";
+
+/// The `code` of an unresolved-import diagnostic (its "did you mean" has a
+/// quick fix too).
+pub const UNRESOLVED_IMPORT: &str = "unresolved-import";
+
+/// The `code` of a dependency import that can't be checked.
+pub const UNVERIFIED_IMPORT: &str = "unverified-import";
 
 /// Semantic diagnostics from `comline-core`'s validation pass — undefined type
 /// references, duplicate declarations, and the like: the same checks
@@ -93,7 +100,44 @@ pub fn project_diagnostics(project: &Project, doc: usize) -> Vec<Diagnostic> {
 
     let mut diagnostics = validation_diagnostics_with(here.source, &here.document, check.scope);
     diagnostics.extend(check.missing.iter().map(|m| missing_import_diagnostic(here.source, m)));
+    diagnostics.extend(check.unresolved.iter().map(|u| unresolved_import_diagnostic(here.source, u)));
+    diagnostics.extend(check.unverified.iter().map(|u| unverified_import_diagnostic(here.source, u)));
     diagnostics
+}
+
+/// Worded like core's own error, so the editor and `comline check` say the
+/// same thing.
+fn unresolved_import_diagnostic(source: &str, unresolved: &UnresolvedImport) -> Diagnostic {
+    let mut message = format!("Unresolved import — {}", unresolved.detail);
+    if let Some(suggestion) = &unresolved.suggestion {
+        message.push_str(&format!(" - did you mean '{suggestion}'?"));
+    }
+    import_diagnostic(source, unresolved.range, DiagnosticSeverity::ERROR, UNRESOLVED_IMPORT, message)
+}
+
+fn unverified_import_diagnostic(source: &str, unverified: &UnverifiedImport) -> Diagnostic {
+    let message = format!("Not checked: {}", unverified.reason);
+    import_diagnostic(source, unverified.range, DiagnosticSeverity::INFORMATION, UNVERIFIED_IMPORT, message)
+}
+
+fn import_diagnostic(
+    source: &str,
+    range: (usize, usize),
+    severity: DiagnosticSeverity,
+    code: &str,
+    message: String,
+) -> Diagnostic {
+    Diagnostic {
+        range: byte_range_to_lsp_range(source, range.0, range.1),
+        severity: Some(severity),
+        code: Some(NumberOrString::String(code.to_string())),
+        code_description: None,
+        source: Some("comline".to_string()),
+        message,
+        related_information: None,
+        tags: None,
+        data: None,
+    }
 }
 
 fn missing_import_diagnostic(source: &str, missing: &MissingImport) -> Diagnostic {
@@ -407,7 +451,7 @@ struct User {
     fn project_messages(files: &[(&str, &str)]) -> Vec<(String, Option<NumberOrString>, u32, u32)> {
         let files: Vec<(Url, String)> =
             files.iter().map(|(u, s)| (Url::parse(u).unwrap(), s.to_string())).collect();
-        let project = Project::new(files.iter().map(|(u, s)| (u, s.as_str())));
+        let project = Project::new(files.iter());
         project_diagnostics(&project, 0)
             .into_iter()
             .map(|d| (d.message, d.code, d.range.start.line, d.range.start.character))
