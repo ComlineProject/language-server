@@ -19,6 +19,7 @@ use lsp_types::{
 use crate::analysis::imports;
 use crate::analysis::project::{Project, ProjectDoc};
 use crate::analysis::source::{DependencyKind, ProjectSource};
+use crate::analysis::stdlib;
 use crate::util::byte_range_to_lsp_range;
 
 /// How many lines up a `{ ... }` list is followed, looking for its `use`.
@@ -220,7 +221,7 @@ fn path_starts(project: &Project, legacy: bool, range: Range) -> Vec<CompletionI
             let item = segment_item(prefix.text, prefix.description.to_string(), CompletionItemKind::KEYWORD, true, range);
             items.push(sorted(item, '2'));
         }
-        let std = segment_item("std", "standard library (not checked yet)".to_string(), CompletionItemKind::MODULE, true, range);
+        let std = segment_item(stdlib::NAME, "the standard library".to_string(), CompletionItemKind::MODULE, true, range);
         items.push(sorted(std, '3'));
     }
     items
@@ -258,7 +259,7 @@ fn children(docs: &[&ProjectDoc], unparsed: &[Vec<String>], base: &[String], ran
                 false => format!("`{name}/`"),
             };
             if let Some(dependency) = child.dependency {
-                detail.push_str(&format!(" (dependency `{dependency}`)"));
+                detail.push_str(&format!(" ({})", stdlib::owner(dependency)));
             }
             // A path can end at a schema; a directory always goes on.
             segment_item(name, detail, CompletionItemKind::MODULE, !child.schema, range)
@@ -545,6 +546,26 @@ mod tests {
         let Some(CompletionTextEdit::Edit(edit)) = &items[0].text_edit else { panic!() };
         assert_eq!((edit.range.start.character, edit.range.end.character), (12, 14));
         assert_eq!(items[0].command.as_ref().map(|c| c.command.as_str()), None, "`models` can end the path");
+    }
+
+    #[test]
+    fn std_completes_like_a_dependency() {
+        let uri = Url::parse("file:///pkg/src/api/b.ids").unwrap();
+        let mut files = package();
+        files.extend(crate::analysis::stdlib::files(&crate::analysis::stdlib::virtual_root()));
+        let at = |source: &str| {
+            let mut items = get_completions_with_project(source, &uri, offset_to_position(source, source.len()), &files);
+            items.sort_by(|a, b| a.sort_text.as_ref().unwrap_or(&a.label).cmp(b.sort_text.as_ref().unwrap_or(&b.label)));
+            items.into_iter().map(|c| (c.label, c.detail.unwrap_or_default())).collect::<Vec<_>>()
+        };
+
+        assert!(at("use ").contains(&("std".to_string(), "the standard library".to_string())));
+        assert_eq!(
+            at("use std::"),
+            [("http".to_string(), "`http.ids` (std)".to_string()), ("validators".to_string(), "`validators.ids` (std)".to_string())]
+        );
+        let http: Vec<String> = at("use std::http::").into_iter().map(|(label, _)| label).collect();
+        assert_eq!(http, ["HttpMethod", "Request", "Response", "*", "{…}"]);
     }
 
     #[test]

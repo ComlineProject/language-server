@@ -6,6 +6,7 @@ use crate::analysis::import_check::{self, declares_type, file_name, is_type_kind
 use crate::analysis::imports::{self, add_use_edit, ResolvedUse};
 use crate::analysis::project::{Project, ProjectDoc};
 use crate::analysis::source::ProjectSource;
+use crate::analysis::stdlib;
 use crate::analysis::symbols;
 use crate::parser;
 use crate::util::position_to_offset;
@@ -203,7 +204,7 @@ fn uses_in(source: &str, uri: &Url) -> Vec<ResolvedUse> {
 /// `` `models.ids` (dependency `shared_types`) ``.
 fn origin(doc: &ProjectDoc) -> String {
     match doc.dependency {
-        Some(dependency) => format!("`{}` (dependency `{dependency}`)", file_name(doc)),
+        Some(dependency) => format!("`{}` ({})", file_name(doc), stdlib::owner(dependency)),
         None => format!("`{}`", file_name(doc)),
     }
 }

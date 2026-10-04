@@ -6,6 +6,7 @@ use std::sync::{Arc, RwLock};
 //
 use crate::analysis::imports::namespace_of;
 use crate::analysis::source::SourceFile;
+use crate::analysis::stdlib;
 use crate::dependencies;
 use crate::document::DocumentStore;
 use crate::workspace::{self, WorkspaceIndex};
@@ -22,6 +23,8 @@ pub struct Backend {
     workspace: Arc<WorkspaceIndex>,
     /// The workspace folders, as filesystem paths.
     roots: RwLock<Vec<PathBuf>>,
+    /// Where std's files are opened from (see `dependencies::std_root`).
+    std_root: Url,
 }
 
 impl Backend {
@@ -31,6 +34,7 @@ impl Backend {
             documents: Arc::new(DocumentStore::new()),
             workspace: Arc::new(WorkspaceIndex::default()),
             roots: RwLock::new(Vec::new()),
+            std_root: dependencies::std_root(),
         }
     }
 
@@ -64,6 +68,7 @@ impl Backend {
             .filter(|d| !is_idp(&d.uri) && workspace::package_root(&d.uri) == root)
             .map(|d| SourceFile::local(d.uri.clone(), d.text.clone()))
             .collect();
+        files.extend(stdlib::files(&self.std_root));
         if root.is_none() {
             return files;
         }

@@ -20,6 +20,7 @@ pub mod analysis {
     pub mod parse_cache;
     pub mod project;
     pub mod source;
+    pub mod stdlib;
     pub mod symbols;
 }
 
