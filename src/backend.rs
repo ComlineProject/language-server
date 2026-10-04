@@ -227,9 +227,24 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
         
+        // Every other open buffer, so a cross-file reference can resolve
+        // (same scope as hover - no workspace scan on `initialize`).
+        let other_files: Vec<(Url, String)> = self
+            .documents
+            .get_all_uris()
+            .into_iter()
+            .filter(|u| u != &uri)
+            .filter_map(|u| self.documents.get(&u).map(|d| (u, d.text)))
+            .collect();
+
         // Use our definition handler
         use crate::handlers::definition;
-        Ok(definition::find_definition(&document.text, &uri, position))
+        Ok(definition::find_definition_with_project(
+            &document.text,
+            &uri,
+            position,
+            &other_files,
+        ))
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
