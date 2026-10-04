@@ -600,7 +600,10 @@ fn field_info_in(
             annotations: spanned
                 .annotations()
                 .iter()
-                .map(|a| format!("@{}={}", a.key(), a.value()))
+                .map(|a| match a.value() {
+                    Some(v) => format!("@{}={}", a.key(), v),
+                    None => format!("@{}", a.key()),
+                })
                 .collect(),
             size: field_size(spanned, lookup),
         })
@@ -809,10 +812,7 @@ struct User {
 
     #[test]
     fn hover_on_idempotent_annotation_says_not_consumed_yet() {
-        // `@idempotent` alone does not parse — the grammar requires
-        // `=value` unconditionally (see `annotations::KNOWN_ANNOTATIONS`'s
-        // own `idempotent` entry).
-        let source = "protocol P {\n    @idempotent = true\n    function f();\n}\n";
+        let source = "protocol P {\n    @idempotent\n    function f();\n}\n";
         let uri = Url::parse("file:///test.ids").unwrap();
         let position = Position::new(1, 8);
 

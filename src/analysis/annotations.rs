@@ -64,15 +64,7 @@ pub const KNOWN_ANNOTATIONS: &[AnnotationInfo] = &[
         description: "Marks that calling this function twice has the same effect as calling \
                        it once — safe to retry.",
         default: "not idempotent",
-        // Conceptually a bare marker (see `design/core-target-contract.md`'s
-        // "Per-call settings"), but the grammar's `Annotation` rule
-        // requires `=value` unconditionally and `Expression` has no
-        // boolean variant — `@idempotent` alone does not parse today.
-        // `= true` (a bare identifier, not a bool literal) is the
-        // convention until the grammar grows one (`structure.md`'s own
-        // `@internal=true` example uses the same workaround).
-        value: "requires a value today (the grammar has no bare-marker form yet) — \
-                conventionally `= true`",
+        value: "a bare marker — no `=value`",
         consumed_by: None,
     },
     AnnotationInfo {
