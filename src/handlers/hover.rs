@@ -1,5 +1,6 @@
 // Hover handler - provides type information on hover
 
+use crate::analysis::imports::{self, ProjectFile};
 use crate::analysis::symbols;
 use crate::parser;
 use crate::util::position_to_offset;
@@ -17,11 +18,16 @@ pub fn get_hover_info(source: &str, uri: &Url, position: Position) -> Option<Hov
 /// Get hover information at a position, also searching `other_files` (every
 /// other file in the project, as `(uri, source)` pairs) for a struct/enum/
 /// protocol/const the hovered word might name if it isn't declared in this
-/// file. This is a flat, project-wide name lookup — first match wins — not a
-/// `use`-scoped resolution (mirrors the same simplification the playground's
-/// `describe_project` already uses for cross-file type references). Good
-/// enough to answer "what is this token", not a claim that it's actually
-/// imported here.
+/// file. Two-tier lookup: first, the active file's own `use`/`import`
+/// declarations are resolved and checked for one that actually brings the
+/// word into scope from a specific sibling (`crate::analysis::imports`) —
+/// the correct, `use`-scoped answer. Failing that, a flat, project-wide,
+/// first-match scan across every other file still runs as a fallback (the
+/// LSP's project view is only whichever files happen to be open — there's
+/// no workspace scan on `initialize` — so "no `use` resolves this" can mean
+/// not-imported, sibling-not-open, or mid-edit non-parsing just as often as
+/// a real miss), with one appended note when the fallback match is in a
+/// sibling no `use` here actually reaches.
 pub fn get_hover_info_with_project(
     source: &str,
     uri: &Url,
@@ -58,10 +64,26 @@ pub fn get_hover_info_with_project(
     // hovered word. A struct's fields can reference types declared in *any*
     // other file, so size computation needs the whole set, not just the
     // document the matched symbol itself lives in.
-    let other_docs: Vec<(&Url, &String, Document)> = other_files
+    let mut other_docs: Vec<(&Url, &String, Document)> = other_files
         .iter()
         .filter_map(|(u, s)| parser::parse(s).ok()?.document.map(|d| (u, s, d)))
         .collect();
+
+    // Check if a `use`/`import` here actually brings a symbol named `word`
+    // into scope from one specific sibling.
+    let own_namespace = imports::namespace_of(uri);
+    let own_imports = imports::resolved_imports(&document, &own_namespace);
+
+    // `others` feeds `HoverSizeLookup` too (below) — put `use`-resolved
+    // siblings first (stable, so relative order within each group is
+    // otherwise unchanged) so a name collision with an unimported sibling
+    // resolves to the one actually in scope, while still falling back to
+    // the unimported sibling's estimate over `Unknown`.
+    other_docs.sort_by_key(|(u, _, _)| {
+        !own_imports
+            .iter()
+            .any(|i| i.resolved.absolute_namespace.starts_with(&imports::namespace_of(u)))
+    });
 
     let lookup = HoverSizeLookup { local: &document, others: &other_docs };
 
@@ -70,11 +92,43 @@ pub fn get_hover_info_with_project(
         return Some(create_symbol_hover(symbol, &document, &lookup));
     }
 
-    // Check if it's a symbol declared in another project file
+    let siblings: Vec<ProjectFile> =
+        other_docs.iter().map(|(u, s, _)| ProjectFile::new(u, s)).collect();
+
+    if let Some(resolved) = imports::resolve_symbol(&word, &own_imports, &siblings) {
+        let sibling = resolved.file;
+        if let Some((_, _, other_document)) =
+            other_docs.iter().find(|(u, _, _)| **u == *sibling.uri)
+        {
+            let other_table =
+                symbols::build_symbol_table(other_document, sibling.uri, sibling.source);
+            // Look up `real_name`, not `word` — they differ when `word`
+            // is an `as` alias, which `sibling`'s own symbol table never
+            // heard of (see `ResolvedSymbol::real_name`'s doc).
+            if let Some(symbol) = other_table.get(&resolved.real_name) {
+                return Some(create_symbol_hover(symbol, other_document, &lookup));
+            }
+        }
+    }
+
+    // Fallback: flat, project-wide, first-match scan — not `use`-scoped,
+    // so append a note when the match isn't one any `use` here actually
+    // reaches (never for a `std::` import: that's a different, legitimate
+    // kind of not-locally-resolvable, not a "you forgot the use" case).
     for (other_uri, other_source, other_document) in &other_docs {
         let other_table = symbols::build_symbol_table(other_document, other_uri, other_source);
         if let Some(symbol) = other_table.get(&word) {
-            return Some(create_symbol_hover(symbol, other_document, &lookup));
+            let mut hover = create_symbol_hover(symbol, other_document, &lookup);
+            if !resolves_via_std_import(&word, &own_imports) {
+                append_note(
+                    &mut hover,
+                    format!(
+                        "declared in `{}` — no `use` here brings it into scope",
+                        file_label(other_uri)
+                    ),
+                );
+            }
+            return Some(hover);
         }
     }
 
@@ -91,11 +145,45 @@ pub fn get_hover_info_with_project(
     None
 }
 
+/// Whether the active file's own imports bring `word` into scope from
+/// `std::` — the one case the fallback-match note (above) must stay quiet
+/// for, since a `std::` symbol is never locally resolvable by design, not
+/// because the author forgot a `use`. A simple last-segment check (not a
+/// full `use_brings_into_scope` call): `std` siblings never exist in this
+/// project, so there's nothing for `imports::resolve_symbol` to match —
+/// this just answers "would it have, if `std` had a schema on disk."
+fn resolves_via_std_import(word: &str, imports: &[imports::ResolvedUse]) -> bool {
+    imports.iter().any(|u| {
+        u.resolved.absolute_namespace.first().map(String::as_str) == Some("std")
+            && u.resolved.absolute_namespace.last().map(String::as_str) == Some(word)
+    })
+}
+
+/// The last path segment of a file's URI, for a short, readable hover note
+/// (`types.ids`, not the full URI). `url.path()`, not `Url::to_file_path()`
+/// — unavailable on `wasm32-unknown-unknown` (see `imports`'s module doc).
+fn file_label(uri: &Url) -> String {
+    std::path::Path::new(uri.path())
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| uri.to_string())
+}
+
+/// Append one more line to an already-built hover.
+fn append_note(hover: &mut Hover, note: String) {
+    if let HoverContents::Array(contents) = &mut hover.contents {
+        contents.push(MarkedString::from_markdown(note));
+    }
+}
+
 /// Resolves a bare type name to its declaration across the active document
-/// plus every other project file — a flat, first-match scan (local document
-/// first, then `others` in order), the same simplification already used for
-/// cross-file *symbol* hover above. Backs [`size::size_of_type`] /
-/// [`size::size_of_struct`] for the size block in [`create_symbol_hover`].
+/// plus every other project file: local document first, then `others` in
+/// order — `use`-resolved siblings sorted first (see the call site that
+/// builds `others`), so a name collision with an unimported sibling still
+/// resolves to the one actually in scope, but an unimported sibling's own
+/// estimate still beats `Unknown` when nothing else matches. Backs
+/// [`size::size_of_type`] / [`size::size_of_struct`] for the size block in
+/// [`create_symbol_hover`].
 struct HoverSizeLookup<'a> {
     local: &'a Document,
     others: &'a [(&'a Url, &'a String, Document)],
@@ -960,6 +1048,12 @@ protocol Chat {
         assert!(text.contains("struct Message"), "got: {text}");
         assert!(text.contains("text"), "got: {text}");
         assert!(text.contains("seq"), "got: {text}");
+        // `chat.ids` has no `use` at all - this is the flat-scan fallback,
+        // not the `use`-scoped tier, so the note should be there.
+        assert!(
+            text.contains("no `use` here brings it into scope"),
+            "got: {text}"
+        );
         // `text: string` is unbounded, so the whole struct's size is too —
         // the direct regression guard for the `other_docs`-retention
         // restructuring that threads a cross-file SizeLookup through.
@@ -1047,5 +1141,169 @@ protocol Chat {
         // target.
         assert!(text.contains("type A = B"), "got: {text}");
         assert!(text.contains("u32"), "got: {text}");
+    }
+
+    #[test]
+    fn use_types_message_resolves_silently_no_note() {
+        let chat_source = "use types::Message\n\nprotocol Chat {\n    function send() -> Message;\n}\n";
+        let types_source = "struct Message {\n    text: string\n}\n";
+
+        let chat_uri = Url::parse("file:///chat.ids").unwrap();
+        let types_uri = Url::parse("file:///types.ids").unwrap();
+
+        // Hover over "Message" in the return-type position.
+        let position = Position::new(3, 24);
+
+        let hover = get_hover_info_with_project(
+            chat_source,
+            &chat_uri,
+            position,
+            &[(types_uri, types_source.to_string())],
+        )
+        .expect("use-resolved cross-file struct hover should resolve");
+        let text = hover_text(hover);
+
+        assert!(text.contains("struct Message"), "got: {text}");
+        assert!(
+            !text.contains("no `use` here brings it into scope"),
+            "a real `use types::Message` should resolve silently, got: {text}"
+        );
+    }
+
+    #[test]
+    fn two_siblings_declaring_the_same_name_use_picks_the_imported_one() {
+        // The actual bug item 4 of this whole plan exists to fix: a flat,
+        // first-match scan can't tell `a.ids`'s `Message` from `b.ids`'s -
+        // it just returns whichever file happened to come first in
+        // `other_files`. `use b::Message` must resolve to `b`'s.
+        let active_source = "use b::Message\n\nprotocol P {\n    function f() -> Message;\n}\n";
+        let a_source = "struct Message {\n    from_a: bool\n}\n";
+        let b_source = "struct Message {\n    from_b: bool\n}\n";
+
+        let active_uri = Url::parse("file:///active.ids").unwrap();
+        let a_uri = Url::parse("file:///a.ids").unwrap();
+        let b_uri = Url::parse("file:///b.ids").unwrap();
+
+        // Hover over "Message" in the return-type position. `a.ids` comes
+        // *before* `b.ids` in `other_files` - a flat scan would find it
+        // first and get this wrong.
+        let position = Position::new(3, 20);
+
+        let hover = get_hover_info_with_project(
+            active_source,
+            &active_uri,
+            position,
+            &[(a_uri, a_source.to_string()), (b_uri, b_source.to_string())],
+        )
+        .expect("use-resolved cross-file struct hover should resolve");
+        let text = hover_text(hover);
+
+        assert!(text.contains("from_b"), "got: {text}");
+        assert!(!text.contains("from_a"), "got: {text}");
+        assert!(!text.contains("no `use` here brings it into scope"), "got: {text}");
+    }
+
+    #[test]
+    fn use_multi_resolves_a_listed_item_silently() {
+        let active_source =
+            "use types::{Message, Other}\n\nprotocol P {\n    function f() -> Message;\n}\n";
+        let types_source = "struct Message {\n    text: string\n}\nstruct Other {\n    n: u8\n}\n";
+
+        let active_uri = Url::parse("file:///active.ids").unwrap();
+        let types_uri = Url::parse("file:///types.ids").unwrap();
+        let position = Position::new(3, 24);
+
+        let hover = get_hover_info_with_project(
+            active_source,
+            &active_uri,
+            position,
+            &[(types_uri, types_source.to_string())],
+        )
+        .expect("use-resolved cross-file struct hover should resolve");
+        let text = hover_text(hover);
+
+        assert!(text.contains("struct Message"), "got: {text}");
+        assert!(!text.contains("no `use` here brings it into scope"), "got: {text}");
+    }
+
+    #[test]
+    fn use_glob_resolves_anything_in_the_namespace_silently() {
+        let active_source =
+            "use types::*\n\nprotocol P {\n    function f() -> Message;\n}\n";
+        let types_source = "struct Message {\n    text: string\n}\n";
+
+        let active_uri = Url::parse("file:///active.ids").unwrap();
+        let types_uri = Url::parse("file:///types.ids").unwrap();
+        let position = Position::new(3, 24);
+
+        let hover = get_hover_info_with_project(
+            active_source,
+            &active_uri,
+            position,
+            &[(types_uri, types_source.to_string())],
+        )
+        .expect("use-resolved cross-file struct hover should resolve");
+        let text = hover_text(hover);
+
+        assert!(text.contains("struct Message"), "got: {text}");
+        assert!(!text.contains("no `use` here brings it into scope"), "got: {text}");
+    }
+
+    #[test]
+    fn use_as_alias_resolves_the_aliased_name_to_the_real_declaration() {
+        let active_source =
+            "use types::Message as Msg\n\nprotocol P {\n    function f() -> Msg;\n}\n";
+        let types_source = "struct Message {\n    text: string\n}\n";
+
+        let active_uri = Url::parse("file:///active.ids").unwrap();
+        let types_uri = Url::parse("file:///types.ids").unwrap();
+        // Hover over "Msg" (the alias) in the return-type position.
+        let position = Position::new(3, 20);
+
+        let hover = get_hover_info_with_project(
+            active_source,
+            &active_uri,
+            position,
+            &[(types_uri, types_source.to_string())],
+        )
+        .expect("alias-resolved cross-file struct hover should resolve");
+        let text = hover_text(hover);
+
+        // The real declaration is `struct Message`, not `struct Msg` -
+        // `types.ids`'s own symbol table never heard of "Msg".
+        assert!(text.contains("struct Message"), "got: {text}");
+        assert!(!text.contains("no `use` here brings it into scope"), "got: {text}");
+    }
+
+    #[test]
+    fn use_std_import_falls_back_silently_with_no_note() {
+        // `std::` never matches a local sibling (there's no "std" file in
+        // this project), and a coincidental same-named local struct isn't
+        // the author forgetting a `use` - it's a different symbol
+        // entirely, so the fallback must stay quiet here, not suggest a
+        // fix that wouldn't apply.
+        let active_source =
+            "use std::collections::HashMap\n\nstruct S {\n    m: HashMap\n}\n";
+        let unrelated_source = "struct HashMap {\n    unrelated: bool\n}\n";
+
+        let active_uri = Url::parse("file:///active.ids").unwrap();
+        let unrelated_uri = Url::parse("file:///unrelated.ids").unwrap();
+        // Hover over "HashMap" in the field-type position.
+        let position = Position::new(3, 9);
+
+        let hover = get_hover_info_with_project(
+            active_source,
+            &active_uri,
+            position,
+            &[(unrelated_uri, unrelated_source.to_string())],
+        )
+        .expect("flat-scan fallback should still resolve");
+        let text = hover_text(hover);
+
+        assert!(text.contains("struct HashMap"), "got: {text}");
+        assert!(
+            !text.contains("no `use` here brings it into scope"),
+            "a std:: import coincidentally sharing a name shouldn't get the not-use-scoped note, got: {text}"
+        );
     }
 }
