@@ -1,5 +1,6 @@
 // Completion handler - provides auto-completion suggestions
 
+use crate::analysis::annotations::{self, AnnotationScope};
 use crate::analysis::symbols;
 use crate::parser;
 use crate::util::position_to_offset;
@@ -595,77 +596,41 @@ fn get_type_completions(symbol_table: Option<&symbols::SymbolTable>) -> Vec<Comp
         .collect()
 }
 
-/// Which declaration an `@key=value` annotation is attaching to — decides
-/// which keys are worth suggesting. The grammar permits annotations on a
-/// `struct`, a `Field`, a `protocol`, and a `Function` (see
-/// `core/src/schema/idl/grammar.rs`); `Leading` covers the first two (a
-/// struct's and a protocol's own annotation sit in the same "top level,
-/// right before the keyword" position, indistinguishable without looking
-/// past the cursor at text that doesn't exist yet) and `Field` /
-/// `Function` the other two.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum AnnotationScope {
-    /// Top level, before `struct` or `protocol`.
-    Leading,
-    /// Inside a `struct`/`error` body, before a field.
-    Field,
-    /// Inside a `protocol` body, before a function.
-    Function,
+/// The snippet a known annotation key inserts — completion-specific
+/// (editor insertion mechanics), so it lives here rather than in the
+/// shared `analysis::annotations` table, which only describes *meaning*.
+/// `None` falls back to inserting just the bare key name.
+fn annotation_insert_text(key: &str) -> Option<&'static str> {
+    match key {
+        "validators" => Some("validators = [$0]"),
+        "timeout_ms" => Some("timeout_ms = $0"),
+        "framing" => Some("framing = \"${1|jsonrpc,datagram|}\"$0"),
+        // Conceptually a bare marker, but the grammar requires `=value`
+        // unconditionally — see `annotations::KNOWN_ANNOTATIONS`'s own
+        // `idempotent` entry for why `= true` and not a bool literal.
+        "idempotent" => Some("idempotent = ${1:true}$0"),
+        _ => None,
+    }
 }
 
-/// Annotation-key completions for `scope`. Every key here is one a real
-/// generator or `core`'s own validation pass actually reads today — not a
-/// guess at the open namespace's eventual shape (`@key=value` accepts any
-/// name; the runtime/generator documents and validates only the keys it
-/// acts on and silently ignores the rest, so this list is deliberately a
-/// known-good subset, not an exhaustive or enforced one).
+/// Annotation-key completions for `scope`, sourced from
+/// [`annotations::KNOWN_ANNOTATIONS`] — the same table [`hover`] reads for
+/// an annotation key's own tooltip, so the two can't describe one key two
+/// different ways.
 fn get_annotation_completions(scope: AnnotationScope) -> Vec<CompletionItem> {
-    match scope {
-        AnnotationScope::Field => vec![CompletionItem {
-            label: "validators".to_string(),
-            kind: Some(CompletionItemKind::PROPERTY),
-            detail: Some("Attach one or more named validators to this field".to_string()),
-            insert_text: Some("validators = [$0]".to_string()),
-            insert_text_format: Some(lsp_types::InsertTextFormat::SNIPPET),
-            ..Default::default()
-        }],
-        AnnotationScope::Function => vec![
+    annotations::for_scope(scope)
+        .map(|info| {
+            let snippet = annotation_insert_text(info.key);
             CompletionItem {
-                label: "timeout_ms".to_string(),
+                label: info.key.to_string(),
                 kind: Some(CompletionItemKind::PROPERTY),
-                detail: Some(
-                    "Milliseconds the client waits for a response before timing out \
-                     (request/response calls only)"
-                        .to_string(),
-                ),
-                insert_text: Some("timeout_ms = $0".to_string()),
-                insert_text_format: Some(lsp_types::InsertTextFormat::SNIPPET),
+                detail: Some(info.description.to_string()),
+                insert_text: snippet.map(str::to_string),
+                insert_text_format: snippet.map(|_| lsp_types::InsertTextFormat::SNIPPET),
                 ..Default::default()
-            },
-            CompletionItem {
-                label: "idempotent".to_string(),
-                kind: Some(CompletionItemKind::PROPERTY),
-                detail: Some(
-                    "Marks calling this function twice as safe — advisory metadata only, \
-                     no behavior yet (reserved for a future retry mechanism)"
-                        .to_string(),
-                ),
-                ..Default::default()
-            },
-        ],
-        AnnotationScope::Leading => vec![CompletionItem {
-            label: "framing".to_string(),
-            kind: Some(CompletionItemKind::PROPERTY),
-            detail: Some(
-                "Wire framing the generated client/server use for this protocol \
-                 (protocols only — no effect on a struct)"
-                    .to_string(),
-            ),
-            insert_text: Some("framing = \"${1|jsonrpc,datagram|}\"$0".to_string()),
-            insert_text_format: Some(lsp_types::InsertTextFormat::SNIPPET),
-            ..Default::default()
-        }],
-    }
+            }
+        })
+        .collect()
 }
 
 /// Completion context
