@@ -20,7 +20,7 @@ pub struct ProjectDoc<'a> {
     pub document: Document,
     pub symbols: SymbolTable,
     pub imports: Vec<ResolvedUse>,
-    namespace: Vec<String>,
+    pub namespace: Vec<String>,
 }
 
 /// Every file that parses, in the order given. The order matters only for
@@ -50,14 +50,20 @@ impl<'a> Project<'a> {
     /// Parse `files` (`(uri, source)` pairs); files that don't parse are
     /// left out.
     pub fn new(files: impl IntoIterator<Item = (&'a Url, &'a str)>) -> Self {
+        Self::from_parsed(files.into_iter().filter_map(|(uri, source)| {
+            parser::parse(source).ok()?.document.map(|document| (uri, source, document))
+        }))
+    }
+
+    /// Like [`Project::new`], from files the caller already parsed.
+    pub fn from_parsed(files: impl IntoIterator<Item = (&'a Url, &'a str, Document)>) -> Self {
         let docs = files
             .into_iter()
-            .filter_map(|(uri, source)| {
-                let document = parser::parse(source).ok()?.document?;
+            .map(|(uri, source, document)| {
                 let symbols = symbols::build_symbol_table(&document, uri, source);
                 let namespace = imports::namespace_of(uri);
                 let imports = imports::resolved_imports(&document, &namespace);
-                Some(ProjectDoc { uri, source, document, symbols, imports, namespace })
+                ProjectDoc { uri, source, document, symbols, imports, namespace }
             })
             .collect();
 
@@ -264,6 +270,42 @@ fn collect_named(ty: &Type, names: &mut BTreeSet<String>) {
         }
         Type::Array(array) => collect_named(array.elem_type(), names),
         Type::Union(union) => union.members().iter().for_each(|m| collect_named(m, names)),
+        _ => {}
+    }
+}
+
+/// Every named type written in `doc`'s type positions: its text as written
+/// (`Message`, or qualified `types::Message`) and the byte offset each
+/// occurrence starts at. A bare name is never matched inside a qualified one.
+pub(crate) fn named_type_sites(doc: &ProjectDoc) -> Vec<(String, usize)> {
+    let mut sites = BTreeSet::new();
+
+    for (span, ty) in type_spans(&doc.document) {
+        let mut names = BTreeSet::new();
+        collect_named_text(ty, &mut names);
+
+        let (start, end) = (span.0.min(doc.source.len()), span.1.min(doc.source.len()));
+        let text = &doc.source[start..end];
+        for name in names {
+            for i in word_occurrences(text, &name) {
+                if !text[..i].ends_with("::") && !text[i + name.len()..].starts_with("::") {
+                    sites.insert((start + i, name.clone()));
+                }
+            }
+        }
+    }
+
+    sites.into_iter().map(|(offset, name)| (name, offset)).collect()
+}
+
+/// Like [`collect_named`], but the full text as written (`types::User`).
+fn collect_named_text(ty: &Type, names: &mut BTreeSet<String>) {
+    match ty {
+        Type::Named(name) => {
+            names.insert(name.text.clone());
+        }
+        Type::Array(array) => collect_named_text(array.elem_type(), names),
+        Type::Union(union) => union.members().iter().for_each(|m| collect_named_text(m, names)),
         _ => {}
     }
 }

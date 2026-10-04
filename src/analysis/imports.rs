@@ -17,7 +17,7 @@ use comline_core::schema::idl::grammar::{Declaration, Document};
 use comline_core::schema::ir::compiler::import_resolver::{
     use_brings_into_scope, ImportResolver, ResolvedImport,
 };
-use lsp_types::Url;
+use lsp_types::{Position, Range, TextEdit, Url};
 
 /// One project file the language server knows about - just enough to
 /// resolve a `use` against it. `namespace` is the file's path under its
@@ -168,6 +168,29 @@ pub struct ResolvedSymbol<'a> {
     pub real_name: String,
 }
 
+/// The edit adding `use <path>` to `source`: on the line after the last
+/// `use`/`import`, or at the very top (plus a blank line) when there's none.
+/// Works on the raw text, not the parsed tree, so completion can use it
+/// mid-edit, when the file doesn't parse.
+pub fn add_use_edit(source: &str, path: &str) -> TextEdit {
+    let lines: Vec<&str> = source.lines().collect();
+    let last_use = lines.iter().rposition(|line| {
+        let line = line.trim_start();
+        line.starts_with("use ") || line.starts_with("import ")
+    });
+
+    let (position, new_text) = match last_use {
+        // The last line, with no newline after it to insert behind.
+        Some(i) if i + 1 == lines.len() && !source.ends_with('\n') => {
+            (Position::new(i as u32, lines[i].chars().count() as u32), format!("\nuse {path}"))
+        }
+        Some(i) => (Position::new(i as u32 + 1, 0), format!("use {path}\n")),
+        None => (Position::new(0, 0), format!("use {path}\n\n")),
+    };
+
+    TextEdit { range: Range::new(position, position), new_text }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,5 +328,31 @@ mod tests {
         let siblings = vec![file(&["types"])];
 
         assert!(resolve_symbol("User", &imports, &siblings).is_none());
+    }
+
+    fn apply(source: &str, edit: &TextEdit) -> String {
+        let offset = crate::util::position_to_offset(source, edit.range.start).unwrap_or(source.len());
+        format!("{}{}{}", &source[..offset], edit.new_text, &source[offset..])
+    }
+
+    #[test]
+    fn add_use_goes_after_the_last_existing_use() {
+        let source = "use a::X\nuse b::Y\n\nstruct S {\n    m: Z\n}\n";
+        assert_eq!(
+            apply(source, &add_use_edit(source, "types::Z")),
+            "use a::X\nuse b::Y\nuse types::Z\n\nstruct S {\n    m: Z\n}\n"
+        );
+    }
+
+    #[test]
+    fn add_use_goes_at_the_top_when_there_is_none() {
+        let source = "struct S {\n    m: Z\n}\n";
+        assert_eq!(apply(source, &add_use_edit(source, "types::Z")), "use types::Z\n\nstruct S {\n    m: Z\n}\n");
+    }
+
+    #[test]
+    fn add_use_after_a_final_use_line_with_no_newline() {
+        let source = "use a::X";
+        assert_eq!(apply(source, &add_use_edit(source, "types::Z")), "use a::X\nuse types::Z");
     }
 }

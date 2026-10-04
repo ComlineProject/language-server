@@ -1,14 +1,32 @@
 // Completion handler - provides auto-completion suggestions
 
+use crate::analysis::import_check::{self, declares_type, file_name, is_type_kind, Target};
+use crate::analysis::imports::{self, add_use_edit, ResolvedUse};
+use crate::analysis::project::{Project, ProjectDoc};
 use crate::analysis::symbols;
 use crate::parser;
 use crate::util::position_to_offset;
 use comline_core::schema::idl::annotations::{self, AnnotationScope};
 use comline_core::schema::idl::vocabulary::{self, KeywordKind};
-use lsp_types::{CompletionItem, CompletionItemKind, Position, Url};
+use lsp_types::{CompletionItem, CompletionItemKind, Position, SymbolKind, Url};
+use std::collections::BTreeSet;
 
-/// Get completion suggestions at a position
+/// Get completion suggestions at a position, considering only this file.
 pub fn get_completions(source: &str, uri: &Url, position: Position) -> Vec<CompletionItem> {
+    get_completions_with_project(source, uri, position, &[])
+}
+
+/// Get completion suggestions at a position, with `other_files` (every
+/// other open file, as `(uri, source)` pairs) as the project: in a type
+/// position, the types this file's `use`s bring in from them, and then
+/// every other type they declare - picking one of those also adds its
+/// `use` line.
+pub fn get_completions_with_project(
+    source: &str,
+    uri: &Url,
+    position: Position,
+    other_files: &[(Url, String)],
+) -> Vec<CompletionItem> {
     let offset = match position_to_offset(source, position) {
         Some(o) => o,
         None => return get_keyword_completions(),
@@ -44,6 +62,7 @@ pub fn get_completions(source: &str, uri: &Url, position: Position) -> Vec<Compl
             // that `:`/`->`/`(`.
             completions.extend(get_primitive_type_completions());
             completions.extend(get_type_completions(symbol_table.as_ref()));
+            completions.extend(get_import_completions(source, uri, other_files, symbol_table.as_ref()));
         }
         CompletionContext::TopLevel => {
             // Nothing (or only a partial keyword) typed yet, no enclosing
@@ -78,10 +97,105 @@ pub fn get_completions(source: &str, uri: &Url, position: Position) -> Vec<Compl
             completions.extend(get_keyword_completions());
             completions.extend(get_primitive_type_completions());
             completions.extend(get_type_completions(symbol_table.as_ref()));
+            completions.extend(get_import_completions(source, uri, other_files, symbol_table.as_ref()));
         }
     }
 
     completions
+}
+
+/// Type names from the other open files. First the ones this file's `use`s
+/// bring into scope - under their alias, if they have one - then every
+/// other type those files declare, sorted after everything else, which
+/// inserts the missing `use` line along with the name. Names already
+/// declared here, or already in scope, aren't offered again.
+fn get_import_completions(
+    source: &str,
+    uri: &Url,
+    other_files: &[(Url, String)],
+    symbol_table: Option<&symbols::SymbolTable>,
+) -> Vec<CompletionItem> {
+    let siblings = Project::new(other_files.iter().map(|(u, s)| (u, s.as_str())));
+    let mut in_scope: BTreeSet<String> = symbol_table
+        .map(|t| t.all_symbols().into_iter().map(|s| s.name.clone()).collect())
+        .unwrap_or_default();
+    // (file, declared name) already imported, under whatever name.
+    let mut imported: BTreeSet<(usize, String)> = BTreeSet::new();
+    let mut items = Vec::new();
+
+    for use_decl in uses_in(source, uri) {
+        let Target::Open(sibling, remaining) = import_check::target_of(&siblings, None, &use_decl) else {
+            continue; // can't list what a file that isn't open declares
+        };
+        let doc = &siblings.docs[sibling];
+        let symbols = &use_decl.resolved.symbols;
+
+        // (name in scope here, name declared there)
+        let names: Vec<(String, String)> = if symbols == &["*"] || (symbols.is_empty() && remaining.is_empty()) {
+            type_names(doc).map(|n| (n.clone(), n)).collect()
+        } else if !symbols.is_empty() {
+            symbols.iter().filter(|n| declares_type(doc, n)).map(|n| (n.clone(), n.clone())).collect()
+        } else {
+            let real = remaining.join("::");
+            match declares_type(doc, &real) {
+                true => vec![(use_decl.alias.clone().unwrap_or_else(|| real.clone()), real)],
+                false => vec![],
+            }
+        };
+
+        for (label, real) in names {
+            imported.insert((sibling, real.clone()));
+            if in_scope.insert(label.clone()) {
+                let detail = match label == real {
+                    true => format!("from `{}`", file_name(doc)),
+                    false => format!("`{real}` from `{}`", file_name(doc)),
+                };
+                items.push(type_item(doc, &real, label, detail));
+            }
+        }
+    }
+
+    for (index, doc) in siblings.docs.iter().enumerate() {
+        for name in type_names(doc) {
+            if in_scope.contains(&name) || imported.contains(&(index, name.clone())) {
+                continue;
+            }
+            let path = format!("{}::{}", doc.namespace.join("::"), name);
+            let mut item = type_item(doc, &name, name.clone(), format!("from `{}` — adds `use {path}`", file_name(doc)));
+            item.sort_text = Some(format!("~{name}"));
+            item.additional_text_edits = Some(vec![add_use_edit(source, &path)]);
+            items.push(item);
+        }
+    }
+
+    items
+}
+
+/// The `use`/`import` declarations in `source`, each parsed on its own
+/// line, so they're there even while the rest of the file doesn't parse.
+fn uses_in(source: &str, uri: &Url) -> Vec<ResolvedUse> {
+    let namespace = imports::namespace_of(uri);
+    source
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("use ") || line.starts_with("import "))
+        .filter_map(|line| parser::parse(line).ok()?.document)
+        .flat_map(|document| imports::resolved_imports(&document, &namespace))
+        .collect()
+}
+
+/// Every struct, enum and type alias `doc` declares.
+fn type_names<'d>(doc: &'d ProjectDoc) -> impl Iterator<Item = String> + 'd {
+    doc.symbols.all_symbols().into_iter().filter(|s| is_type_kind(s.kind)).map(|s| s.name.clone())
+}
+
+fn type_item(doc: &ProjectDoc, real: &str, label: String, detail: String) -> CompletionItem {
+    let kind = match doc.symbols.get(real).map(|s| s.kind) {
+        Some(SymbolKind::ENUM) => CompletionItemKind::ENUM,
+        Some(SymbolKind::TYPE_PARAMETER) => CompletionItemKind::CLASS,
+        _ => CompletionItemKind::STRUCT,
+    };
+    CompletionItem { label, kind: Some(kind), detail: Some(detail), ..Default::default() }
 }
 
 /// Is `offset` inside a `//` line comment or a `"…"` string on its line?
@@ -867,5 +981,81 @@ mod tests {
             CompletionContext::ProtocolBody
         );
         assert_eq!(determine_context("struct ", 7), CompletionContext::DeclarationName);
+    }
+
+    const TYPES: &str = "struct Message {\n    text: string\n}\n\nenum Kind {\n    A\n}\n\nprotocol Api {\n    function f();\n}\n";
+
+    /// Completions at the end of `source` (a type position), with
+    /// `pkg/src/types.ids` open: `(label, detail, adds a use line?)` for every
+    /// item from another file.
+    fn imported_items(source: &str) -> Vec<(String, String, Option<String>)> {
+        let uri = Url::parse("file:///pkg/src/chat.ids").unwrap();
+        let others = [(Url::parse("file:///pkg/src/types.ids").unwrap(), TYPES.to_string())];
+        let end = crate::util::offset_to_position(source, source.len());
+
+        get_completions_with_project(source, &uri, end, &others)
+            .into_iter()
+            .filter(|c| c.detail.as_deref().is_some_and(|d| d.contains("types.ids")))
+            .map(|c| {
+                let edit = c.additional_text_edits.map(|e| e[0].new_text.clone());
+                (c.label, c.detail.unwrap(), edit)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn imported_types_are_offered_and_the_rest_add_their_use() {
+        // Mid-edit: the file doesn't parse, its `use` line still does.
+        let items = imported_items("use types::Message\n\nstruct S {\n    m: ");
+        assert_eq!(
+            items,
+            vec![
+                ("Message".to_string(), "from `types.ids`".to_string(), None),
+                (
+                    "Kind".to_string(),
+                    "from `types.ids` — adds `use types::Kind`".to_string(),
+                    Some("use types::Kind\n".to_string())
+                ),
+            ],
+            "the protocol `Api` isn't a type"
+        );
+    }
+
+    #[test]
+    fn an_alias_is_offered_under_its_alias_only() {
+        let items = imported_items("use types::Message as Msg\n\nstruct S {\n    m: ");
+        let labels: Vec<_> = items.iter().map(|(l, d, _)| (l.as_str(), d.as_str())).collect();
+        assert!(labels.contains(&("Msg", "`Message` from `types.ids`")), "{items:?}");
+        assert!(!labels.iter().any(|(l, _)| *l == "Message"), "already imported as `Msg`: {items:?}");
+    }
+
+    #[test]
+    fn a_glob_brings_in_every_type() {
+        let items = imported_items("use types::*\n\nstruct S {\n    m: ");
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert!(items.iter().all(|(_, _, edit)| edit.is_none()), "{items:?}");
+    }
+
+    #[test]
+    fn without_a_use_every_type_adds_one_at_the_top() {
+        let items = imported_items("struct S {\n    m: ");
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert!(items.iter().any(|(l, _, edit)| l == "Message" && edit.as_deref() == Some("use types::Message\n\n")));
+    }
+
+    #[test]
+    fn a_type_declared_here_is_not_offered_from_another_file() {
+        let source = "struct Message {\n    mine: bool\n}\n\nstruct S {\n    m: Message\n    n: ";
+        let finished = format!("{source}bool\n}}\n");
+        let uri = Url::parse("file:///pkg/src/chat.ids").unwrap();
+        let others = [(Url::parse("file:///pkg/src/types.ids").unwrap(), TYPES.to_string())];
+        let at = crate::util::offset_to_position(&finished, source.len());
+
+        let labels: Vec<_> = get_completions_with_project(&finished, &uri, at, &others)
+            .into_iter()
+            .filter(|c| c.label == "Message")
+            .map(|c| c.detail)
+            .collect();
+        assert_eq!(labels.len(), 1, "only the local `Message`: {labels:?}");
     }
 }

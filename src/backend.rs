@@ -85,6 +85,10 @@ impl LanguageServer for Backend {
                     work_done_progress_options: WorkDoneProgressOptions::default(),
                 })),
                 document_formatting_provider: Some(OneOf::Left(true)),
+                code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
+                    code_action_kinds: Some(vec![CodeActionKind::QUICKFIX]),
+                    ..Default::default()
+                })),
                 semantic_tokens_provider: Some(
                     SemanticTokensServerCapabilities::SemanticTokensOptions(
                         SemanticTokensOptions {
@@ -157,6 +161,13 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         tracing::debug!("Document closed: {}", uri);
         self.documents.remove(&uri);
+
+        if !is_idp(&uri) {
+            // Its declarations are gone from the project view, which can
+            // change what the remaining files' imports resolve to.
+            self.client.publish_diagnostics(uri, vec![], None).await;
+            self.publish_ids_diagnostics().await;
+        }
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
@@ -203,7 +214,12 @@ impl LanguageServer for Backend {
         
         // Use our completion handler
         use crate::handlers::completion;
-        let completions = completion::get_completions(&document.text, &uri, position);
+        let completions = completion::get_completions_with_project(
+            &document.text,
+            &uri,
+            position,
+            &self.other_open_files(&uri),
+        );
         
         if completions.is_empty() {
             Ok(None)
@@ -381,6 +397,28 @@ impl LanguageServer for Backend {
         .map(PrepareRenameResponse::Range))
     }
 
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        let uri = params.text_document.uri.clone();
+
+        if is_idp(&uri) {
+            return Ok(None);
+        }
+
+        let document = match self.documents.get(&uri) {
+            Some(doc) => doc,
+            None => return Ok(None),
+        };
+
+        use crate::handlers::code_actions;
+        let actions = code_actions::get_code_actions_with_project(
+            &document.text,
+            &uri,
+            &params,
+            &self.other_open_files(&uri),
+        );
+        Ok((!actions.is_empty()).then_some(actions))
+    }
+
     async fn semantic_tokens_full(
         &self,
         params: SemanticTokensParams,
@@ -412,51 +450,55 @@ impl Backend {
         if is_idp(uri) {
             self.parse_and_publish_idp_diagnostics(uri).await;
         } else {
-            self.parse_and_publish_ids_diagnostics(uri).await;
+            self.publish_ids_diagnostics().await;
         }
     }
 
-    async fn parse_and_publish_ids_diagnostics(&self, uri: &Url) {
+    /// Re-check every open `.ids` file and publish its diagnostics. All of
+    /// them, not just the one that changed: whether a name is imported, or
+    /// declared somewhere at all, depends on the other open files too
+    /// (`analysis::import_check`). Each file is parsed once per refresh.
+    async fn publish_ids_diagnostics(&self) {
         use crate::analysis::diagnostics;
+        use crate::analysis::project::Project;
         use crate::parser;
 
-        let document = match self.documents.get(uri) {
-            Some(doc) => doc,
-            None => return,
-        };
+        let documents: Vec<crate::document::Document> = self
+            .documents
+            .get_all_uris()
+            .into_iter()
+            .filter(|u| !is_idp(u))
+            .filter_map(|u| self.documents.get(&u))
+            .collect();
 
-        // Parse the document
-        match parser::parse(&document.text) {
-            Ok(result) => {
-                // Parse-error diagnostics, plus `comline-core`'s validation
-                // pass once the tree is well-formed.
-                let lsp_diagnostics = diagnostics::all_diagnostics(
-                    &document.text,
-                    &result.errors,
-                    result.document.as_ref(),
-                );
-
-                // Log parse results
-                if result.is_ok() {
-                    if let Some(doc) = &result.document {
-                        tracing::debug!("Successfully parsed {}: {} declarations", uri, parser::get_declaration_count(doc));
+        // (document, its parse errors), and the trees of the ones that parsed
+        let mut parsed = Vec::new();
+        let mut trees = Vec::new();
+        for d in &documents {
+            match parser::parse(&d.text) {
+                Ok(result) => {
+                    if let Some(tree) = result.document {
+                        trees.push((&d.uri, d.text.as_str(), tree));
                     }
-                } else {
-                    tracing::debug!("Parse errors for {}: {} error(s)", uri, result.errors.len());
+                    parsed.push((d, result.errors));
                 }
+                Err(e) => tracing::error!("Failed to parse {}: {}", d.uri, e),
+            }
+        }
+        let project = Project::from_parsed(trees);
 
-                // Publish diagnostics to client
-                self.client
-                    .publish_diagnostics(uri.clone(), lsp_diagnostics, Some(document.version))
-                    .await;
-            }
-            Err(e) => {
-                tracing::error!("Failed to parse {}: {}", uri, e);
-                // Clear diagnostics on internal error
-                self.client
-                    .publish_diagnostics(uri.clone(), vec![], Some(document.version))
-                    .await;
-            }
+        for (d, errors) in &parsed {
+            let lsp_diagnostics = match project.index_of(&d.uri) {
+                Some(index) if errors.is_empty() => diagnostics::project_diagnostics(&project, index),
+                _ => {
+                    tracing::debug!("Parse errors for {}: {} error(s)", d.uri, errors.len());
+                    diagnostics::generate_diagnostics(&d.text, errors)
+                }
+            };
+
+            self.client
+                .publish_diagnostics(d.uri.clone(), lsp_diagnostics, Some(d.version))
+                .await;
         }
     }
 

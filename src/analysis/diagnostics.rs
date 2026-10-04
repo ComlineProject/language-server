@@ -1,17 +1,33 @@
-// Diagnostic generation — parse errors, and `comline-core`'s validation pass
+// Diagnostic generation — parse errors, `comline-core`'s validation pass,
+// and missing imports
 
+use crate::analysis::import_check::{self, MissingImport};
+use crate::analysis::project::Project;
 use crate::util::byte_range_to_lsp_range;
 use comline_core::schema::idl::grammar::Document;
 use comline_core::schema::ir::compiler::interpreter::incremental::IncrementalInterpreter;
 use comline_core::schema::ir::compiler::Compile;
+use comline_core::schema::ir::frozen::unit::FrozenUnit;
 use comline_core::schema::ir::validation;
-use lsp_types::{Diagnostic, DiagnosticSeverity};
+use lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Url};
+
+/// The `code` of a missing-import diagnostic - what the quick fix in
+/// `handlers::code_actions` answers to.
+pub const MISSING_IMPORT: &str = "missing-import";
 
 /// Semantic diagnostics from `comline-core`'s validation pass — undefined type
 /// references, duplicate declarations, and the like: the same checks
 /// `comline build` runs. Call only on a document that parsed cleanly.
 pub fn validation_diagnostics(source: &str, document: &Document) -> Vec<Diagnostic> {
-    let units = IncrementalInterpreter::from_declarations(document.0.clone());
+    validation_diagnostics_with(source, document, vec![])
+}
+
+/// [`validation_diagnostics`], with `extra` imports appended to the file's
+/// own units first - the ones core can't see from this file alone (see
+/// `analysis::import_check`).
+fn validation_diagnostics_with(source: &str, document: &Document, extra: Vec<FrozenUnit>) -> Vec<Diagnostic> {
+    let mut units = IncrementalInterpreter::from_declarations(document.0.clone());
+    units.extend(extra);
     let errors = match validation::validate(&units) {
         Ok(()) => return vec![],
         Err(errors) => errors,
@@ -46,8 +62,8 @@ pub fn validation_diagnostics(source: &str, document: &Document) -> Vec<Diagnost
         .collect()
 }
 
-/// Parse-error + validation diagnostics for `source`. Validation is skipped
-/// while the tree is malformed (parse errors present).
+/// Parse-error + validation diagnostics for `source` on its own. Validation
+/// is skipped while the tree is malformed (parse errors present).
 pub fn all_diagnostics(
     source: &str,
     errors: &[rust_sitter::errors::ParseError],
@@ -56,10 +72,59 @@ pub fn all_diagnostics(
     let mut diagnostics = generate_diagnostics(source, errors);
     if errors.is_empty() {
         if let Some(doc) = document {
-            diagnostics.extend(validation_diagnostics(source, doc));
+            // A project of one: no siblings, but `use` forms core can't
+            // expand alone still aren't reported as unknown types.
+            let uri = Url::parse("file:///schema.ids").expect("static URL");
+            let project = Project::from_parsed([(&uri, source, Document(doc.0.clone()))]);
+            diagnostics.extend(project_diagnostics(&project, 0));
         }
     }
     diagnostics
+}
+
+/// Validation diagnostics for `project.docs[doc]` (a file that parsed
+/// cleanly), using what the other open files reveal: core's own checks,
+/// told about the imports it can't see from one file, plus a
+/// missing-import error - in place of core's bare "Unknown type" - where a
+/// type declared in another open file is used without a `use`.
+pub fn project_diagnostics(project: &Project, doc: usize) -> Vec<Diagnostic> {
+    let here = &project.docs[doc];
+    let check = import_check::check(project, doc);
+
+    let mut diagnostics = validation_diagnostics_with(here.source, &here.document, check.scope);
+    diagnostics.extend(check.missing.iter().map(|m| missing_import_diagnostic(here.source, m)));
+    diagnostics
+}
+
+fn missing_import_diagnostic(source: &str, missing: &MissingImport) -> Diagnostic {
+    let name = &missing.name;
+    let message = match (&missing.imported_as, missing.candidates.as_slice()) {
+        (Some(alias), [first, ..]) => format!(
+            "`{name}` is imported here as `{alias}` — write `{alias}`, or add `use {}`",
+            first.use_path(name)
+        ),
+        (None, [only]) => format!(
+            "`{name}` is declared in `{}` but not imported here — add `use {}`",
+            only.file,
+            only.use_path(name)
+        ),
+        (_, many) => format!(
+            "`{name}` is declared in {} but not imported here — add a `use` for one of them",
+            many.iter().map(|c| format!("`{}`", c.file)).collect::<Vec<_>>().join(", ")
+        ),
+    };
+
+    Diagnostic {
+        range: byte_range_to_lsp_range(source, missing.range.0, missing.range.1),
+        severity: Some(DiagnosticSeverity::ERROR),
+        code: Some(NumberOrString::String(MISSING_IMPORT.to_string())),
+        code_description: None,
+        source: Some("comline".to_string()),
+        message,
+        related_information: None,
+        tags: None,
+        data: None,
+    }
 }
 
 /// Generate LSP diagnostics from parse errors
@@ -333,5 +398,69 @@ struct User {
         assert!(!result.has_errors());
         assert!(generate_diagnostics(source, &result.errors).is_empty());
     }
-}
 
+    fn messages(source: &str) -> Vec<String> {
+        let r = parser::parse(source).unwrap();
+        all_diagnostics(source, &r.errors, r.document.as_ref()).into_iter().map(|d| d.message).collect()
+    }
+
+    fn project_messages(files: &[(&str, &str)]) -> Vec<(String, Option<NumberOrString>, u32, u32)> {
+        let files: Vec<(Url, String)> =
+            files.iter().map(|(u, s)| (Url::parse(u).unwrap(), s.to_string())).collect();
+        let project = Project::new(files.iter().map(|(u, s)| (u, s.as_str())));
+        project_diagnostics(&project, 0)
+            .into_iter()
+            .map(|d| (d.message, d.code, d.range.start.line, d.range.start.character))
+            .collect()
+    }
+
+    const TYPES: (&str, &str) = ("file:///pkg/src/types.ids", "struct Message {\n    text: string\n}\n");
+
+    #[test]
+    fn use_forms_core_cannot_expand_alone_are_not_unknown_types() {
+        // Each of these was reported as "Unknown type 'Message'" on its own.
+        for source in [
+            "use types::*\n\nstruct S {\n    m: Message\n}\n",
+            "use types::{Message, Other}\n\nstruct S {\n    m: Message\n}\n",
+            "use types\n\nstruct S {\n    m: Message\n}\n",
+            "use types\n\nstruct S {\n    m: types::Message\n}\n",
+        ] {
+            assert_eq!(messages(source), Vec::<String>::new(), "{source}");
+        }
+    }
+
+    #[test]
+    fn a_type_used_with_no_import_at_all_is_still_unknown_on_its_own() {
+        assert_eq!(messages("struct S {\n    m: Message\n}\n").len(), 1);
+    }
+
+    #[test]
+    fn a_missing_import_replaces_the_unknown_type_error() {
+        let found = project_messages(&[("file:///pkg/src/chat.ids", "struct S {\n    m: Message\n}\n"), TYPES]);
+        assert_eq!(
+            found,
+            vec![(
+                "`Message` is declared in `types.ids` but not imported here — add `use types::Message`".to_string(),
+                Some(NumberOrString::String(MISSING_IMPORT.to_string())),
+                1,
+                7
+            )]
+        );
+    }
+
+    #[test]
+    fn a_glob_of_an_open_file_is_expanded_with_what_it_declares() {
+        let chat = "use types::*\n\nstruct S {\n    m: Message\n    n: Nope\n}\n";
+        let found = project_messages(&[("file:///pkg/src/chat.ids", chat), TYPES]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].0.starts_with("Unknown type 'Nope'"), "{found:?}");
+    }
+
+    #[test]
+    fn using_the_real_name_of_an_aliased_import_says_so() {
+        let chat = "use types::Message as Msg\n\nstruct S {\n    m: Message\n}\n";
+        let found = project_messages(&[("file:///pkg/src/chat.ids", chat), TYPES]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].0, "`Message` is imported here as `Msg` — write `Msg`, or add `use types::Message`");
+    }
+}
