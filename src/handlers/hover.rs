@@ -1,5 +1,6 @@
 // Hover handler - provides type information on hover
 
+use crate::analysis::annotations;
 use crate::analysis::symbols;
 use crate::parser;
 use crate::util::position_to_offset;
@@ -38,6 +39,18 @@ pub fn get_hover_info_with_project(
 
     // Find what's at this position
     let word = get_word_at_offset(source, offset)?;
+
+    // An annotation key (`@timeout_ms`) — checked first since `@`
+    // immediately before the word is an unambiguous signal, independent of
+    // whether the same text happens to also name a symbol or a field
+    // elsewhere (a field literally named `timeout_ms` is a real,
+    // if confusing, possibility).
+    if is_annotation_key(source, offset) {
+        return Some(match annotations::lookup(&word) {
+            Some(info) => create_annotation_hover(info),
+            None => create_unknown_annotation_hover(&word),
+        });
+    }
 
     // Parse every sibling file once, up front, and keep them all alive for
     // the rest of this call — not just whichever one happens to match the
@@ -344,6 +357,64 @@ fn create_type_hover(type_name: &str, type_kind: &str) -> Hover {
     
     Hover {
         contents: HoverContents::Array(contents),
+        range: None,
+    }
+}
+
+/// Whether the word at `offset` is immediately preceded by `@` — i.e. this
+/// is an annotation key (`@timeout_ms`), not a coincidental identifier
+/// that happens to share its text with one (a field literally named
+/// `timeout_ms`, say). Same start-boundary scan as
+/// [`get_word_at_offset`], so it agrees with it on where the word begins.
+fn is_annotation_key(source: &str, offset: usize) -> bool {
+    let offset = offset.min(source.len());
+    let start = source[..offset]
+        .rfind(|c: char| !c.is_alphanumeric() && c != '_')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    start > 0 && source.as_bytes().get(start - 1) == Some(&b'@')
+}
+
+/// Hover for a known `@key` — its own name, description, default when
+/// absent, expected value shape, and what actually reads it (or that
+/// nothing does yet). Sourced from [`annotations::KNOWN_ANNOTATIONS`], the
+/// same table `completion` reads for the key's suggestion, so the two
+/// can't describe one key two different ways.
+fn create_annotation_hover(info: &annotations::AnnotationInfo) -> Hover {
+    let consumed = match info.consumed_by {
+        Some(c) => format!("consumed by: {c}"),
+        None => "**not consumed anywhere yet** — decided, advisory metadata only".to_string(),
+    };
+    let detail = [
+        format!("default: {}", info.default),
+        format!("value: {}", info.value),
+        consumed,
+    ]
+    .join("\n\n");
+
+    Hover {
+        contents: HoverContents::Array(vec![
+            MarkedString::from_language_code("comline".to_string(), format!("@{}", info.key)),
+            MarkedString::from_markdown(info.description.to_string()),
+            MarkedString::from_markdown(detail),
+        ]),
+        range: None,
+    }
+}
+
+/// Hover for an `@key` this server doesn't have a description for.
+/// `@key=value` is an open namespace — an unrecognised key is still
+/// perfectly valid, just not one this server knows the meaning of (yet).
+fn create_unknown_annotation_hover(key: &str) -> Hover {
+    Hover {
+        contents: HoverContents::Array(vec![
+            MarkedString::from_language_code("comline".to_string(), format!("@{key}")),
+            MarkedString::from_markdown(
+                "Not a recognised annotation — still parses and freezes fine (`@key=value` is \
+                 an open namespace), but nothing this server knows about reads it."
+                    .to_string(),
+            ),
+        ]),
         range: None,
     }
 }
@@ -695,6 +766,87 @@ struct User {
         assert!(text.contains("3 fields"), "got: {text}");
         assert!(text.contains("optional: no"), "got: {text}");
         assert!(text.contains("variable"), "got: {text}"); // `string` is unbounded
+    }
+
+    #[test]
+    fn hover_on_timeout_ms_annotation_shows_its_description() {
+        let source = "protocol Thing {\n    @timeout_ms = 100\n    function foo();\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        // Hover over "timeout_ms" on line 1.
+        let position = Position::new(1, 7);
+
+        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let text = hover_text(hover);
+        assert!(text.contains("@timeout_ms"), "got: {text}");
+        assert!(text.contains("waits"), "got: {text}");
+        assert!(text.contains("milliseconds"), "got: {text}");
+        assert!(text.contains("comline-rust"), "got: {text}");
+    }
+
+    #[test]
+    fn hover_on_framing_annotation_shows_its_default() {
+        let source = "@framing = \"jsonrpc\"\nprotocol Thing {\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let position = Position::new(0, 3);
+
+        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let text = hover_text(hover);
+        assert!(text.contains("@framing"), "got: {text}");
+        assert!(text.contains("datagram"), "got: {text}");
+    }
+
+    #[test]
+    fn hover_on_validators_annotation_shows_its_description() {
+        let source = "struct X {\n    @validators = [Foo()]\n    name: str\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let position = Position::new(1, 7);
+
+        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let text = hover_text(hover);
+        assert!(text.contains("@validators"), "got: {text}");
+        assert!(text.contains("validator"), "got: {text}");
+    }
+
+    #[test]
+    fn hover_on_idempotent_annotation_says_not_consumed_yet() {
+        // `@idempotent` alone does not parse — the grammar requires
+        // `=value` unconditionally (see `annotations::KNOWN_ANNOTATIONS`'s
+        // own `idempotent` entry).
+        let source = "protocol P {\n    @idempotent = true\n    function f();\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let position = Position::new(1, 8);
+
+        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let text = hover_text(hover);
+        assert!(text.contains("@idempotent"), "got: {text}");
+        assert!(text.contains("not consumed anywhere yet"), "got: {text}");
+    }
+
+    #[test]
+    fn hover_on_an_unrecognised_annotation_still_shows_something() {
+        let source = "protocol P {\n    @custom_key = 1\n    function f();\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let position = Position::new(1, 8);
+
+        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let text = hover_text(hover);
+        assert!(text.contains("@custom_key"), "got: {text}");
+        assert!(text.contains("open namespace"), "got: {text}");
+    }
+
+    #[test]
+    fn hover_on_a_field_named_like_an_annotation_key_gets_field_hover_not_annotation_hover() {
+        // No `@` prefix — "timeout_ms" here is an ordinary field name, not
+        // the annotation. Disambiguated by `is_annotation_key`'s preceding-
+        // `@` check, not by the word's text.
+        let source = "struct X {\n    timeout_ms: u32\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let position = Position::new(1, 6);
+
+        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let text = hover_text(hover);
+        assert!(text.contains("timeout_ms: u32"), "got: {text}");
+        assert!(!text.contains("waits indefinitely"), "got: {text}");
     }
 
     #[test]

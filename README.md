@@ -208,6 +208,23 @@ This is a curated, known-good subset, not validation — `@key=value` stays
 an open namespace; an unrecognised key still parses, freezes, and is
 silently ignored by whatever doesn't act on it.
 
+Hover over any key — typed yourself or picked from completion — for the
+same information at a glance: what it does, its default when absent, the
+value it expects, and what actually reads it.
+
+```comline
+@timeout_ms
+
+How long the client waits for the response before timing out.
+Request/response calls only — a one-way call has nothing to wait for.
+
+default: no timeout — waits indefinitely
+
+value: an integer, in milliseconds
+
+consumed by: the generated Rust client (`comline-rust`)
+```
+
 ### Go to Definition
 
 Ctrl/Cmd + Click on any type reference to jump to its definition:
