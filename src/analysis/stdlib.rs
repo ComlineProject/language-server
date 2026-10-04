@@ -31,9 +31,11 @@ pub fn files(root: &Url) -> Vec<SourceFile> {
 /// shows one by asking the server for its text (`comline/stdSource`).
 pub const SCHEME: &str = "comline-std";
 
-/// The root every std file is under: `comline-std:///http.ids` is `std::http`.
+/// The root every std file is under: `comline-std:/http.ids` is `std::http`.
+/// No `//`: that's how editors (VS Code's `Uri`) print a URL with no
+/// authority, so the URLs they send back match these exactly.
 pub fn root() -> Url {
-    Url::parse(&format!("{SCHEME}:///")).expect("a valid URL")
+    Url::parse(&format!("{SCHEME}:/")).expect("a valid URL")
 }
 
 /// Whether `uri` names one of std's files.
@@ -41,9 +43,13 @@ pub fn is_std(uri: &Url) -> bool {
     uri.scheme() == SCHEME
 }
 
-/// The text of the std file at `uri`, for a client opening it.
+/// The text of the std file at `uri`, for a client opening it. Matched by
+/// path, so `comline-std:///http.ids` finds it too.
 pub fn source(uri: &Url) -> Option<String> {
-    files(&root()).into_iter().find(|file| file.uri == *uri).map(|file| file.text)
+    if !is_std(uri) {
+        return None;
+    }
+    files(&root()).into_iter().find(|file| file.uri.path() == uri.path()).map(|file| file.text)
 }
 
 /// How a hover or completion detail names what a file belongs to:
@@ -65,15 +71,16 @@ mod tests {
         let files = files(&root());
         let named: Vec<(String, Vec<String>)> =
             files.iter().map(|f| (f.uri().to_string(), f.namespace().unwrap().to_vec())).collect();
-        assert!(named.contains(&("comline-std:///http.ids".to_string(), vec!["std".to_string(), "http".to_string()])));
+        assert!(named.contains(&("comline-std:/http.ids".to_string(), vec!["std".to_string(), "http".to_string()])));
         assert!(files.iter().all(|f| f.dependency() == Some(NAME)));
     }
 
     #[test]
     fn a_std_file_is_served_by_its_url() {
-        let http = Url::parse("comline-std:///http.ids").unwrap();
+        let http = Url::parse("comline-std:/http.ids").unwrap();
         assert!(is_std(&http));
         assert!(source(&http).unwrap().contains("struct Request"));
+        assert_eq!(source(&Url::parse("comline-std:///http.ids").unwrap()), source(&http));
         assert_eq!(source(&Url::parse("comline-std:///nope.ids").unwrap()), None);
         assert!(!is_std(&Url::parse("file:///pkg/src/http.ids").unwrap()));
     }

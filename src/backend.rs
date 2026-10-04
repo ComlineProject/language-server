@@ -26,7 +26,7 @@ pub struct Backend {
 }
 
 impl Backend {
-    /// `comline/stdSource`: the text of a std file (`comline-std:///http.ids`),
+    /// `comline/stdSource`: the text of a std file (`comline-std:/http.ids`),
     /// for a client to show it - std's files are virtual, never on disk.
     /// `null` for a URL that isn't one of them. Params: `{ "uri": ... }`.
     pub async fn std_source(&self, params: TextDocumentIdentifier) -> Result<Option<String>> {
