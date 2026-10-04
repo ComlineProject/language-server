@@ -6,9 +6,9 @@
 //! crate with `default-features = false` and calls the same handlers the LSP
 //! does.
 //!
-//! The `server` feature (on by default) adds `document` (the doc store) and
-//! `backend` (the `tower-lsp` `LanguageServer` impl behind the `comline-lsp`
-//! binary).
+//! The `server` feature (on by default) adds `document` (the doc store),
+//! `workspace` (the index of every package schema on disk) and `backend`
+//! (the `tower-lsp` `LanguageServer` impl behind the `comline-lsp` binary).
 
 pub mod parser;
 pub mod util;
@@ -17,6 +17,7 @@ pub mod analysis {
     pub mod diagnostics;
     pub mod import_check;
     pub mod imports;
+    pub mod parse_cache;
     pub mod project;
     pub mod symbols;
 }
@@ -38,3 +39,5 @@ pub mod handlers {
 pub mod backend;
 #[cfg(feature = "server")]
 pub mod document;
+#[cfg(feature = "server")]
+pub mod workspace;

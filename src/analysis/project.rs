@@ -4,20 +4,21 @@
 //! exactly the places whose go-to-definition lands on the same declaration.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use comline_core::schema::idl::grammar::{Declaration, Document, Type};
 use lsp_types::{Location, Url};
 
 use crate::analysis::imports::{self, ProjectFile, ResolvedUse};
 use crate::analysis::symbols::{self, SymbolTable};
-use crate::parser;
+use crate::analysis::parse_cache;
 use crate::util::{byte_range_to_lsp_range, word_occurrences};
 
 /// One parsed project file.
 pub struct ProjectDoc<'a> {
     pub uri: &'a Url,
     pub source: &'a str,
-    pub document: Document,
+    pub document: Arc<Document>,
     pub symbols: SymbolTable,
     pub imports: Vec<ResolvedUse>,
     pub namespace: Vec<String>,
@@ -47,16 +48,17 @@ pub struct Reference {
 }
 
 impl<'a> Project<'a> {
-    /// Parse `files` (`(uri, source)` pairs); files that don't parse are
-    /// left out.
+    /// Parse `files` (`(uri, source)` pairs, through
+    /// [`parse_cache`](crate::analysis::parse_cache)); files that don't parse
+    /// are left out.
     pub fn new(files: impl IntoIterator<Item = (&'a Url, &'a str)>) -> Self {
         Self::from_parsed(files.into_iter().filter_map(|(uri, source)| {
-            parser::parse(source).ok()?.document.map(|document| (uri, source, document))
+            parse_cache::parse(uri, source).map(|document| (uri, source, document))
         }))
     }
 
     /// Like [`Project::new`], from files the caller already parsed.
-    pub fn from_parsed(files: impl IntoIterator<Item = (&'a Url, &'a str, Document)>) -> Self {
+    pub fn from_parsed(files: impl IntoIterator<Item = (&'a Url, &'a str, Arc<Document>)>) -> Self {
         let docs = files
             .into_iter()
             .map(|(uri, source, document)| {
@@ -89,8 +91,8 @@ impl<'a> Project<'a> {
     ///    `name` into scope from (`imports::resolve_symbol` - so through an
     ///    `as` alias, the target's real name comes back);
     /// 3. failing both, the first other file declaring `name` - a fallback,
-    ///    since only open files are visible, so a miss in step 2 is often
-    ///    just a sibling that isn't open, or a `use` mid-edit.
+    ///    since a miss in step 2 is often just a `use` being typed, or a
+    ///    sibling that doesn't parse mid-edit.
     pub fn resolve(&self, doc: usize, name: &str) -> Option<Target> {
         let here = &self.docs[doc];
 

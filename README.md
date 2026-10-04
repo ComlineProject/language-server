@@ -6,19 +6,19 @@ A Language Server Protocol (LSP) implementation for [Comline](https://github.com
 
 ### ✅ Fully Implemented
 
-- **Diagnostics** - Real-time syntax errors plus `comline-core`'s validation pass (undefined types, duplicate declarations, ...) — the same checks `comline build` runs
+- **Diagnostics** - Real-time syntax errors plus `comline-core`'s validation pass (undefined types, duplicate declarations, ...) — the same checks `comline build` runs. A type from another file of the package used without a `use` gets a specific error with an **"Add `use ...`" quick fix**
+- **Whole-package analysis** - every `.ids` file in a package's `src/` takes part, open or not, kept current through file watching; each package only sees its own files
 - **Document Symbols** - Hierarchical outline view of structs, enums, protocols, and constants
+- **Workspace Symbols** - Fuzzy search over every schema in the workspace
 - **Hover Information** - Rich tooltips showing full type definitions and signatures
-- **Go to Definition** - Jump from type references to their declarations
-- **Find References** - Locate all usages of a symbol (with include/exclude declaration option)
-- **Auto-Completion** - Context-aware code suggestions (keywords, primitives, user types, `@annotation` keys)
+- **Go to Definition / Find References / Rename** - Across files, following each file's `use` statements; rename updates `use` lines and leaves `as` aliases alone
+- **Auto-Completion** - Context-aware code suggestions (keywords, primitives, user and imported types, `@annotation` keys); types from other files that aren't imported yet add their `use` line
 - **Semantic Tokens** - Comline syntax highlighting from a shared lexer
 
 ### 🚧 Rougher / next
 
-- Rename Symbol, Code Formatting, Signature Help, Code Actions — present but thin
-- Cross-file `use` resolution (analysis is single-file today)
-- AST-accurate spans (declaration ranges use a text-search heuristic)
+- Code Formatting, Signature Help — present but thin
+- Dependency packages (`use dep::...` for a `config.idp` dependency) aren't resolved by the editor yet; their names get the benefit of the doubt
 
 ## Library
 
@@ -294,14 +294,16 @@ The server advertises the following capabilities:
 
 - **Text Document Sync** - Full document synchronization
 - **Hover Provider** - Type information on hover
-- **Completion Provider** - Trigger characters: `.`, `:`
-- **Definition Provider** - Go to definition support
-- **References Provider** - Find all references (planned)
+- **Completion Provider** - Trigger characters: `.`, `:`, `(`, `>`, space, `@`
+- **Definition Provider** - Go to definition, across files
+- **References Provider** - Find all references, across files
 - **Document Symbol Provider** - Outline view
-- **Workspace Symbol Provider** - Global symbol search (planned)
-- **Document Formatting** - Auto-formatting (planned)
-- **Rename Provider** - Symbol renaming (planned)
-- **Semantic Tokens** - Enhanced highlighting (planned)
+- **Workspace Symbol Provider** - Global symbol search
+- **Document Formatting** - Auto-formatting
+- **Rename Provider** - Symbol renaming across files, with prepare-rename
+- **Code Action Provider** - Quick fixes (add a missing `use`)
+- **Semantic Tokens** - Enhanced highlighting
+- **Workspace Folders** - Multi-root workspaces; `workspace/didChangeWatchedFiles` keeps the index current
 
 ### Dependencies
 
@@ -316,11 +318,10 @@ The server advertises the following capabilities:
 
 Contributions are welcome! Areas for improvement:
 
-1. **Find References** - Implement reference finding across files
-2. **Auto-Completion** - Add intelligent completion suggestions
-3. **Import Resolution** - Cross-file type resolution
-4. **Code Actions** - Quick fixes and refactorings
-5. **Formatting** - Implement Comline code formatter
+1. **Dependency packages** - Resolve `use` across `config.idp` dependencies
+2. **Signature Help** - Function argument hints
+3. **Formatting** - A fuller Comline code formatter
+4. **Code Actions** - More quick fixes and refactorings
 
 ## License
 

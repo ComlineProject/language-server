@@ -1,5 +1,5 @@
-//! Which type names a file's `use`s bring into scope, given the other open
-//! files - and which names it uses that are declared in another open file
+//! Which type names a file's `use`s bring into scope, given the package's
+//! other files - and which names it uses that are declared in another file
 //! but never imported (a missing `use`).
 //!
 //! In the editor, core validates one file at a time, without the project,
@@ -9,13 +9,14 @@
 //! as an unknown type. [`check`] does what core does with the whole project
 //! (`resolve_use_declaration`: expand a glob or whole-namespace `use` into
 //! every name the target declares, an item list into its items), with the
-//! open files standing in for the project, and hands the result back as
+//! files it's given standing in for the project, and hands the result back as
 //! extra `FrozenUnit::Import`s for core's own validator ([`ImportCheck::scope`]).
 //!
-//! Where the target of a glob or whole-namespace `use` isn't open, there is
-//! no way to know what it declares, so names that could come from it are
-//! given the benefit of the doubt - `comline build` sees every file and
-//! still catches a real mistake there; the editor shouldn't invent one.
+//! Where the target of a glob or whole-namespace `use` isn't among those
+//! files (a dependency package, `std::`, or a file the caller didn't pass),
+//! there is no way to know what it declares, so names that could come from
+//! it are given the benefit of the doubt - `comline build` sees everything
+//! and still catches a real mistake there; the editor shouldn't invent one.
 
 use std::collections::BTreeSet;
 
@@ -32,7 +33,7 @@ pub struct ImportCheck {
     /// Imports core's per-file lowering can't produce on its own, to append
     /// to the file's units before validation.
     pub scope: Vec<FrozenUnit>,
-    /// Each use of a bare type name that's declared in another open file
+    /// Each use of a bare type name that's declared in another project file
     /// but not brought into scope by any `use` here.
     pub missing: Vec<MissingImport>,
 }
@@ -42,7 +43,7 @@ pub struct MissingImport {
     pub name: String,
     /// Byte range of this occurrence.
     pub range: (usize, usize),
-    /// Every open file declaring `name` as a type, in project order.
+    /// Every project file declaring `name` as a type, in project order.
     pub candidates: Vec<Candidate>,
     /// The alias a `use` here already imports `name` under, if any - core
     /// binds only the alias (`use types::User as U` makes `U` usable, not
@@ -50,7 +51,7 @@ pub struct MissingImport {
     pub imported_as: Option<String>,
 }
 
-/// An open file a missing name could be imported from.
+/// A project file a missing name could be imported from.
 pub struct Candidate {
     pub namespace: Vec<String>,
     /// The file's name, for messages (`types.ids`).
@@ -64,15 +65,15 @@ impl Candidate {
     }
 }
 
-/// Where one `use` points, as far as the open files can tell.
+/// Where one `use` points, as far as the project's files can tell.
 pub(crate) enum Target {
-    /// An open file (index into `Project::docs`), with the rest of the path
+    /// A project file (index into `Project::docs`), with the rest of the path
     /// past its namespace (`["User"]` for `use types::User`, empty for
     /// `use types`, `use types::*` or `use types::{A, B}`).
-    Open(usize, Vec<String>),
-    /// No open file has the namespace (or any prefix of it) - closed,
-    /// `std::`, or another package.
-    NotOpen,
+    Found(usize, Vec<String>),
+    /// No project file has the namespace (or any prefix of it) - a
+    /// dependency package, `std::`, or a file the caller didn't pass.
+    Outside,
 }
 
 pub fn check(project: &Project, doc: usize) -> ImportCheck {
@@ -97,7 +98,7 @@ pub fn check(project: &Project, doc: usize) -> ImportCheck {
         let items = !glob && !resolved.symbols.is_empty();
 
         match target_of(project, Some(doc), use_decl) {
-            Target::Open(sibling, remaining) => {
+            Target::Found(sibling, remaining) => {
                 let sibling = &project.docs[sibling];
                 if glob || (!items && remaining.is_empty()) {
                     // Glob or whole namespace: everything the file declares.
@@ -115,7 +116,7 @@ pub fn check(project: &Project, doc: usize) -> ImportCheck {
                     covered.insert(single_symbol_name(use_decl, &remaining, &mut aliases));
                 }
             }
-            Target::NotOpen => {
+            Target::Outside => {
                 if items {
                     // Known without the file: the items are listed right here.
                     for item in &resolved.symbols {
@@ -175,8 +176,8 @@ pub fn check(project: &Project, doc: usize) -> ImportCheck {
     ImportCheck { scope, missing }
 }
 
-/// The open file a `use` points at: the longest prefix of its namespace
-/// that some open file other than `exclude` (the file the `use` is in) has.
+/// The project file a `use` points at: the longest prefix of its namespace
+/// that some project file other than `exclude` (the file the `use` is in) has.
 /// A deeper file always wins: `use chat::admin::X` means `chat/admin.ids`
 /// when it's open, not `chat.ids`. The same search as
 /// [`crate::analysis::imports::resolve_symbol`].
@@ -186,11 +187,11 @@ pub(crate) fn target_of(project: &Project, exclude: Option<usize>, use_decl: &Re
     for split_at in (1..=namespace.len()).rev() {
         let prefix = &namespace[..split_at];
         if let Some(i) = (0..project.docs.len()).find(|&i| Some(i) != exclude && project.docs[i].namespace == prefix) {
-            return Target::Open(i, namespace[split_at..].to_vec());
+            return Target::Found(i, namespace[split_at..].to_vec());
         }
     }
 
-    Target::NotOpen
+    Target::Outside
 }
 
 /// The name a single-symbol `use` binds, the way core's validator registers
@@ -309,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    fn a_glob_or_whole_namespace_use_of_a_file_that_isnt_open_gets_the_benefit_of_the_doubt() {
+    fn a_glob_or_whole_namespace_use_of_a_file_outside_the_project_gets_the_benefit_of_the_doubt() {
         for header in ["use other::*", "use other"] {
             let source = format!("{header}\n\nstruct S {{\n    m: Message\n}}\n");
             let files = project(&[("file:///pkg/src/chat.ids", &source), TYPES]);
@@ -318,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn a_glob_of_an_open_file_that_doesnt_declare_the_name_does_not_count() {
+    fn a_glob_of_a_project_file_that_doesnt_declare_the_name_does_not_count() {
         let files = project(&[
             ("file:///pkg/src/chat.ids", "use other::*\n\nstruct S {\n    m: Message\n}\n"),
             ("file:///pkg/src/other.ids", "struct Unrelated {\n    x: bool\n}\n"),

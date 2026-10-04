@@ -17,8 +17,8 @@ pub fn get_code_actions(source: &str, uri: &Url, params: &CodeActionParams) -> V
 }
 
 /// Get code actions for a given range, with `other_files` (every other
-/// open file, as `(uri, source)` pairs) as the project. Today: one "Add
-/// `use ...`" quick fix per open file that declares a type used in range
+/// file in the package, as `(uri, source)` pairs) as the project. Today: one
+/// "Add `use ...`" quick fix per file that declares a type used in range
 /// without being imported (the missing-import diagnostic's fix).
 pub fn get_code_actions_with_project(
     source: &str,
