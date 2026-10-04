@@ -57,10 +57,12 @@ pub fn namespace_of(uri: &Url) -> Vec<String> {
 }
 
 /// One resolved `use` (or legacy `import`) declaration: the namespace it
-/// points at, and its `as` alias if any.
+/// points at, its `as` alias if any, and the declaration's byte span in its
+/// own file (so rename can edit the symbol name written in the `use` line).
 pub struct ResolvedUse {
     pub resolved: ResolvedImport,
     pub alias: Option<String>,
+    pub span: (usize, usize),
 }
 
 /// Every `use`/`import` in `document`, resolved against
@@ -85,7 +87,7 @@ pub fn resolved_imports(document: &Document, current_namespace: &[String]) -> Ve
             Declaration::Use(use_stmt) => {
                 let resolved = resolver.resolve_namespace(&use_stmt.path, current_namespace).ok()?;
                 let alias = use_stmt.alias.as_ref().map(|a| a.name.text.clone());
-                Some(ResolvedUse { resolved, alias })
+                Some(ResolvedUse { resolved, alias, span: decl.span })
             }
             Declaration::Import(import) => {
                 // The legacy `import pkg::Type` form - same shape as an
@@ -102,6 +104,7 @@ pub fn resolved_imports(document: &Document, current_namespace: &[String]) -> Ve
                         alias: None,
                     },
                     alias: None,
+                    span: decl.span,
                 })
             }
             _ => None,
