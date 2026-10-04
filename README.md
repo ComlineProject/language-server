@@ -147,7 +147,9 @@ Navigate your schema using the document symbols panel:
 
 ### Hover Information
 
-Hover over any symbol to see its definition:
+Hover over a struct/enum/protocol/const name to see its definition, a
+per-field wire-size breakdown prefixed with each field's wire index, and
+the field/variant/function count:
 
 ```comline
 struct User {
@@ -156,7 +158,26 @@ struct User {
   optional email: string
 }
 
+wire size: variable
+
+- #0 name: variable
+- #1 age: 4 bytes
+- #2 email: variable
+
 3 fields
+```
+
+Hover over a field's own name for just that field: its type, wire index,
+size, `optional`, and any annotations or default value it carries.
+
+```comline
+optional email: string
+
+field #2 of `User` (3 fields)
+
+size: variable
+
+optional: yes
 ```
 
 ### Go to Definition

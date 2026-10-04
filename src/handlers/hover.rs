@@ -3,7 +3,7 @@
 use crate::analysis::symbols;
 use crate::parser;
 use crate::util::position_to_offset;
-use comline_core::schema::idl::grammar::{Declaration, Document, Type};
+use comline_core::schema::idl::grammar::{Declaration, Document, Expression, Field, Type};
 use comline_core::schema::idl::size::{self, SizeLookup, SizeTarget, WireSize};
 use lsp_types::{Hover, HoverContents, MarkedString, Position, Url};
 
@@ -70,7 +70,7 @@ pub fn get_hover_info_with_project(
     }
 
     // Check if it's a field reference
-    if let Some(field_info) = find_field_info(&document, &word, offset, source) {
+    if let Some(field_info) = find_field_info(&document, &word, offset, &lookup) {
         return Some(create_field_hover(&field_info));
     }
 
@@ -155,24 +155,37 @@ fn format_wire_size(size: WireSize) -> String {
     }
 }
 
-/// Per-field breakdown line for a struct's size block, one field per line:
-/// `- name: 8 bytes` / `- name: variable`.
+/// One-line rendering of a field's own size: `8 bytes` / `variable` /
+/// `unknown` — shared between the struct's per-field breakdown and a single
+/// field's own hover.
+fn render_size_oneline(size: WireSize) -> String {
+    match size {
+        WireSize::Fixed(bytes) => format!("{bytes} bytes"),
+        WireSize::Variable => "variable".to_string(),
+        WireSize::Unknown => "unknown".to_string(),
+    }
+}
+
+/// A field's declared size: `variable` the moment it's `optional` (absence
+/// is itself variable-length), otherwise whatever its type resolves to.
+fn field_size(f: &Field, lookup: &HoverSizeLookup) -> WireSize {
+    if f.optional() {
+        WireSize::Variable
+    } else {
+        size::size_of_type(f.field_type(), lookup)
+    }
+}
+
+/// Per-field breakdown line for a struct's size block, one field per line,
+/// prefixed with its wire index — the position `comline-rust`'s positional
+/// (array-form) MsgPack encoding actually keys on, and the number the
+/// append-only field discipline (see Versioning rules) protects.
+/// `- #0 name: 8 bytes` / `- #1 name: variable`.
 fn render_field_sizes(s: &comline_core::schema::idl::grammar::Struct, lookup: &HoverSizeLookup) -> String {
     s.fields()
         .iter()
-        .map(|f| {
-            let field_size = if f.optional() {
-                WireSize::Variable
-            } else {
-                size::size_of_type(f.field_type(), lookup)
-            };
-            let rendered = match field_size {
-                WireSize::Fixed(bytes) => format!("{bytes} bytes"),
-                WireSize::Variable => "variable".to_string(),
-                WireSize::Unknown => "unknown".to_string(),
-            };
-            format!("- {}: {}", f.name(), rendered)
-        })
+        .enumerate()
+        .map(|(index, f)| format!("- #{index} {}: {}", f.name(), render_size_oneline(field_size(f, lookup))))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -335,13 +348,50 @@ fn create_type_hover(type_name: &str, type_kind: &str) -> Hover {
     }
 }
 
-/// Create hover for a field
-fn create_field_hover(info: &str) -> Hover {
+/// Everything a field's own hover shows, resolved at the hovered offset.
+struct FieldHoverInfo {
+    container: String,
+    index: usize,
+    total: usize,
+    name: String,
+    type_text: String,
+    optional: bool,
+    default: Option<String>,
+    docstring: Option<String>,
+    annotations: Vec<String>,
+    size: WireSize,
+}
+
+/// Create hover for a field: signature, docstring (if any), then a detail
+/// block with its wire index, size, and any other attributes it carries.
+fn create_field_hover(info: &FieldHoverInfo) -> Hover {
+    let mut contents = vec![];
+
+    let opt = if info.optional { "optional " } else { "" };
+    let default = info
+        .default
+        .as_ref()
+        .map(|d| format!(" = {d}"))
+        .unwrap_or_default();
+    let signature = format!("{opt}{}: {}{default}", info.name, info.type_text);
+    contents.push(MarkedString::from_language_code("comline".to_string(), signature));
+
+    if let Some(doc) = &info.docstring {
+        contents.push(MarkedString::from_markdown(doc.clone()));
+    }
+
+    let mut detail = vec![
+        format!("field **#{}** of `{}` ({} field{})", info.index, info.container, info.total, if info.total == 1 { "" } else { "s" }),
+        format!("size: {}", render_size_oneline(info.size)),
+    ];
+    detail.push(format!("optional: {}", if info.optional { "yes" } else { "no" }));
+    if !info.annotations.is_empty() {
+        detail.push(format!("annotations: {}", info.annotations.join(", ")));
+    }
+    contents.push(MarkedString::from_markdown(detail.join("\n\n")));
+
     Hover {
-        contents: HoverContents::Scalar(MarkedString::from_language_code(
-            "comline".to_string(),
-            info.to_string(),
-        )),
+        contents: HoverContents::Array(contents),
         range: None,
     }
 }
@@ -425,10 +475,77 @@ fn find_type_at_position(document: &comline_core::schema::idl::grammar::Document
     }
 }
 
-/// Find field info at position
-fn find_field_info(_document: &comline_core::schema::idl::grammar::Document, _word: &str, _offset: usize, _source: &str) -> Option<String> {
-    // TODO: Implement field lookup
+/// Find the field at `offset`, if the hovered `word` names one. Matched by
+/// span, not name alone — a struct's own name-based symbol hover and the
+/// type-reference hover both run first, so this only ever sees a word that
+/// didn't resolve as a declaration or type name; disambiguating by span
+/// still matters because two different structs can each have a field with
+/// the same name. Field size can resolve a type declared in another
+/// project file, same as a struct's total size, so this takes the same
+/// `lookup` rather than searching only `document`.
+fn find_field_info(
+    document: &Document,
+    word: &str,
+    offset: usize,
+    lookup: &HoverSizeLookup,
+) -> Option<FieldHoverInfo> {
+    for decl in &document.0 {
+        let found = match &**decl {
+            Declaration::Struct(s) => field_info_in(s.name(), s.fields(), word, offset, lookup),
+            Declaration::Error(e) => field_info_in(e.name(), e.fields(), word, offset, lookup),
+            _ => None,
+        };
+        if found.is_some() {
+            return found;
+        }
+    }
     None
+}
+
+/// Shared by `Struct` and `Error` — both carry a flat `Vec<Spanned<Field>>`
+/// in the same shape.
+fn field_info_in(
+    container: String,
+    fields: &[rust_sitter::Spanned<Field>],
+    word: &str,
+    offset: usize,
+    lookup: &HoverSizeLookup,
+) -> Option<FieldHoverInfo> {
+    let total = fields.len();
+    fields.iter().enumerate().find_map(|(index, spanned)| {
+        let (start, end) = spanned.span;
+        if offset < start || offset >= end || spanned.name() != word {
+            return None;
+        }
+        Some(FieldHoverInfo {
+            container: container.clone(),
+            index,
+            total,
+            name: spanned.name(),
+            type_text: format_type(spanned.field_type()),
+            optional: spanned.optional(),
+            default: spanned.default_value().map(format_expression),
+            docstring: spanned.docstring(),
+            annotations: spanned
+                .annotations()
+                .iter()
+                .map(|a| format!("@{}={}", a.key(), a.value()))
+                .collect(),
+            size: field_size(spanned, lookup),
+        })
+    })
+}
+
+/// Render a field default / annotation-value expression back to source-like
+/// text — just enough for a hover line, not a general pretty-printer.
+fn format_expression(e: &Expression) -> String {
+    match e {
+        Expression::Integer(i) => i.value.to_string(),
+        Expression::String(s) => format!("\"{}\"", s.value),
+        Expression::FString(f) => f.source(),
+        Expression::Path(p) => p.text.clone(),
+        Expression::Identifier(i) => i.text.clone(),
+    }
 }
 
 // Helper functions to find declarations
@@ -547,6 +664,78 @@ struct User {
         let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
         let text = hover_text(hover);
         assert!(text.contains("variable"), "got: {text}");
+    }
+
+    #[test]
+    fn test_struct_hover_shows_field_indices() {
+        let source = "struct Greeting {\n    message: string\n    language: string\n    test: bool\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        // Hover over "Greeting" on line 0.
+        let position = Position::new(0, 8);
+
+        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let text = hover_text(hover);
+        assert!(text.contains("#0 message"), "got: {text}");
+        assert!(text.contains("#1 language"), "got: {text}");
+        assert!(text.contains("#2 test"), "got: {text}");
+    }
+
+    #[test]
+    fn test_hover_on_a_field_name_shows_its_own_info() {
+        let source = "struct Greeting {\n    message: string\n    language: string\n    test: bool\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        // Hover over "language" (the field name) on line 2.
+        let position = Position::new(2, 6);
+
+        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let text = hover_text(hover);
+        assert!(text.contains("language: string"), "got: {text}");
+        assert!(text.contains("#1"), "got: {text}");
+        assert!(text.contains("of `Greeting`"), "got: {text}");
+        assert!(text.contains("3 fields"), "got: {text}");
+        assert!(text.contains("optional: no"), "got: {text}");
+        assert!(text.contains("variable"), "got: {text}"); // `string` is unbounded
+    }
+
+    #[test]
+    fn test_hover_on_an_optional_field_shows_optional_and_default() {
+        let source = "struct Thing {\n    optional id: u64 = 0\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        // Hover over "id" (the field name) on line 1.
+        let position = Position::new(1, 14);
+
+        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let text = hover_text(hover);
+        assert!(text.contains("optional id: u64 = 0"), "got: {text}");
+        assert!(text.contains("optional: yes"), "got: {text}");
+        // Optional is always variable at the wire, regardless of `u64`'s
+        // own fixed size, since it needs a presence sentinel.
+        assert!(text.contains("size: variable"), "got: {text}");
+    }
+
+    #[test]
+    fn test_hover_on_a_field_shows_its_annotations() {
+        let source = "struct Message {\n    @timeout_ms=1000\n    body: str\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        // Hover over "body" (the field name) on line 2.
+        let position = Position::new(2, 6);
+
+        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let text = hover_text(hover);
+        assert!(text.contains("@timeout_ms=1000"), "got: {text}");
+    }
+
+    #[test]
+    fn test_hover_on_a_field_in_an_error_shows_its_own_info() {
+        let source = "error Rejected {\n    message = \"no\"\n    reason: str\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        // Hover over "reason" (the field name) on line 2.
+        let position = Position::new(2, 6);
+
+        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let text = hover_text(hover);
+        assert!(text.contains("reason: str"), "got: {text}");
+        assert!(text.contains("of `Rejected`"), "got: {text}");
     }
 
     #[test]
