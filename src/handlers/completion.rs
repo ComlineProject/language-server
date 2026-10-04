@@ -1,9 +1,10 @@
 // Completion handler - provides auto-completion suggestions
 
-use crate::analysis::annotations::{self, AnnotationScope};
 use crate::analysis::symbols;
 use crate::parser;
 use crate::util::position_to_offset;
+use comline_core::schema::idl::annotations::{self, AnnotationScope};
+use comline_core::schema::idl::vocabulary::{self, KeywordKind};
 use lsp_types::{CompletionItem, CompletionItemKind, Position, Url};
 
 /// Get completion suggestions at a position
@@ -211,12 +212,26 @@ fn tokenize_prefix(cleaned: &str, offset: usize) -> Vec<(Tok<'_>, usize)> {
     toks
 }
 
-/// Declaration-introducing keywords — completion offers nothing while the
-/// identifier right after one of these is being typed (see
-/// [`CompletionContext::DeclarationName`]).
-const DECL_KEYWORDS: &[&str] = &[
-    "struct", "enum", "protocol", "const", "type", "error", "settings", "validator", "function",
-];
+/// Whether `word` introduces a declaration — completion offers nothing
+/// while the identifier right after one of these is being typed (see
+/// [`CompletionContext::DeclarationName`]). Sourced from
+/// `vocabulary::KeywordKind::Declaration`, which also includes `use`/
+/// `import` — a deliberate widening over the old hand-maintained list:
+/// typing a partial `use` path used to fall through to the broad
+/// `Unknown` fallback (keywords + primitives + every known type, none of
+/// it relevant), and "nothing" is a strict improvement over that even
+/// though neither is the ideal (path/namespace completions, not built).
+fn is_declaration_keyword(word: &str) -> bool {
+    match vocabulary::keyword(word) {
+        // `function` is the one `Member`-kind keyword followed by a
+        // user-chosen name (unlike its siblings `validate`/`message`,
+        // which aren't) — included explicitly rather than widening
+        // `Member` wholesale, which would wrongly swallow completions
+        // after those two as well.
+        Some(k) => k.kind == KeywordKind::Declaration || word == "function",
+        None => false,
+    }
+}
 
 /// Determine completion context based on position — a backward scan over
 /// tokens, not a full grammar parse, so it degrades gracefully on exactly
@@ -242,7 +257,7 @@ fn determine_context(source: &str, offset: usize) -> CompletionContext {
     // Naming something new: the identifier right after a
     // declaration-introducing keyword.
     if let Some(&(Tok::Word(w), _)) = toks.last() {
-        if DECL_KEYWORDS.contains(&w) {
+        if is_declaration_keyword(w) {
             return CompletionContext::DeclarationName;
         }
     }
@@ -390,174 +405,58 @@ fn function_keyword_completion() -> CompletionItem {
     }
 }
 
-/// Get keyword completions (struct, enum, protocol, etc.)
-fn get_keyword_completions() -> Vec<CompletionItem> {
-    vec![
-        CompletionItem {
-            label: "struct".to_string(),
-            kind: Some(CompletionItemKind::KEYWORD),
-            detail: Some("Define a structure".to_string()),
-            insert_text: Some("struct $1 {\n\t$0\n}".to_string()),
-            insert_text_format: Some(lsp_types::InsertTextFormat::SNIPPET),
-            ..Default::default()
-        },
-        CompletionItem {
-            label: "enum".to_string(),
-            kind: Some(CompletionItemKind::KEYWORD),
-            detail: Some("Define an enumeration".to_string()),
-            insert_text: Some("enum $1 {\n\t$0\n}".to_string()),
-            insert_text_format: Some(lsp_types::InsertTextFormat::SNIPPET),
-            ..Default::default()
-        },
-        CompletionItem {
-            label: "protocol".to_string(),
-            kind: Some(CompletionItemKind::KEYWORD),
-            detail: Some("Define a protocol".to_string()),
-            insert_text: Some("protocol $1 {\n\t$0\n}".to_string()),
-            insert_text_format: Some(lsp_types::InsertTextFormat::SNIPPET),
-            ..Default::default()
-        },
-        CompletionItem {
-            label: "const".to_string(),
-            kind: Some(CompletionItemKind::KEYWORD),
-            detail: Some("Define a constant".to_string()),
-            insert_text: Some("const $1: $2 = $0".to_string()),
-            insert_text_format: Some(lsp_types::InsertTextFormat::SNIPPET),
-            ..Default::default()
-        },
-        CompletionItem {
-            label: "type".to_string(),
-            kind: Some(CompletionItemKind::KEYWORD),
-            detail: Some("Define a transparent type alias".to_string()),
-            insert_text: Some("type $1 = $0".to_string()),
-            insert_text_format: Some(lsp_types::InsertTextFormat::SNIPPET),
-            ..Default::default()
-        },
-        CompletionItem {
-            label: "error".to_string(),
-            kind: Some(CompletionItemKind::KEYWORD),
-            detail: Some("Define an error".to_string()),
-            insert_text: Some("error $1 {\n\tmessage = \"$2\"\n\t$0\n}".to_string()),
-            insert_text_format: Some(lsp_types::InsertTextFormat::SNIPPET),
-            ..Default::default()
-        },
-        CompletionItem {
-            label: "settings".to_string(),
-            kind: Some(CompletionItemKind::KEYWORD),
-            detail: Some("Define schema-wide settings".to_string()),
-            insert_text: Some("settings $1 {\n\t$0\n}".to_string()),
-            insert_text_format: Some(lsp_types::InsertTextFormat::SNIPPET),
-            ..Default::default()
-        },
-        CompletionItem {
-            label: "validator".to_string(),
-            kind: Some(CompletionItemKind::KEYWORD),
-            detail: Some("Define a named, parameterised field check".to_string()),
-            insert_text: Some("validator $1 {\n\t$0\n}".to_string()),
-            insert_text_format: Some(lsp_types::InsertTextFormat::SNIPPET),
-            ..Default::default()
-        },
-        CompletionItem {
-            label: "use".to_string(),
-            kind: Some(CompletionItemKind::KEYWORD),
-            detail: Some("Import statement".to_string()),
-            ..Default::default()
-        },
-        CompletionItem {
-            label: "import".to_string(),
-            kind: Some(CompletionItemKind::KEYWORD),
-            detail: Some("Legacy import statement".to_string()),
-            ..Default::default()
-        },
-    ]
+/// The snippet a declaration keyword inserts — completion-specific
+/// (editor insertion mechanics), so it lives here rather than in
+/// `vocabulary`, which only describes *meaning*. Mirrors
+/// `annotation_insert_text`'s split. `None` (just `use`/`import`) falls
+/// back to inserting the bare keyword.
+fn keyword_snippet(text: &str) -> Option<&'static str> {
+    match text {
+        "struct" => Some("struct $1 {\n\t$0\n}"),
+        "enum" => Some("enum $1 {\n\t$0\n}"),
+        "protocol" => Some("protocol $1 {\n\t$0\n}"),
+        "const" => Some("const $1: $2 = $0"),
+        "type" => Some("type $1 = $0"),
+        "error" => Some("error $1 {\n\tmessage = \"$2\"\n\t$0\n}"),
+        "settings" => Some("settings $1 {\n\t$0\n}"),
+        "validator" => Some("validator $1 {\n\t$0\n}"),
+        _ => None,
+    }
 }
 
-/// Get primitive type completions
+/// Keyword completions for a new top-level declaration — every
+/// `KeywordKind::Declaration` word, sourced from `vocabulary` so this list
+/// can't drift from the grammar (it already has once: `self`/`parent`/
+/// `crate`/etc. were invisible here before this existed).
+fn get_keyword_completions() -> Vec<CompletionItem> {
+    vocabulary::keywords_of_kind(KeywordKind::Declaration)
+        .map(|k| {
+            let snippet = keyword_snippet(k.text);
+            CompletionItem {
+                label: k.text.to_string(),
+                kind: Some(CompletionItemKind::KEYWORD),
+                detail: Some(k.description.to_string()),
+                insert_text: snippet.map(str::to_string),
+                insert_text_format: snippet.map(|_| lsp_types::InsertTextFormat::SNIPPET),
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
+/// Primitive type completions, sourced from `vocabulary::PRIMITIVES` —
+/// this used to hand-list `i8/i16/i32/i64`, which were never real Comline
+/// syntax (signed integers are `s`-prefixed).
 fn get_primitive_type_completions() -> Vec<CompletionItem> {
-    vec![
-        // Integer types
-        CompletionItem {
-            label: "i8".to_string(),
+    vocabulary::PRIMITIVES
+        .iter()
+        .map(|p| CompletionItem {
+            label: p.name.to_string(),
             kind: Some(CompletionItemKind::TYPE_PARAMETER),
-            detail: Some("8-bit signed integer".to_string()),
+            detail: Some(p.description.to_string()),
             ..Default::default()
-        },
-        CompletionItem {
-            label: "i16".to_string(),
-            kind: Some(CompletionItemKind::TYPE_PARAMETER),
-            detail: Some("16-bit signed integer".to_string()),
-            ..Default::default()
-        },
-        CompletionItem {
-            label: "i32".to_string(),
-            kind: Some(CompletionItemKind::TYPE_PARAMETER),
-            detail: Some("32-bit signed integer".to_string()),
-            ..Default::default()
-        },
-        CompletionItem {
-            label: "i64".to_string(),
-            kind: Some(CompletionItemKind::TYPE_PARAMETER),
-            detail: Some("64-bit signed integer".to_string()),
-            ..Default::default()
-        },
-        // Unsigned integers
-        CompletionItem {
-            label: "u8".to_string(),
-            kind: Some(CompletionItemKind::TYPE_PARAMETER),
-            detail: Some("8-bit unsigned integer".to_string()),
-            ..Default::default()
-        },
-        CompletionItem {
-            label: "u16".to_string(),
-            kind: Some(CompletionItemKind::TYPE_PARAMETER),
-            detail: Some("16-bit unsigned integer".to_string()),
-            ..Default::default()
-        },
-        CompletionItem {
-            label: "u32".to_string(),
-            kind: Some(CompletionItemKind::TYPE_PARAMETER),
-            detail: Some("32-bit unsigned integer".to_string()),
-            ..Default::default()
-        },
-        CompletionItem {
-            label: "u64".to_string(),
-            kind: Some(CompletionItemKind::TYPE_PARAMETER),
-            detail: Some("64-bit unsigned integer".to_string()),
-            ..Default::default()
-        },
-        // Floats
-        CompletionItem {
-            label: "f32".to_string(),
-            kind: Some(CompletionItemKind::TYPE_PARAMETER),
-            detail: Some("32-bit floating point".to_string()),
-            ..Default::default()
-        },
-        CompletionItem {
-            label: "f64".to_string(),
-            kind: Some(CompletionItemKind::TYPE_PARAMETER),
-            detail: Some("64-bit floating point".to_string()),
-            ..Default::default()
-        },
-        // Strings and bool
-        CompletionItem {
-            label: "string".to_string(),
-            kind: Some(CompletionItemKind::TYPE_PARAMETER),
-            detail: Some("String type".to_string()),
-            ..Default::default()
-        },
-        CompletionItem {
-            label: "str".to_string(),
-            kind: Some(CompletionItemKind::TYPE_PARAMETER),
-            detail: Some("String slice type".to_string()),
-            ..Default::default()
-        },
-        CompletionItem {
-            label: "bool".to_string(),
-            kind: Some(CompletionItemKind::TYPE_PARAMETER),
-            detail: Some("Boolean type".to_string()),
-            ..Default::default()
-        },
-    ]
+        })
+        .collect()
 }
 
 /// User-defined type completions from the symbol table — struct, enum, and
@@ -598,7 +497,8 @@ fn get_type_completions(symbol_table: Option<&symbols::SymbolTable>) -> Vec<Comp
 
 /// The snippet a known annotation key inserts — completion-specific
 /// (editor insertion mechanics), so it lives here rather than in the
-/// shared `analysis::annotations` table, which only describes *meaning*.
+/// shared `comline_core::schema::idl::annotations` table, which only
+/// describes *meaning*.
 /// `None` falls back to inserting just the bare key name — correct as-is
 /// for a bare-marker annotation like `idempotent` (no `=value`), not just
 /// a fallback for one this function hasn't gotten to yet.
@@ -675,9 +575,38 @@ mod tests {
     fn test_primitive_type_completions() {
         let completions = get_primitive_type_completions();
         assert!(completions.len() >= 10);
-        assert!(completions.iter().any(|c| c.label == "i32"));
+        assert!(completions.iter().any(|c| c.label == "s32"));
         assert!(completions.iter().any(|c| c.label == "string"));
         assert!(completions.iter().any(|c| c.label == "bool"));
+        // The actual regression check: `i8`/`i16`/`i32`/`i64` are not real
+        // Comline syntax and must never be offered.
+        for fake in ["i8", "i16", "i32", "i64"] {
+            assert!(!completions.iter().any(|c| c.label == fake), "offered {fake}");
+        }
+    }
+
+    #[test]
+    fn keyword_completions_include_use_and_import() {
+        // Both are `KeywordKind::Declaration` in `vocabulary` but were
+        // missing from the old hand-maintained list's equivalent check in
+        // some call paths — explicit regression guard.
+        let completions = get_keyword_completions();
+        assert!(completions.iter().any(|c| c.label == "use"));
+        assert!(completions.iter().any(|c| c.label == "import"));
+        // `function` is a real keyword but not a top-level declaration —
+        // it only belongs inside a protocol body.
+        assert!(!completions.iter().any(|c| c.label == "function"));
+    }
+
+    #[test]
+    fn typing_a_partial_use_path_offers_nothing_not_everything() {
+        // Previously fell through every specific check to `Unknown`,
+        // dumping keywords + primitives + every known type after `use `.
+        let source = "use pk";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let position = Position::new(0, 6);
+
+        assert!(get_completions(source, &uri, position).is_empty());
     }
 
     #[test]

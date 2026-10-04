@@ -14,11 +14,9 @@ pub mod parser;
 pub mod util;
 
 pub mod analysis {
-    pub mod annotations;
     pub mod diagnostics;
     pub mod imports;
     pub mod symbols;
-    pub mod types;
 }
 
 pub mod handlers {
