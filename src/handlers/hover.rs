@@ -1282,7 +1282,7 @@ protocol Chat {
         let active_uri = Url::parse("file:///pkg/src/active.ids").unwrap();
         // Hover over "Request" in the field-type position.
         let position = Position::new(3, 9);
-        let std = crate::analysis::stdlib::files(&crate::analysis::stdlib::virtual_root());
+        let std = crate::analysis::stdlib::files(&crate::analysis::stdlib::root());
 
         let hover = get_hover_info_with_project(active_source, &active_uri, position, &std).expect("std resolves");
         let text = hover_text(hover);

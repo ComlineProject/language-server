@@ -586,7 +586,7 @@ mod tests {
                 vec!["shared".to_string(), "models".to_string()],
             ),
         ];
-        files.extend(crate::analysis::stdlib::files(&crate::analysis::stdlib::virtual_root()));
+        files.extend(crate::analysis::stdlib::files(&crate::analysis::stdlib::root()));
         let project = Project::new(files.iter());
         let check = check(&project, 0);
         let unresolved = check

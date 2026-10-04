@@ -21,38 +21,6 @@ use crate::util::{byte_range_to_lsp_range, word_occurrences};
 /// The file every package's manifest is in.
 pub const MANIFEST: &str = "config.idp";
 
-/// The directory std's schemas are opened from (go-to-definition, hover
-/// links): a copy of core's embedded std, written once per std version under
-/// the system temp directory, read-only. The virtual root if that can't be
-/// written - std still resolves, it just can't be opened.
-pub fn std_root() -> Url {
-    let sources: String = comline_core::package::stdlib::schemas().map(|(_, source)| source).collect();
-    let version = comline_core::package::build::cas::storage::Hash::from_bytes(sources.as_bytes()).to_hex();
-    let dir = std::env::temp_dir().join(format!("comline-std-{}", &version[..16]));
-
-    let written = crate::analysis::stdlib::files(&crate::analysis::stdlib::virtual_root()).iter().all(|file| {
-        let path = dir.join(file.uri.path().trim_start_matches('/'));
-        if path.exists() {
-            return true;
-        }
-        let ok = path.parent().is_some_and(|parent| std::fs::create_dir_all(parent).is_ok())
-            && std::fs::write(&path, &file.text).is_ok();
-        if ok {
-            if let Ok(metadata) = std::fs::metadata(&path) {
-                let mut permissions = metadata.permissions();
-                permissions.set_readonly(true);
-                let _ = std::fs::set_permissions(&path, permissions);
-            }
-        }
-        ok
-    });
-
-    match written {
-        true => Url::from_directory_path(&dir).unwrap_or_else(|_| crate::analysis::stdlib::virtual_root()),
-        false => crate::analysis::stdlib::virtual_root(),
-    }
-}
-
 /// One declared dependency and what's on disk for it.
 #[derive(Debug, Clone)]
 pub struct IndexedDependency {

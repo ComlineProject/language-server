@@ -552,7 +552,7 @@ mod tests {
     fn std_completes_like_a_dependency() {
         let uri = Url::parse("file:///pkg/src/api/b.ids").unwrap();
         let mut files = package();
-        files.extend(crate::analysis::stdlib::files(&crate::analysis::stdlib::virtual_root()));
+        files.extend(crate::analysis::stdlib::files(&crate::analysis::stdlib::root()));
         let at = |source: &str| {
             let mut items = get_completions_with_project(source, &uri, offset_to_position(source, source.len()), &files);
             items.sort_by(|a, b| a.sort_text.as_ref().unwrap_or(&a.label).cmp(b.sort_text.as_ref().unwrap_or(&b.label)));

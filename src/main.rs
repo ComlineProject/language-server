@@ -14,7 +14,9 @@ async fn main() {
 
     tracing::info!("Starting Comline Language Server");
 
-    let (service, socket) = LspService::new(Backend::new);
+    let (service, socket) = LspService::build(Backend::new)
+        .custom_method("comline/stdSource", Backend::std_source)
+        .finish();
     Server::new(tokio::io::stdin(), tokio::io::stdout(), socket)
         .serve(service)
         .await;
