@@ -107,6 +107,11 @@ impl Backend {
                 let text = open_text(&url).unwrap_or(text);
                 files.push(SourceFile::of_dependency(url, text, &dependency.name, namespace));
             }
+            // Its manifest: what the package says about itself (`//!`).
+            if let Some((url, text)) = dependency.manifest {
+                let text = open_text(&url).unwrap_or(text);
+                files.push(SourceFile::of_dependency(url, text, &dependency.name, vec![dependency.name.clone()]));
+            }
         }
 
         files
@@ -346,6 +351,10 @@ impl LanguageServer for Backend {
         for change in params.changes {
             if let Some(src_root) = manifest_package_src(&change.uri) {
                 reindex.push(src_root);
+                // Every package depending on this one shows its `//!` docs.
+                if let Ok(path) = change.uri.to_file_path() {
+                    reindex.extend(self.workspace.packages_depending_on(&path));
+                }
                 changed = true;
                 continue;
             }

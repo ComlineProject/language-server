@@ -9,7 +9,7 @@ use crate::analysis::source::ProjectSource;
 use crate::analysis::stdlib;
 use crate::analysis::symbols;
 use crate::parser;
-use crate::util::position_to_offset;
+use crate::util::{in_comment_or_string, position_to_offset};
 use comline_core::schema::idl::annotations::{self, AnnotationScope};
 use comline_core::schema::idl::vocabulary::{self, KeywordKind};
 use lsp_types::{CompletionItem, CompletionItemKind, Position, SymbolKind, Url};
@@ -221,30 +221,6 @@ fn type_item(doc: &ProjectDoc, real: &str, label: String, detail: String) -> Com
         _ => CompletionItemKind::STRUCT,
     };
     CompletionItem { label, kind: Some(kind), detail: Some(detail), ..Default::default() }
-}
-
-/// Is `offset` inside a `//` line comment or a `"…"` string on its line?
-/// Comline has no block comments and strings don't span lines, so a scan of
-/// the current line's prefix is enough.
-fn in_comment_or_string(source: &str, offset: usize) -> bool {
-    let offset = offset.min(source.len());
-    let line_start = source[..offset].rfind('\n').map_or(0, |i| i + 1);
-    let bytes = source.as_bytes();
-    let mut in_str = false;
-    let mut i = line_start;
-    while i < offset {
-        match bytes[i] {
-            b'\\' if in_str => {
-                i += 2;
-                continue;
-            }
-            b'"' => in_str = !in_str,
-            b'/' if !in_str && bytes.get(i + 1) == Some(&b'/') => return true,
-            _ => {}
-        }
-        i += 1;
-    }
-    in_str
 }
 
 /// Blank out `//` line comments and the *contents* of `"…"` string
@@ -967,17 +943,6 @@ mod tests {
         // code before a trailing comment on the same line still completes
         let src = "struct M {\n    name:  // a field\n}\n";
         assert!(!get_completions(src, &uri, Position::new(1, 10)).is_empty());
-    }
-
-    #[test]
-    fn in_comment_or_string_scans_one_line() {
-        assert!(in_comment_or_string("/// doc", 5));
-        assert!(in_comment_or_string("a: u8 // c", 9));
-        assert!(in_comment_or_string("x = \"unclosed", 10));
-        assert!(!in_comment_or_string("x = \"done\" ", 11));
-        assert!(!in_comment_or_string("struct M {", 9));
-        // a `//` inside a string is not a comment
-        assert!(in_comment_or_string("x = \"a // b", 8)); // still in the string
     }
 
     #[test]

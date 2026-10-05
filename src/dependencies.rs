@@ -29,6 +29,8 @@ pub struct IndexedDependency {
     pub dir: Option<PathBuf>,
     /// Its schemas, from `dir/src`.
     pub files: Vec<(Url, String)>,
+    /// Its `config.idp`, whose `//!` header documents the package.
+    pub manifest: Option<(Url, String)>,
 }
 
 /// Every dependency `manifest` (the text of `package_dir/config.idp`)
@@ -41,7 +43,11 @@ pub fn index(package_dir: &Path, manifest: &str) -> Vec<IndexedDependency> {
             // and go-to-definition lands on a clean path.
             let dir = dependency.package_dir(package_dir).map(|dir| dir.canonicalize().unwrap_or(dir));
             let files = dir.as_ref().map(|dir| read_schemas(&dir.join(SCHEMAS_DIR))).unwrap_or_default();
-            IndexedDependency { name: dependency.name, dir, files }
+            let manifest = dir.as_ref().and_then(|dir| {
+                let path = dir.join(MANIFEST);
+                Some((Url::from_file_path(&path).ok()?, std::fs::read_to_string(&path).ok()?))
+            });
+            IndexedDependency { name: dependency.name, dir, files, manifest }
         })
         .collect();
     indexed.sort_by(|a, b| a.name.cmp(&b.name));
@@ -199,6 +205,11 @@ mod tests {
         let files: Vec<(&str, usize)> = indexed.iter().map(|d| (d.name.as_str(), d.files.len())).collect();
         assert_eq!(files, vec![("fetched", 1), ("gone", 0), ("hosted", 0), ("pending", 0), ("shared", 1)]);
         assert!(indexed[0].files[0].0.path().ends_with("/src/wire/frame.ids"));
+
+        // The manifests of the packages that are on disk.
+        let manifests: Vec<(&str, bool)> = indexed.iter().map(|d| (d.name.as_str(), d.manifest.is_some())).collect();
+        assert_eq!(manifests, vec![("fetched", true), ("gone", false), ("hosted", false), ("pending", false), ("shared", true)]);
+        assert!(indexed[4].manifest.as_ref().unwrap().1.contains("congregation shared"));
 
         let _ = std::fs::remove_dir_all(root);
     }

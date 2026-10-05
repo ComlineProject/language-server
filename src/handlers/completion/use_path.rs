@@ -5,19 +5,18 @@
 //!
 //! A path is resolved the way the build resolves it, relative prefixes
 //! through core's own `ImportResolver`, so what's offered is what
-//! `comline check` accepts.
+//! `comline check` accepts. Each module and declaration offered carries its
+//! docs (`//!` and `///`), read through `analysis::modules`, the same view
+//! hover uses.
 
-use std::collections::{BTreeMap, HashMap};
-
-use comline_core::schema::idl::grammar::{Declaration, ScopedIdentifier, UsePath};
 use comline_core::schema::idl::vocabulary::{self, KeywordKind};
-use comline_core::schema::ir::compiler::import_resolver::ImportResolver;
 use lsp_types::{
-    Command, CompletionItem, CompletionItemKind, CompletionTextEdit, InsertTextFormat, Range, TextEdit, Url,
+    Command, CompletionItem, CompletionItemKind, CompletionTextEdit, Documentation, InsertTextFormat, MarkupContent,
+    MarkupKind, Range, TextEdit, Url,
 };
 
-use crate::analysis::imports;
-use crate::analysis::project::{Project, ProjectDoc};
+use crate::analysis::modules::{self, ChildModule, DeclKind, Declared};
+use crate::analysis::project::Project;
 use crate::analysis::source::{DependencyKind, ProjectSource};
 use crate::analysis::stdlib;
 use crate::util::byte_range_to_lsp_range;
@@ -162,22 +161,29 @@ pub(super) fn completions<S: ProjectSource>(
         return path_starts(&project, prefix.legacy, range);
     }
 
-    let relative = is_relative_prefix(&prefix.segments[0]);
-    let Some(base) = resolve(&prefix.segments, prefix.legacy, uri) else {
+    let relative = modules::is_relative_prefix(&prefix.segments[0]);
+    let Some(base) = modules::resolve_path(&prefix.segments, prefix.legacy, uri) else {
         return vec![]; // `parent::` above the top
     };
     // A relative path stays inside the package.
-    let docs: Vec<&ProjectDoc> = project.docs.iter().filter(|d| !relative || d.dependency.is_none()).collect();
-    let schema = docs.iter().copied().find(|d| d.namespace == base);
+    let schema = project.docs.iter().find(|d| d.namespace == base && (!relative || d.dependency.is_none()));
+    let declared = || schema.map(modules::declarations).unwrap_or_default();
 
     if let Some(listed) = &prefix.listed {
-        let Some(schema) = schema else { return vec![] };
-        return declarations(schema, range).filter(|item| !listed.contains(&item.label)).collect();
+        if schema.is_none() {
+            return vec![];
+        }
+        return declared()
+            .iter()
+            .filter(|d| !listed.contains(&d.name))
+            .map(|d| declared_item(d, range))
+            .collect();
     }
 
-    let mut items = children(&docs, &project.unparsed, &base, range);
-    if let Some(schema) = schema {
-        items.extend(declarations(schema, range));
+    let mut items: Vec<CompletionItem> =
+        modules::children(&project, &base, relative).iter().map(|child| child_item(child, range)).collect();
+    if schema.is_some() {
+        items.extend(declared().iter().map(|d| declared_item(d, range)));
         // `use parent::*` and `use self::{A}` don't parse: a prefix alone
         // before `::*` or `::{` lexes as its keyword.
         let bare_prefix = relative && prefix.segments.len() == 1;
@@ -191,14 +197,9 @@ pub(super) fn completions<S: ProjectSource>(
 /// `use ` itself: the package's own top-level namespaces, then its declared
 /// dependencies, then `self` / `parent` / `package` and `std`.
 fn path_starts(project: &Project, legacy: bool, range: Range) -> Vec<CompletionItem> {
-    let is_dependency = |name: &str| project.dependencies.iter().any(|d| d.name == name);
-    let local: Vec<&ProjectDoc> = project.docs.iter().filter(|d| d.dependency.is_none()).collect();
-    let unparsed: Vec<Vec<String>> =
-        project.unparsed.iter().filter(|ns| !ns.first().is_some_and(|first| is_dependency(first))).cloned().collect();
-
-    let mut items: Vec<CompletionItem> = children(&local, &unparsed, &[], range)
-        .into_iter()
-        .map(|item| sorted(item, '0'))
+    let mut items: Vec<CompletionItem> = modules::children(project, &[], true)
+        .iter()
+        .map(|child| sorted(child_item(child, range), '0'))
         .collect();
 
     for dependency in &project.dependencies {
@@ -213,7 +214,9 @@ fn path_starts(project: &Project, legacy: bool, range: Range) -> Vec<CompletionI
             (DependencyKind::Git, false) => "dependency, git — not fetched yet".to_string(),
             (DependencyKind::Registry, _) => "dependency, registry — not supported yet".to_string(),
         };
-        items.push(sorted(segment_item(&dependency.name, detail, CompletionItemKind::MODULE, true, range), '1'));
+        let mut item = segment_item(&dependency.name, detail, CompletionItemKind::MODULE, true, range);
+        item.documentation = project.package_docs.get(&dependency.name).map(|docs| markdown(docs));
+        items.push(sorted(item, '1'));
     }
 
     if !legacy {
@@ -221,73 +224,48 @@ fn path_starts(project: &Project, legacy: bool, range: Range) -> Vec<CompletionI
             let item = segment_item(prefix.text, prefix.description.to_string(), CompletionItemKind::KEYWORD, true, range);
             items.push(sorted(item, '2'));
         }
-        let std = segment_item(stdlib::NAME, "the standard library".to_string(), CompletionItemKind::MODULE, true, range);
+        let mut std = segment_item(stdlib::NAME, "the standard library".to_string(), CompletionItemKind::MODULE, true, range);
+        std.documentation = project.package_docs.get(stdlib::NAME).map(|docs| markdown(docs));
         items.push(sorted(std, '3'));
     }
     items
 }
 
-/// The next segment under `base`: every namespace one level below it, from
-/// `docs` and the schemas that don't parse right now.
-fn children(docs: &[&ProjectDoc], unparsed: &[Vec<String>], base: &[String], range: Range) -> Vec<CompletionItem> {
-    #[derive(Default)]
-    struct Child<'a> {
-        /// A schema is right there, not only deeper ones.
-        schema: bool,
-        dependency: Option<&'a str>,
+/// A module one level down, with its docs. A path can end at a schema; a
+/// directory always goes on.
+fn child_item(child: &ChildModule, range: Range) -> CompletionItem {
+    let name = &child.name;
+    let mut detail = match child.schema {
+        true => format!("`{name}.ids`"),
+        false => format!("`{name}/`"),
+    };
+    if let Some(dependency) = &child.dependency {
+        detail.push_str(&format!(" ({})", stdlib::owner(dependency)));
     }
-
-    let mut found: BTreeMap<&str, Child> = BTreeMap::new();
-    for doc in docs {
-        if let Some(name) = child_of(&doc.namespace, base) {
-            let child = found.entry(name).or_default();
-            child.schema |= doc.namespace.len() == base.len() + 1;
-            child.dependency = child.dependency.or(doc.dependency);
-        }
-    }
-    for namespace in unparsed {
-        if let Some(name) = child_of(namespace, base) {
-            found.entry(name).or_default().schema |= namespace.len() == base.len() + 1;
-        }
-    }
-
-    found
-        .into_iter()
-        .map(|(name, child)| {
-            let mut detail = match child.schema {
-                true => format!("`{name}.ids`"),
-                false => format!("`{name}/`"),
-            };
-            if let Some(dependency) = child.dependency {
-                detail.push_str(&format!(" ({})", stdlib::owner(dependency)));
-            }
-            // A path can end at a schema; a directory always goes on.
-            segment_item(name, detail, CompletionItemKind::MODULE, !child.schema, range)
-        })
-        .collect()
+    let mut item = segment_item(name, detail, CompletionItemKind::MODULE, !child.schema, range);
+    item.documentation = child.docs.as_deref().map(markdown);
+    item
 }
 
-fn child_of<'n>(namespace: &'n [String], base: &[String]) -> Option<&'n str> {
-    (namespace.len() > base.len() && namespace.starts_with(base)).then(|| namespace[base.len()].as_str())
+/// A declaration a `use` can import, with its docstring.
+fn declared_item(declared: &Declared, range: Range) -> CompletionItem {
+    let kind = match declared.kind {
+        DeclKind::Struct => CompletionItemKind::STRUCT,
+        DeclKind::Enum => CompletionItemKind::ENUM,
+        DeclKind::Protocol => CompletionItemKind::INTERFACE,
+        DeclKind::Const => CompletionItemKind::CONSTANT,
+        DeclKind::Type => CompletionItemKind::CLASS,
+        DeclKind::Error => CompletionItemKind::EVENT,
+        DeclKind::Validator => CompletionItemKind::FUNCTION,
+        DeclKind::Settings => CompletionItemKind::PROPERTY,
+    };
+    let mut item = segment_item(&declared.name, declared.kind.keyword().to_string(), kind, false, range);
+    item.documentation = declared.docs.as_deref().map(markdown);
+    item
 }
 
-/// What `doc` declares that a `use` can import - the same set core's
-/// `check_imports` accepts.
-fn declarations<'d>(doc: &'d ProjectDoc, range: Range) -> impl Iterator<Item = CompletionItem> + 'd {
-    doc.document.0.iter().filter_map(move |decl| {
-        let (name, kind, keyword) = match &decl.value {
-            Declaration::Struct(s) => (&s.name.text, CompletionItemKind::STRUCT, "struct"),
-            Declaration::Enum(e) => (&e.name.text, CompletionItemKind::ENUM, "enum"),
-            Declaration::Protocol(p) => (&p.name.text, CompletionItemKind::INTERFACE, "protocol"),
-            Declaration::Const(c) => (&c.name.text, CompletionItemKind::CONSTANT, "const"),
-            Declaration::TypeAlias(t) => (&t.name.text, CompletionItemKind::CLASS, "type alias"),
-            Declaration::Error(e) => (&e.name.text, CompletionItemKind::EVENT, "error"),
-            Declaration::Validator(v) => (&v.name.text, CompletionItemKind::FUNCTION, "validator"),
-            Declaration::Settings(s) => (&s.name.text, CompletionItemKind::PROPERTY, "settings"),
-            Declaration::Use(_) | Declaration::Import(_) => return None,
-        };
-        Some(segment_item(name, keyword.to_string(), kind, false, range))
-    })
+fn markdown(docs: &str) -> Documentation {
+    Documentation::MarkupContent(MarkupContent { kind: MarkupKind::Markdown, value: docs.to_string() })
 }
 
 /// `*` and `{…}` after a schema's path.
@@ -314,23 +292,6 @@ fn glob_and_list(base: &[String], range: Range) -> [CompletionItem; 2] {
             ..Default::default()
         },
     ]
-}
-
-/// The namespace `segments` name, from the file at `uri`, the way the build
-/// resolves a `use` path: `parent::common` is the sibling `common`.
-fn resolve(segments: &[String], legacy: bool, uri: &Url) -> Option<Vec<String>> {
-    if legacy {
-        return Some(segments.to_vec()); // `import` predates relative prefixes
-    }
-    let path = UsePath::Absolute(ScopedIdentifier { text: format!("{}::_", segments.join("::")) });
-    let resolver = ImportResolver::new(vec![], HashMap::new(), None);
-    let mut namespace = resolver.resolve_namespace(&path, &imports::namespace_of(uri)).ok()?.absolute_namespace;
-    namespace.pop();
-    Some(namespace)
-}
-
-fn is_relative_prefix(segment: &str) -> bool {
-    vocabulary::keyword(segment).is_some_and(|k| k.kind == KeywordKind::PathPrefix)
 }
 
 /// A path segment or a declaration's name. `continues`: the path must go on,
@@ -566,6 +527,89 @@ mod tests {
         );
         let http: Vec<String> = at("use std::http::").into_iter().map(|(label, _)| label).collect();
         assert_eq!(http, ["HttpMethod", "Request", "Response", "*", "{…}"]);
+    }
+
+    /// A package whose modules, a dependency and its package, and std all
+    /// document themselves.
+    fn documented_package() -> Vec<SourceFile> {
+        let file = |path: &str| Url::parse(&format!("file:///pkg/{path}")).unwrap();
+        let mut files = vec![
+            SourceFile::local(file("config.idp"), MANIFEST.to_string()),
+            SourceFile::local(
+                file("src/types.ids"),
+                "//! The package's types.\n\n/// Someone.\nstruct User {\n    id: u64\n}\n".to_string(),
+            ),
+            SourceFile::local(
+                file("src/api/common.ids"),
+                "//! Things every API schema needs.\n\nstruct Error {\n    code: u32\n}\n".to_string(),
+            ),
+            SourceFile::of_dependency(
+                Url::parse("file:///shared/config.idp").unwrap(),
+                "//! A shared package.\ncongregation shared\nspecification_version = 1\n".to_string(),
+                "shared",
+                vec!["shared".to_string()],
+            ),
+            SourceFile::of_dependency(
+                Url::parse("file:///shared/src/models.ids").unwrap(),
+                "//! Shared models.\n\n/// A thing.\nstruct Thing {\n    id: u64\n}\n".to_string(),
+                "shared",
+                vec!["shared".to_string(), "models".to_string()],
+            ),
+        ];
+        files.extend(crate::analysis::stdlib::files(&crate::analysis::stdlib::root()));
+        files
+    }
+
+    /// `(label, documentation)` of the completions at the end of `source`.
+    fn documented(source: &str) -> Vec<(String, Option<String>)> {
+        let uri = Url::parse("file:///pkg/src/api/b.ids").unwrap();
+        let at = offset_to_position(source, source.len());
+        get_completions_with_project(source, &uri, at, &documented_package())
+            .into_iter()
+            .map(|c| {
+                let docs = c.documentation.map(|d| match d {
+                    Documentation::MarkupContent(m) => m.value,
+                    Documentation::String(s) => s,
+                });
+                (c.label, docs)
+            })
+            .collect()
+    }
+
+    fn docs_for(items: &[(String, Option<String>)], label: &str) -> Option<String> {
+        items.iter().find(|(l, _)| l == label).unwrap_or_else(|| panic!("no {label} in {items:?}")).1.clone()
+    }
+
+    #[test]
+    fn a_path_start_carries_each_modules_and_packages_docs() {
+        let items = documented("use ");
+        assert_eq!(docs_for(&items, "types").as_deref(), Some("The package's types."));
+        assert_eq!(docs_for(&items, "api"), None, "a directory with no schema of its own");
+        assert_eq!(docs_for(&items, "shared").as_deref(), Some("A shared package."), "the dependency's config.idp");
+        let std = docs_for(&items, "std").unwrap();
+        assert!(std.starts_with("The Comline standard library."), "{std}");
+    }
+
+    #[test]
+    fn a_namespace_carries_the_docs_of_each_module_below_it() {
+        let items = documented("use std::");
+        assert_eq!(
+            docs_for(&items, "http").as_deref(),
+            Some("Types for talking HTTP: request methods, requests and responses.\n\nPlain data types: use them as fields and arguments in your own schemas.")
+        );
+        assert!(docs_for(&items, "validators").unwrap().starts_with("Validators to attach to fields"));
+        assert_eq!(docs_for(&documented("use api::"), "common").as_deref(), Some("Things every API schema needs."));
+        assert_eq!(docs_for(&documented("use shared::"), "models").as_deref(), Some("Shared models."));
+    }
+
+    #[test]
+    fn declarations_carry_their_docstrings() {
+        let validators = documented("use std::validators::");
+        let bounds = docs_for(&validators, "StringBounds").unwrap();
+        assert!(bounds.starts_with("Checks a string's length is within a minimum and a maximum."), "{bounds}");
+        assert_eq!(docs_for(&documented("use shared::models::"), "Thing").as_deref(), Some("A thing."));
+        assert_eq!(docs_for(&documented("use types::{"), "User").as_deref(), Some("Someone."), "in a brace list");
+        assert_eq!(docs_for(&documented("use std::http::"), "*"), None, "glob and list have none");
     }
 
     #[test]

@@ -40,6 +40,17 @@ fn basic_format(source: &str) -> String {
             continue;
         }
         
+        // A full-line comment is text: a `{` or `}` in one (a code example in a
+        // `///` or `//!` doc) doesn't change the nesting.
+        if trimmed.starts_with("//") {
+            for _ in 0..indent_level {
+                result.push_str(INDENT);
+            }
+            result.push_str(trimmed);
+            result.push('\n');
+            continue;
+        }
+
         // Decrease indent before closing brace
         if trimmed.starts_with('}') {
             indent_level = indent_level.saturating_sub(1);
@@ -67,6 +78,23 @@ fn basic_format(source: &str) -> String {
 mod tests {
     use super::*;
     
+    #[test]
+    fn braces_in_full_line_comments_do_not_change_the_indentation() {
+        // A doc example with a `{` at the end of a line used to indent
+        // everything after it, since its `}` never closed anything.
+        let source = "//! Example:\n//!\n//!     struct A {\n//!         id: u64\n//!     }\n\n/// See `{`\nstruct B {\nid: u64\n}\n";
+        assert_eq!(
+            basic_format(source),
+            "//! Example:\n//!\n//!     struct A {\n//!         id: u64\n//!     }\n\n/// See `{`\nstruct B {\n    id: u64\n}\n"
+        );
+
+        // Inside a block a comment is indented with it, and still doesn't nest.
+        assert_eq!(
+            basic_format("struct B {\n// note {\nid: u64\n}\n"),
+            "struct B {\n    // note {\n    id: u64\n}\n"
+        );
+    }
+
     #[test]
     fn test_format_struct() {
         let source = "struct User {\nname: string\nage: i32\n}";

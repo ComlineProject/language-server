@@ -120,6 +120,67 @@ fn levenshtein(a: &str, b: &str) -> usize {
     previous[b.len()]
 }
 
+/// Is `offset` inside a `//` line comment or a `"…"` string on its line?
+/// Comline has no block comments and strings don't span lines, so a scan of
+/// the current line's prefix is enough.
+pub fn in_comment_or_string(source: &str, offset: usize) -> bool {
+    let offset = offset.min(source.len());
+    let line_start = source[..offset].rfind('\n').map_or(0, |i| i + 1);
+    let bytes = source.as_bytes();
+    let mut in_str = false;
+    let mut i = line_start;
+    while i < offset {
+        match bytes[i] {
+            b'\\' if in_str => {
+                i += 2;
+                continue;
+            }
+            b'"' => in_str = !in_str,
+            b'/' if !in_str && bytes.get(i + 1) == Some(&b'/') => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    in_str
+}
+
+/// A `::`-separated path with the cursor on one of its segments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathAt {
+    /// The path's segments up to and including the one under the cursor.
+    pub segments: Vec<String>,
+    /// The byte range of the segment under the cursor.
+    pub range: (usize, usize),
+    /// Whether `::` follows that segment directly: it names a namespace, not
+    /// (only) a declaration.
+    pub continues: bool,
+}
+
+/// The path (`std::validators::StringBounds`) the identifier under `offset`
+/// is part of, with the cursor's segment. Segments are joined only by a
+/// directly adjacent `::`; `None` off an identifier.
+pub fn path_at(text: &str, offset: usize) -> Option<PathAt> {
+    let (start, end) = word_range_at(text, offset)?;
+    if !text[start..].starts_with(|c: char| c.is_alphabetic() || c == '_') {
+        return None;
+    }
+
+    let mut segments = vec![text[start..end].to_string()];
+    let mut at = start;
+    while text[..at].ends_with("::") {
+        let before = &text[..at - 2];
+        let segment_start = before.rfind(|c: char| !is_ident_char(c)).map_or(0, |i| i + 1);
+        let segment = &before[segment_start..];
+        if segment.is_empty() || !segment.starts_with(|c: char| c.is_alphabetic() || c == '_') {
+            break;
+        }
+        segments.insert(0, segment.to_string());
+        at = segment_start;
+    }
+
+    Some(PathAt { segments, range: (start, end), continues: text[end..].starts_with("::") })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,5 +224,43 @@ mod tests {
         assert_eq!(closest("Thign", ["Thing", "Other"]), Some("Thing".to_string()));
         assert_eq!(closest("zzzz", ["types", "chat"]), None);
         assert_eq!(closest("types", ["types"]), None, "an exact match isn't a suggestion");
+    }
+
+    #[test]
+    fn in_comment_or_string_scans_one_line() {
+        assert!(in_comment_or_string("/// doc", 5));
+        assert!(in_comment_or_string("a: u8 // c", 9));
+        assert!(in_comment_or_string("x = \"unclosed", 10));
+        assert!(!in_comment_or_string("x = \"done\" ", 11));
+        assert!(!in_comment_or_string("struct M {", 9));
+        // a `//` inside a string is not a comment
+        assert!(in_comment_or_string("x = \"a // b", 8)); // still in the string
+    }
+
+    #[test]
+    fn path_at_reads_the_whole_path_up_to_the_cursor() {
+        let text = "use std::validators::StringBounds\n";
+        let at = |needle: &str| path_at(text, text.find(needle).unwrap() + 1).unwrap();
+
+        let std = at("std");
+        assert_eq!((std.segments.as_slice(), std.continues), (&["std".to_string()][..], true));
+        let validators = at("validators");
+        assert_eq!(validators.segments, ["std", "validators"]);
+        assert!(validators.continues);
+        assert_eq!(&text[validators.range.0..validators.range.1], "validators");
+        let last = at("StringBounds");
+        assert_eq!(last.segments, ["std", "validators", "StringBounds"]);
+        assert!(!last.continues, "nothing follows the last segment");
+    }
+
+    #[test]
+    fn path_at_stops_at_anything_but_an_adjacent_separator() {
+        let text = "use a::{B, C}\nx: parent::common::*\nuse t as T\n";
+        let seg = |needle: &str| path_at(text, text.find(needle).unwrap()).unwrap().segments;
+        assert_eq!(seg("B,"), ["B"], "inside a brace list there's no path before it");
+        assert_eq!(seg("common"), ["parent", "common"]);
+        assert_eq!(path_at("a ::b", 4).unwrap().segments, ["b"], "a space breaks the path");
+        assert_eq!(path_at("9lives::x", 1), None, "not an identifier");
+        assert_eq!(path_at("a::b", 4), None, "past the end");
     }
 }

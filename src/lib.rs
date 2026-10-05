@@ -17,6 +17,7 @@ pub mod analysis {
     pub mod diagnostics;
     pub mod import_check;
     pub mod imports;
+    pub mod modules;
     pub mod parse_cache;
     pub mod project;
     pub mod source;

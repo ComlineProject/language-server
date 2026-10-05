@@ -1,13 +1,16 @@
 // Hover handler - provides type information on hover
 
 use crate::analysis::imports::{self, ProjectFile};
+use crate::analysis::modules::{self, Module};
+use crate::analysis::project::Project;
 use crate::analysis::source::{self, ProjectSource};
 use crate::analysis::stdlib;
 use crate::analysis::symbols;
 use crate::parser;
-use crate::util::position_to_offset;
+use crate::util::{byte_range_to_lsp_range, in_comment_or_string, path_at, position_to_offset};
 use comline_core::schema::idl::annotations;
 use comline_core::schema::idl::grammar::{Declaration, Document, Expression, Field, Type};
+use comline_core::schema::idl::module_docs::summary;
 use comline_core::schema::idl::size::{self, SizeLookup, SizeTarget, WireSize};
 use comline_core::schema::idl::vocabulary;
 use lsp_types::{Hover, HoverContents, MarkedString, Position, Url};
@@ -37,6 +40,13 @@ pub fn get_hover_info_with_project<S: ProjectSource>(
 ) -> Option<Hover> {
     // Convert position to byte offset
     let offset = position_to_offset(source, position)?;
+
+    // A segment of a `::` path (`std`, `validators` in `use std::validators::X`):
+    // the module it names. Only needs the text, so it works while the rest of
+    // the file doesn't parse.
+    if let Some(hover) = module_hover(source, uri, offset, other_files) {
+        return Some(hover);
+    }
 
     // Parse the document
     let parse_result = parser::parse(source).ok()?;
@@ -291,6 +301,112 @@ fn render_field_sizes(s: &comline_core::schema::idl::grammar::Struct, lookup: &H
         .map(|(index, f)| format!("- #{index} {}: {}", f.name(), render_size_oneline(field_size(f, lookup))))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// How many entries of a module's contents a hover lists before "and N more".
+const LISTED: usize = 20;
+
+/// Hover on a segment of a `::` path - `std` and `validators` in
+/// `use std::validators::StringBounds`, or in a qualified type name: the
+/// module that segment names, with its docs (`//!`), the modules below it and
+/// the types it declares. Relative prefixes (`parent`, `self`) show the
+/// module they stand for.
+///
+/// `None` when the cursor isn't on such a segment, when it's in a comment or
+/// string, and for a last segment that names a declaration (`StringBounds`):
+/// that's the declaration's hover.
+fn module_hover<S: ProjectSource>(source: &str, uri: &Url, offset: usize, other_files: &[S]) -> Option<Hover> {
+    if in_comment_or_string(source, offset) {
+        return None;
+    }
+    let at = path_at(source, offset)?;
+    let keyword = statement_keyword(source, offset);
+    // A lone word is a path only in a `use` line (`use types`).
+    if !(at.continues || at.segments.len() > 1 || keyword.is_some()) || is_alias(source, at.range.0) {
+        return None;
+    }
+
+    let namespace = modules::resolve_path(&at.segments, keyword == Some("import"), uri)?;
+    let project = Project::with_active(uri, source, other_files);
+
+    if !at.continues {
+        let (last, parent) = namespace.split_last()?;
+        let declared = modules::module(&project, parent)
+            .is_some_and(|parent| parent.declarations.iter().any(|d| d.name == *last));
+        if declared {
+            return None;
+        }
+    }
+
+    let module = modules::module(&project, &namespace)?;
+    Some(Hover {
+        contents: HoverContents::Array(module_contents(&module)),
+        range: Some(byte_range_to_lsp_range(source, at.range.0, at.range.1)),
+    })
+}
+
+/// `use` or `import` when the line `offset` is on starts with it.
+fn statement_keyword(source: &str, offset: usize) -> Option<&'static str> {
+    let line_start = source[..offset.min(source.len())].rfind('\n').map_or(0, |i| i + 1);
+    let line = source[line_start..].trim_start();
+    ["use", "import"]
+        .into_iter()
+        .find(|keyword| line.strip_prefix(keyword).is_some_and(|rest| rest.starts_with(char::is_whitespace)))
+}
+
+/// Whether the word starting at `start` is the alias in `... as Alias`.
+fn is_alias(source: &str, start: usize) -> bool {
+    source[..start]
+        .trim_end()
+        .strip_suffix("as")
+        .is_some_and(|before| before.ends_with(char::is_whitespace))
+}
+
+/// A module's hover: what it is, its docs, then what's in it.
+fn module_contents(module: &Module) -> Vec<MarkedString> {
+    let kind = if module.package { "package" } else { "module" };
+    let mut contents = vec![MarkedString::from_language_code(
+        "comline".to_string(),
+        format!("{kind} {}", module.namespace.join("::")),
+    )];
+    if let Some(docs) = &module.docs {
+        contents.push(MarkedString::from_markdown(docs.clone()));
+    }
+
+    let mut lists = Vec::new();
+    if !module.modules.is_empty() {
+        let entries: Vec<(String, Option<&str>)> =
+            module.modules.iter().map(|m| (format!("`{}`", m.name), m.docs.as_deref())).collect();
+        lists.push(entries_list("Modules", &entries));
+    }
+    if !module.declarations.is_empty() {
+        let entries: Vec<(String, Option<&str>)> = module
+            .declarations
+            .iter()
+            .map(|d| (format!("`{} {}`", d.kind.keyword(), d.name), d.docs.as_deref()))
+            .collect();
+        lists.push(entries_list("Declares", &entries));
+    }
+    if !lists.is_empty() {
+        contents.push(MarkedString::from_markdown(lists.join("\n\n")));
+    }
+    contents
+}
+
+/// `**Heading**` and a bullet per entry: its label, then the first line of
+/// its docs. Long lists are cut.
+fn entries_list(heading: &str, entries: &[(String, Option<&str>)]) -> String {
+    let mut lines = vec![format!("**{heading}**"), String::new()];
+    for (label, docs) in entries.iter().take(LISTED) {
+        match docs.map(summary).filter(|s| !s.is_empty()) {
+            Some(summary) => lines.push(format!("- {label} — {summary}")),
+            None => lines.push(format!("- {label}")),
+        }
+    }
+    if entries.len() > LISTED {
+        lines.push(format!("- …and {} more", entries.len() - LISTED));
+    }
+    lines.join("\n")
 }
 
 /// Create hover for a symbol (struct, enum, protocol, const)
@@ -1322,5 +1438,122 @@ protocol Chat {
         assert!(text.contains("struct Thing"), "got: {text}");
         assert!(text.contains("A shared thing"), "got: {text}");
         assert!(!text.contains("no `use` here"), "it is imported: {text}");
+    }
+
+    // ---- module docs on path segments ----
+
+    use crate::analysis::source::SourceFile;
+
+    fn local(path: &str, text: &str) -> SourceFile {
+        SourceFile::local(Url::parse(&format!("file:///pkg/{path}")).unwrap(), text.to_string())
+    }
+
+    /// The files of a package with documented modules, and std.
+    fn documented_package() -> Vec<SourceFile> {
+        let mut files = vec![
+            local("src/types.ids", "//! The package's types.\n//!\n//! Shared by everything.\n\n/// Someone.\nstruct User {\n    id: u64\n}\n"),
+            local("src/api.ids", "//! The API.\n\nstruct Root {\n    id: u64\n}\n"),
+            local("src/api/common.ids", "//! Things every API schema needs.\n\nstruct Error {\n    code: u32\n}\n"),
+        ];
+        files.extend(crate::analysis::stdlib::files(&crate::analysis::stdlib::root()));
+        files
+    }
+
+    /// The hover at the first `needle` in `source` (the cursor on its first
+    /// character + `shift`), written in `pkg/src/<file>`.
+    fn hover_in(file: &str, source: &str, needle: &str, shift: usize) -> Option<String> {
+        let uri = Url::parse(&format!("file:///pkg/src/{file}")).unwrap();
+        let offset = source.find(needle).unwrap() + shift;
+        let position = crate::util::offset_to_position(source, offset);
+        get_hover_info_with_project(source, &uri, position, &documented_package()).map(hover_text)
+    }
+
+    #[test]
+    fn a_module_segment_shows_its_docs_and_the_types_it_declares() {
+        let text = hover_in("chat.ids", "use types::User\n", "types", 1).expect("module hover");
+        assert!(text.contains("module types"), "{text}");
+        assert!(text.contains("The package's types.\n\nShared by everything."), "{text}");
+        assert!(text.contains("**Declares**"), "{text}");
+        assert!(text.contains("- `struct User` — Someone."), "{text}");
+    }
+
+    #[test]
+    fn std_and_each_of_its_modules_show_their_own_docs() {
+        let source = "use std::validators::StringBounds\n";
+
+        let package = hover_in("chat.ids", source, "std", 0).unwrap();
+        assert!(package.contains("package std"), "{package}");
+        assert!(package.contains("The Comline standard library."), "its config.idp docs: {package}");
+        assert!(package.contains("**Modules**"), "{package}");
+        assert!(package.contains("- `http` — Types for talking HTTP: request methods, requests and responses."), "{package}");
+        assert!(package.contains("- `validators` — Validators to attach to fields with `@validators`."), "{package}");
+
+        let module = hover_in("chat.ids", source, "validators", 0).unwrap();
+        assert!(module.contains("module std::validators"), "{module}");
+        assert!(module.contains("Validators to attach to fields with `@validators`."), "{module}");
+        assert!(module.contains("- `validator StringBounds` — Checks a string's length is within a minimum and a maximum."), "{module}");
+        assert!(!module.contains("**Modules**"), "a schema has no modules below it: {module}");
+    }
+
+    #[test]
+    fn a_last_segment_that_names_a_declaration_keeps_its_own_hover() {
+        let text = hover_in("chat.ids", "use std::http::Request\n", "Request", 0).unwrap();
+        assert!(text.contains("struct Request"), "{text}");
+        assert!(!text.contains("module"), "the declaration, not a module: {text}");
+    }
+
+    #[test]
+    fn a_whole_namespace_import_names_a_module_at_the_end() {
+        let text = hover_in("chat.ids", "use std::http\n", "http", 0).unwrap();
+        assert!(text.contains("module std::http"), "{text}");
+        assert!(text.contains("- `enum HttpMethod` — An HTTP request method."), "{text}");
+        assert!(text.contains("- `struct Response` — An HTTP response, by its status code."), "{text}");
+        let lone = hover_in("chat.ids", "use types\n", "types", 0).unwrap();
+        assert!(lone.contains("module types"), "a lone word on a `use` line: {lone}");
+    }
+
+    #[test]
+    fn a_directory_over_a_schema_lists_both() {
+        let text = hover_in("chat.ids", "use api::common::Error\n", "api", 0).unwrap();
+        assert!(text.contains("module api\n"), "{text}");
+        assert!(text.contains("The API."), "{text}");
+        assert!(text.contains("**Modules**\n\n- `common` — Things every API schema needs."), "{text}");
+        assert!(text.contains("- `struct Root`"), "{text}");
+    }
+
+    #[test]
+    fn relative_prefixes_show_the_module_they_stand_for() {
+        let text = hover_in("api/b.ids", "use parent::common::Error\n", "parent", 2).unwrap();
+        assert!(text.contains("module api"), "one up from api::b is api: {text}");
+        assert!(text.contains("The API."), "{text}");
+        let me = hover_in("types.ids", "use self::x::Y\n", "self", 0).unwrap_or_default();
+        assert!(!me.contains("package"), "{me}");
+    }
+
+    #[test]
+    fn qualified_type_names_work_too() {
+        let source = "struct S {\n    r: std::http::Request\n}\n";
+        let text = hover_in("chat.ids", source, "http", 0).unwrap();
+        assert!(text.contains("module std::http"), "{text}");
+        let package = hover_in("chat.ids", source, "std", 0).unwrap();
+        assert!(package.contains("package std"), "{package}");
+    }
+
+    #[test]
+    fn not_for_aliases_comments_strings_or_unknown_paths() {
+        // An alias hovers as what it stands for, never as a module of that name.
+        let alias = hover_in("chat.ids", "use std::http::Request as types\n", "types", 0).unwrap();
+        assert!(alias.contains("struct Request") && !alias.contains("module"), "{alias}");
+        assert_eq!(hover_in("chat.ids", "// see types::User\nstruct S {\n    id: u64\n}\n", "types", 0), None, "a comment");
+        assert_eq!(hover_in("chat.ids", "use typse::User\n", "typse", 0), None, "no such module");
+        assert_eq!(hover_in("chat.ids", "use std::htp::Request\n", "htp", 0), None, "no such std module");
+        assert_eq!(hover_in("chat.ids", "struct types {\n    id: u64\n}\n", "types", 0).map(|t| t.contains("module")), Some(false));
+    }
+
+    #[test]
+    fn works_while_the_rest_of_the_file_does_not_parse() {
+        let source = "use std::http::Request\n\nstruct Broken {\n";
+        let text = hover_in("chat.ids", source, "http", 0).expect("only the path is needed");
+        assert!(text.contains("module std::http"), "{text}");
     }
 }
