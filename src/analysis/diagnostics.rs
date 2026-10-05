@@ -473,6 +473,15 @@ struct User {
         }
     }
 
+    /// `use parent::*` used to be a raw parser error (core#65).
+    #[test]
+    fn a_bare_prefix_glob_or_list_is_not_a_syntax_error() {
+        for header in ["use parent::*", "use self::*", "use package::{Message}", "use parent::{Message, Other}"] {
+            let source = format!("{header}\n\nstruct S {{\n    id: u64\n}}\n");
+            assert_eq!(messages(&source), Vec::<String>::new(), "{header}");
+        }
+    }
+
     #[test]
     fn a_type_used_with_no_import_at_all_is_still_unknown_on_its_own() {
         assert_eq!(messages("struct S {\n    m: Message\n}\n").len(), 1);

@@ -486,6 +486,22 @@ mod tests {
     }
 
     #[test]
+    fn a_bare_prefix_before_a_glob_or_list_imports_the_name() {
+        // From `types/inner.ids`, `parent::` is `types`.
+        for header in ["use parent::*", "use parent::{Message, Kind}"] {
+            let source = format!("{header}\n\nstruct S {{\n    m: Message\n}}\n");
+            let files = project(&[("file:///pkg/src/types/inner.ids", &source), TYPES]);
+            assert_eq!(missing_names(&files, 0), vec![], "`{header}` imports `Message`");
+        }
+
+        let source = "use parent::{Kind}\n\nstruct S {\n    m: Message\n}\n";
+        let files = project(&[("file:///pkg/src/types/inner.ids", source), TYPES]);
+        let missing = missing_names(&files, 0);
+        assert_eq!(missing.len(), 1, "a list that leaves `Message` out doesn't import it: {missing:?}");
+        assert_eq!(missing[0].0, "Message");
+    }
+
+    #[test]
     fn an_alias_binds_only_the_alias() {
         let aliased = "use types::Message as Msg\n\nstruct S {\n    a: Msg\n    b: Message\n}\n";
         let files = project(&[("file:///pkg/src/chat.ids", aliased), TYPES]);

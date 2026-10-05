@@ -259,6 +259,22 @@ mod tests {
         assert!(resolve_symbol("Comment", &imports, &siblings).is_none());
     }
 
+    /// `parent::*` / `parent::{..}` parse (core#65) and resolve against the
+    /// namespace one level up, like the longer relative forms.
+    #[test]
+    fn a_bare_prefix_before_a_glob_or_list_resolves_against_that_namespace() {
+        let current = ["chat".to_string(), "admin".to_string()];
+        let siblings = vec![file(&["chat"])];
+
+        let glob = resolved_imports(&parse_use("use parent::*"), &current);
+        assert_eq!(glob[0].resolved.absolute_namespace, vec!["chat".to_string()]);
+        assert!(resolve_symbol("AnyName", &glob, &siblings).is_some());
+
+        let list = resolved_imports(&parse_use("use parent::{User, Post}"), &current);
+        assert!(resolve_symbol("User", &list, &siblings).is_some());
+        assert!(resolve_symbol("Comment", &list, &siblings).is_none());
+    }
+
     #[test]
     fn use_as_alias_resolves_under_both_the_alias_and_the_real_name() {
         // Matches `use_brings_into_scope`'s existing, already-shipped rule
