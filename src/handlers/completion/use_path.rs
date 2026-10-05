@@ -184,10 +184,7 @@ pub(super) fn completions<S: ProjectSource>(
         modules::children(&project, &base, relative).iter().map(|child| child_item(child, range)).collect();
     if schema.is_some() {
         items.extend(declared().iter().map(|d| declared_item(d, range)));
-        // `use parent::*` and `use self::{A}` don't parse: a prefix alone
-        // before `::*` or `::{` lexes as its keyword.
-        let bare_prefix = relative && prefix.segments.len() == 1;
-        if !prefix.legacy && !bare_prefix {
+        if !prefix.legacy {
             items.extend(glob_and_list(&base, range));
         }
     }
@@ -422,8 +419,13 @@ mod tests {
     /// `(label, detail, inserted text)` for completions at the end of `source`
     /// in `pkg/src/api/b.ids`, in the order the client would show them.
     fn complete(source: &str) -> Vec<(String, String, String)> {
-        let uri = Url::parse("file:///pkg/src/api/b.ids").unwrap();
-        let mut items = get_completions_with_project(source, &uri, offset_to_position(source, source.len()), &package());
+        complete_in(&package(), "file:///pkg/src/api/b.ids", source)
+    }
+
+    /// Like [`complete`], for any package and any file in it.
+    fn complete_in(files: &[SourceFile], uri: &str, source: &str) -> Vec<(String, String, String)> {
+        let uri = Url::parse(uri).unwrap();
+        let mut items = get_completions_with_project(source, &uri, offset_to_position(source, source.len()), files);
         items.sort_by(|a, b| a.sort_text.as_ref().unwrap_or(&a.label).cmp(b.sort_text.as_ref().unwrap_or(&b.label)));
         items
             .into_iter()
@@ -474,10 +476,26 @@ mod tests {
     #[test]
     fn relative_paths_resolve_like_the_build_and_stay_in_the_package() {
         // From `api/b.ids`, `parent::` is `api`.
-        assert_eq!(labels(&complete("use parent::")), ["common", "v1"], "no `*` after a bare prefix: it wouldn't parse");
+        assert_eq!(labels(&complete("use parent::")), ["common", "v1"], "`api` has no schema of its own to glob");
         assert_eq!(labels(&complete("use parent::common::")), ["Error", "Other", "*", "{…}"]);
         assert_eq!(labels(&complete("use package::")), ["api", "types"], "not the dependencies");
         assert_eq!(labels(&complete("use self::")), Vec::<&str>::new(), "`api::b` has nothing under it");
+    }
+
+    /// `use parent::*` and `use parent::{A}` parse, so a bare prefix that lands
+    /// on a schema offers them like any other path.
+    #[test]
+    fn a_bare_prefix_on_a_schema_offers_glob_and_list() {
+        let file = |path: &str| Url::parse(&format!("file:///pkg/{path}")).unwrap();
+        let files = vec![
+            SourceFile::local(file("config.idp"), "congregation app\nspecification_version = 1\n".to_string()),
+            SourceFile::local(file("src/api.ids"), "struct Shared {\n    id: u64\n}\n".to_string()),
+            SourceFile::local(file("src/api/child.ids"), "struct Child {\n    id: u64\n}\n".to_string()),
+        ];
+        let complete_child = |source: &str| complete_in(&files, "file:///pkg/src/api/other.ids", source);
+
+        assert_eq!(labels(&complete_child("use parent::")), ["Shared", "child", "*", "{…}"]);
+        assert_eq!(labels(&complete_child("use parent::{")), ["Shared"]);
     }
 
     #[test]
