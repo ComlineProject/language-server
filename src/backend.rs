@@ -273,6 +273,7 @@ impl LanguageServer for Backend {
                                     SemanticTokenType::COMMENT,
                                     SemanticTokenType::NUMBER,
                                     SemanticTokenType::DECORATOR,
+                                    SemanticTokenType::NAMESPACE,
                                 ],
                                 token_modifiers: vec![],
                             },

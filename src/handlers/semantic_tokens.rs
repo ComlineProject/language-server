@@ -3,9 +3,9 @@
 //! playground's editor.
 //!
 //! A small line-oriented lexer: enough to colour keywords, primitive / user
-//! types, strings, `//` comments, `@annotations` and numbers without a full
-//! AST walk. Token positions are in characters (== UTF-16 units for ASCII
-//! schemas, which is the common case).
+//! types, namespace segments, strings, `//` comments, `@annotations` and
+//! numbers without a full AST walk. Token positions are in characters (==
+//! UTF-16 units for ASCII schemas, which is the common case).
 
 use comline_core::schema::idl::vocabulary;
 use lsp_types::{SemanticToken, SemanticTokens, SemanticTokensResult, Url};
@@ -18,10 +18,12 @@ const STRING: u32 = 2;
 const COMMENT: u32 = 3;
 const NUMBER: u32 = 4;
 const DECORATOR: u32 = 5;
+const NAMESPACE: u32 = 6;
 
 /// The token-type names, in legend order. `backend.rs` turns these into
 /// `SemanticTokenType`s.
-pub const LEGEND_TYPES: &[&str] = &["keyword", "type", "string", "comment", "number", "decorator"];
+pub const LEGEND_TYPES: &[&str] =
+    &["keyword", "type", "string", "comment", "number", "decorator", "namespace"];
 
 pub fn get_semantic_tokens(source: &str, _uri: &Url) -> Option<SemanticTokensResult> {
     let mut data: Vec<SemanticToken> = Vec::new();
@@ -121,6 +123,16 @@ fn lex_line(line: &str) -> Vec<(u32, u32, u32)> {
                 } else {
                     Some(KEYWORD)
                 }
+            } else if chars.get(j) == Some(&':') && chars.get(j + 1) == Some(&':') {
+                // Any segment immediately followed by `::` (except a
+                // path-prefix keyword, caught above) names a package or a
+                // module - `std`/`validators` in `std::validators::
+                // StringBounds`, `types` in `types::User`. Purely
+                // positional: Comline's grammar never allows whitespace
+                // around `::`, and every non-final segment of a `::`-path
+                // is structurally a namespace reference, whether or not it
+                // happens to resolve to anything real right now.
+                Some(NAMESPACE)
             } else if vocabulary::primitive(&word).is_some()
                 || word.starts_with(|c: char| c.is_uppercase())
             {
@@ -198,6 +210,44 @@ mod tests {
         // at all (not every word on the line is one of the three tokens).
         assert_eq!(t.data.len(), 2);
         assert!(t.data.iter().all(|x| x.token_type == KEYWORD));
+    }
+
+    #[test]
+    fn package_and_module_segments_highlight_as_namespace() {
+        let ty = types_on("use std::validators::StringBounds\n");
+        // `use` KEYWORD, `std` NAMESPACE, `validators` NAMESPACE,
+        // `StringBounds` TYPE (the leaf - not followed by `::`, so it keeps
+        // the ordinary uppercase-identifier treatment).
+        assert_eq!(ty, vec![KEYWORD, NAMESPACE, NAMESPACE, TYPE]);
+    }
+
+    #[test]
+    fn a_relative_prefix_keyword_stays_keyword_even_before_a_namespace_segment() {
+        let ty = types_on("use parent::common::Error\n");
+        // `parent` is a path-prefix keyword (checked first, see
+        // `use_path_prefix_keywords_highlight` above) - it must stay
+        // KEYWORD, not get reclassified as NAMESPACE just because it's
+        // also immediately followed by `::`.
+        assert_eq!(ty, vec![KEYWORD, KEYWORD, NAMESPACE, TYPE]);
+    }
+
+    #[test]
+    fn a_qualified_type_reference_highlights_its_namespace_segments_too() {
+        // Not just `use` lines - `std`/`http` here are a field's type, and
+        // every non-final `::`-segment is structurally a namespace
+        // reference regardless of position.
+        let ty = types_on("struct S {\n    r: std::http::Request\n}\n");
+        assert_eq!(ty, vec![KEYWORD, TYPE, NAMESPACE, NAMESPACE, TYPE]);
+    }
+
+    #[test]
+    fn a_single_segment_name_is_unaffected() {
+        // No `::` anywhere - `types` here is a lone module reference
+        // (`use types` imports the whole module), not followed by
+        // anything, so it keeps getting no token at all, same as any other
+        // lowercase identifier with no further information about it.
+        let ty = types_on("use types\n");
+        assert_eq!(ty, vec![KEYWORD]);
     }
 
     #[test]
