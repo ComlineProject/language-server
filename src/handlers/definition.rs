@@ -388,4 +388,68 @@ struct User {
         let location = definition_in("chat.ids", "use types\n", "types").expect("lone word on a use line");
         assert_eq!(location.uri.as_str(), "file:///pkg/src/types.ids");
     }
+
+    // ---- go-to-definition on error/validator/settings declarations ----
+    //
+    // These three kinds used to be entirely absent from the symbol table
+    // (`analysis::symbols::build_symbol_table` skipped them outright), so a
+    // reference to one - a `@validators = [StringBounds(...)]` annotation,
+    // a `! NotFound` throws clause - resolved to nothing at all, even
+    // though the declaration was right there in the same file.
+
+    #[test]
+    fn test_goto_definition_validator() {
+        let source = "validator StringBounds {\n    min: u32\n    max: u32\n}\n\nstruct S {\n    @validators = [StringBounds(min=3, max=10)]\n    name: string\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let offset = source.rfind("StringBounds").unwrap();
+        let position = crate::util::offset_to_position(source, offset);
+
+        let location = scalar(find_definition(source, &uri, position));
+        assert_eq!(location.range.start.line, 0, "jumps to the validator's own declaration");
+    }
+
+    #[test]
+    fn test_goto_definition_error() {
+        let source = "error NotFound {\n    message = \"missing\"\n}\n\nprotocol P {\n    function f() ! NotFound;\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let offset = source.rfind("NotFound").unwrap();
+        let position = crate::util::offset_to_position(source, offset);
+
+        let location = scalar(find_definition(source, &uri, position));
+        assert_eq!(location.range.start.line, 0, "jumps to the error's own declaration");
+    }
+
+    #[test]
+    fn test_goto_definition_settings() {
+        let source = "settings AAA {\n    k = True\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        // The declaration's own name - a settings block has no reference
+        // syntax elsewhere yet, so this just confirms the symbol itself is
+        // now in the table at all (it used to be entirely absent).
+        let offset = source.find("AAA").unwrap();
+        let position = crate::util::offset_to_position(source, offset);
+
+        let location = scalar(find_definition(source, &uri, position));
+        assert_eq!(location.range.start.line, 0);
+    }
+
+    #[test]
+    fn a_std_validator_jumps_to_its_virtual_file() {
+        // The exact case reported: `use std::validators::StringBounds`,
+        // then referencing it in `@validators` - go-to-definition on the
+        // *usage* (not the module path in the `use` line, already covered
+        // above) did nothing before this fix.
+        let source = "use std::validators::StringBounds\n\nstruct S {\n    @validators = [StringBounds(min=3, max=10)]\n    name: string\n}\n";
+        let uri = Url::parse("file:///pkg/src/chat.ids").unwrap();
+        let offset = source.rfind("StringBounds").unwrap();
+        let position = crate::util::offset_to_position(source, offset);
+
+        let location = match find_definition_with_project(source, &uri, position, &documented_package())
+            .expect("validator declaration")
+        {
+            GotoDefinitionResponse::Scalar(location) => location,
+            other => panic!("expected a scalar location, got {other:?}"),
+        };
+        assert_eq!(location.uri.as_str(), "comline-std:/validators.ids");
+    }
 }

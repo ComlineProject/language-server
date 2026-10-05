@@ -230,4 +230,24 @@ protocol UserService {
         assert_eq!(get_workspace_symbols(&files, "").len(), 3);
         assert!(get_workspace_symbols(&files, "zzz").is_empty());
     }
+
+    #[test]
+    fn error_validator_and_settings_now_appear_in_the_outline() {
+        // These three used to be entirely absent from the symbol table
+        // (`analysis::symbols::build_symbol_table` skipped them outright),
+        // so they never showed up here either.
+        let source = "error NotFound {\n    message = \"missing\"\n}\n\nvalidator StringBounds {\n    min: u32\n}\n\nsettings AAA {\n    k = True\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let symbols = get_document_symbols(source, &uri);
+
+        let names: Vec<(&str, SymbolKind)> = symbols.iter().map(|s| (s.name.as_str(), s.kind)).collect();
+        assert_eq!(
+            names,
+            vec![
+                ("NotFound", SymbolKind::EVENT),
+                ("StringBounds", SymbolKind::FUNCTION),
+                ("AAA", SymbolKind::OBJECT),
+            ]
+        );
+    }
 }

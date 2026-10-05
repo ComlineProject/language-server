@@ -488,6 +488,42 @@ fn create_symbol_hover(symbol: &symbols::Symbol, document: &Document, lookup: &H
                 (format!("type {}", symbol.name), None, None)
             }
         }
+        SymbolKind::EVENT => {
+            if let Some(e) = find_error_declaration(document, &symbol.name) {
+                let fields: Vec<String> = e.fields()
+                    .iter()
+                    .map(|f| {
+                        let opt = if f.optional() { "optional " } else { "" };
+                        format!("  {}{}: {}", opt, f.name(), format_type(f.field_type()))
+                    })
+                    .collect();
+                (format!("error {} {{\n{}\n}}", symbol.name, fields.join("\n")), e.docstring(), None)
+            } else {
+                (format!("error {}", symbol.name), None, None)
+            }
+        }
+        SymbolKind::FUNCTION => {
+            if let Some(v) = find_validator_declaration(document, &symbol.name) {
+                let params: Vec<String> = v.properties()
+                    .iter()
+                    .map(|p| format!("{}: {}", p.name(), format_type(p.property_type())))
+                    .collect();
+                (format!("validator {}({})", symbol.name, params.join(", ")), v.docstring(), None)
+            } else {
+                (format!("validator {}", symbol.name), None, None)
+            }
+        }
+        SymbolKind::OBJECT => {
+            if let Some(s) = find_settings_declaration(document, &symbol.name) {
+                let entries: Vec<String> = s.entries()
+                    .iter()
+                    .map(|e| format!("  {} = {}", e.key(), e.value_string()))
+                    .collect();
+                (format!("settings {} {{\n{}\n}}", symbol.name, entries.join("\n")), s.docstring(), None)
+            } else {
+                (format!("settings {}", symbol.name), None, None)
+            }
+        }
         _ => (symbol.name.clone(), None, None),
     };
 
@@ -505,6 +541,9 @@ fn create_symbol_hover(symbol: &symbols::Symbol, document: &Document, lookup: &H
             SymbolKind::STRUCT => format!("{} fields", symbol.children.len()),
             SymbolKind::ENUM => format!("{} variants", symbol.children.len()),
             SymbolKind::INTERFACE => format!("{} functions", symbol.children.len()),
+            SymbolKind::EVENT => format!("{} fields", symbol.children.len()),
+            SymbolKind::FUNCTION => format!("{} parameters", symbol.children.len()),
+            SymbolKind::OBJECT => format!("{} settings", symbol.children.len()),
             _ => String::new(),
         };
         if !detail.is_empty() {
@@ -837,6 +876,39 @@ fn find_type_alias_declaration<'a>(document: &'a comline_core::schema::idl::gram
         if let Declaration::TypeAlias(t) = &**decl {
             if t.name() == name {
                 return Some(t);
+            }
+        }
+    }
+    None
+}
+
+fn find_error_declaration<'a>(document: &'a comline_core::schema::idl::grammar::Document, name: &str) -> Option<&'a comline_core::schema::idl::grammar::Error> {
+    for decl in &document.0 {
+        if let Declaration::Error(e) = &**decl {
+            if e.name() == name {
+                return Some(e);
+            }
+        }
+    }
+    None
+}
+
+fn find_validator_declaration<'a>(document: &'a comline_core::schema::idl::grammar::Document, name: &str) -> Option<&'a comline_core::schema::idl::grammar::Validator> {
+    for decl in &document.0 {
+        if let Declaration::Validator(v) = &**decl {
+            if v.name() == name {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+fn find_settings_declaration<'a>(document: &'a comline_core::schema::idl::grammar::Document, name: &str) -> Option<&'a comline_core::schema::idl::grammar::Settings> {
+    for decl in &document.0 {
+        if let Declaration::Settings(s) = &**decl {
+            if s.name() == name {
+                return Some(s);
             }
         }
     }
@@ -1519,5 +1591,69 @@ protocol Chat {
         let source = "use std::http::Request\n\nstruct Broken {\n";
         let text = hover_in("chat.ids", source, "http", 0).expect("only the path is needed");
         assert!(text.contains("module std::http"), "{text}");
+    }
+
+    // ---- hover on error/validator/settings references ----
+    //
+    // These three were entirely absent from the symbol table, so a
+    // reference to one hovered with nothing at all - not even a bare name,
+    // since it never reached find_type_at_position either (an annotation
+    // value or a `! Name` throws clause isn't a `Type` position).
+
+    #[test]
+    fn hover_on_a_validator_reference_shows_its_parameters() {
+        let source = "validator StringBounds {\n    min: u32\n    max: u32\n}\n\nstruct S {\n    @validators = [StringBounds(min=3, max=10)]\n    name: string\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let offset = source.rfind("StringBounds").unwrap();
+        let position = crate::util::offset_to_position(source, offset);
+
+        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let text = hover_text(hover);
+        assert!(text.contains("validator StringBounds(min: u32, max: u32)"), "got: {text}");
+        assert!(text.contains("2 parameters"), "got: {text}");
+    }
+
+    #[test]
+    fn hover_on_an_error_reference_shows_its_fields() {
+        let source = "error NotFound {\n    message = \"missing\"\n    id: u64\n}\n\nprotocol P {\n    function f() ! NotFound;\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let offset = source.rfind("NotFound").unwrap();
+        let position = crate::util::offset_to_position(source, offset);
+
+        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let text = hover_text(hover);
+        assert!(text.contains("error NotFound"), "got: {text}");
+        assert!(text.contains("id: u64"), "got: {text}");
+        assert!(text.contains("1 fields"), "got: {text}");
+    }
+
+    #[test]
+    fn hover_on_a_settings_declaration_shows_its_entries() {
+        let source = "settings AAA {\n    k = True\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let offset = source.find("AAA").unwrap();
+        let position = crate::util::offset_to_position(source, offset);
+
+        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let text = hover_text(hover);
+        assert!(text.contains("settings AAA"), "got: {text}");
+        assert!(text.contains("k = True"), "got: {text}");
+    }
+
+    #[test]
+    fn hover_on_a_std_validator_reference_shows_its_declaration() {
+        let source = "use std::validators::StringBounds\n\nstruct S {\n    @validators = [StringBounds(min=3, max=10)]\n    name: string\n}\n";
+        let uri = Url::parse("file:///pkg/src/chat.ids").unwrap();
+        let offset = source.rfind("StringBounds").unwrap();
+        let position = crate::util::offset_to_position(source, offset);
+
+        let hover = get_hover_info_with_project(source, &uri, position, &documented_package())
+            .expect("hover should resolve");
+        let text = hover_text(hover);
+        assert!(text.contains("validator StringBounds"), "got: {text}");
+        assert!(
+            text.contains("Checks a string's length is within a minimum and a maximum."),
+            "got: {text}"
+        );
     }
 }
