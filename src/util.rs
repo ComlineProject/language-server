@@ -120,28 +120,58 @@ fn levenshtein(a: &str, b: &str) -> usize {
     previous[b.len()]
 }
 
-/// Is `offset` inside a `//` line comment or a `"…"` string on its line?
-/// Comline has no block comments and strings don't span lines, so a scan of
-/// the current line's prefix is enough.
+/// Is `offset` inside a `//` line comment, a `/* ... */` block comment (which
+/// can span multiple lines), or a `"…"` string (which can't)? Needs a scan
+/// from the start of the document - unlike a line comment or a string, a
+/// block comment's start isn't visible from `offset`'s own line alone.
 pub fn in_comment_or_string(source: &str, offset: usize) -> bool {
     let offset = offset.min(source.len());
-    let line_start = source[..offset].rfind('\n').map_or(0, |i| i + 1);
     let bytes = source.as_bytes();
-    let mut in_str = false;
-    let mut i = line_start;
+
+    #[derive(PartialEq)]
+    enum State {
+        Normal,
+        Str,
+        Line,
+        Block,
+    }
+
+    let mut state = State::Normal;
+    let mut i = 0;
     while i < offset {
-        match bytes[i] {
-            b'\\' if in_str => {
-                i += 2;
-                continue;
+        match state {
+            State::Normal => match bytes[i] {
+                b'"' => state = State::Str,
+                b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                    state = State::Line;
+                    i += 1;
+                }
+                b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                    state = State::Block;
+                    i += 1;
+                }
+                _ => {}
+            },
+            State::Str => match bytes[i] {
+                b'\\' => i += 1,
+                b'"' | b'\n' => state = State::Normal,
+                _ => {}
+            },
+            State::Line => {
+                if bytes[i] == b'\n' {
+                    state = State::Normal;
+                }
             }
-            b'"' => in_str = !in_str,
-            b'/' if !in_str && bytes.get(i + 1) == Some(&b'/') => return true,
-            _ => {}
+            State::Block => {
+                if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                    state = State::Normal;
+                    i += 1;
+                }
+            }
         }
         i += 1;
     }
-    in_str
+    state != State::Normal
 }
 
 /// A `::`-separated path with the cursor on one of its segments.
@@ -235,6 +265,29 @@ mod tests {
         assert!(!in_comment_or_string("struct M {", 9));
         // a `//` inside a string is not a comment
         assert!(in_comment_or_string("x = \"a // b", 8)); // still in the string
+    }
+
+    #[test]
+    fn in_comment_or_string_crosses_a_block_comment_across_lines() {
+        let text = "/*\nfoo\n*/\nbar";
+        // Inside the comment, on the line after its opener.
+        assert!(in_comment_or_string(text, text.find("foo").unwrap() + 1));
+        // Past the closing `*/`, on the following line - no longer inside.
+        assert!(!in_comment_or_string(text, text.find("bar").unwrap()));
+    }
+
+    #[test]
+    fn in_comment_or_string_handles_a_block_comment_on_one_line() {
+        let text = "/* note */ struct M {";
+        assert!(in_comment_or_string(text, 5));
+        assert!(!in_comment_or_string(text, text.find("struct").unwrap() + 1));
+    }
+
+    #[test]
+    fn in_comment_or_string_a_slash_inside_a_string_does_not_start_a_block_comment() {
+        let text = "x = \"a /* b\" ok";
+        // Past the closing quote, back to ordinary code.
+        assert!(!in_comment_or_string(text, text.find("ok").unwrap()));
     }
 
     #[test]

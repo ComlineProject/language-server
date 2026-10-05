@@ -1093,6 +1093,23 @@ struct User {
     }
 
     #[test]
+    fn a_declaration_commented_out_with_a_block_comment_parses_and_hovers_as_the_real_one() {
+        // The end-to-end version of the block-comment grammar fix: with a
+        // `/* ... */`-commented-out `error Test { ... }` sitting above it,
+        // the document must still parse as a whole (so symbol-table-backed
+        // hover works at all) and the commented-out `Test` must not shadow
+        // or interfere with the real `Greeting` declaration below it.
+        let source =
+            "/*\nerror Test {\n    message = \"\"\n}\n*/\nstruct Greeting {\n    name: string\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let position = Position::new(5, 10); // "Greeting"
+
+        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let text = hover_text(hover);
+        assert!(text.contains("struct Greeting"), "got: {text}");
+    }
+
+    #[test]
     fn hover_on_a_field_named_like_an_annotation_key_gets_field_hover_not_annotation_hover() {
         // No `@` prefix — "timeout_ms" here is an ordinary field name, not
         // the annotation. Disambiguated by `is_annotation_key`'s preceding-
