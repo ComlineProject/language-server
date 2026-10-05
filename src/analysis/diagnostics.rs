@@ -179,40 +179,60 @@ fn missing_import_diagnostic(source: &str, missing: &MissingImport) -> Diagnosti
 /// one-shot CLI message) - so each entry is wrapped in a one-element slice
 /// and handed to that same shared "most informative leaf" search, rather
 /// than this crate keeping its own second copy of it.
+///
+/// An unclosed `{`/`[` is checked for first, once for the whole document
+/// rather than per entry - it's a whole-document property, not a
+/// per-`ParseError` one, and once found it *replaces* every other
+/// diagnostic: a dangling bracket makes the parser's own recovery produce
+/// unreliable (often whole-file-spanning) noise for everything after it,
+/// the same way `rustc` treats an unclosed delimiter as the dominant error.
 pub fn generate_diagnostics(source: &str, errors: &[rust_sitter::errors::ParseError]) -> Vec<Diagnostic> {
+    if !errors.is_empty() {
+        if let Some(diagnostic) = comline_core::diagnostics::find_unclosed_bracket(source) {
+            return vec![parse_diagnostic(source, &diagnostic, None)];
+        }
+    }
+
     errors
         .iter()
         .map(|error| {
             let diagnostic = comline_core::diagnostics::from_parse_errors(std::slice::from_ref(error));
-
-            // The leaf's own span when there is one (an accuracy fix over
-            // this file's old outer-`FailedNode`-span behavior - see
-            // core's diagnostics module); falls back to this entry's own
-            // range for the one case with no leaf to point at at all (an
-            // empty `FailedNode`).
-            let range = diagnostic
-                .span
-                .map(|(start, end)| byte_range_to_lsp_range(source, start, end))
-                .unwrap_or_else(|| byte_range_to_lsp_range(source, error.start, error.end));
-
-            let message = match diagnostic.help {
-                Some(help) => format!("{} — {help}", diagnostic.message),
-                None => diagnostic.message,
-            };
-
-            Diagnostic {
-                range,
-                severity: Some(DiagnosticSeverity::ERROR),
-                code: None,
-                code_description: None,
-                source: Some("comline".to_string()),
-                message,
-                related_information: None,
-                tags: None,
-                data: None,
-            }
+            parse_diagnostic(source, &diagnostic, Some((error.start, error.end)))
         })
         .collect()
+}
+
+/// Turn a `comline_core::diagnostics::Diagnostic` into an LSP one. `fallback`
+/// is the raw `ParseError`'s own range - used only when `diagnostic` has no
+/// span of its own (the one case left with nothing to point at: an empty
+/// `FailedNode`, see core's diagnostics module).
+fn parse_diagnostic(
+    source: &str,
+    diagnostic: &comline_core::diagnostics::Diagnostic,
+    fallback: Option<(usize, usize)>,
+) -> Diagnostic {
+    let range = diagnostic
+        .span
+        .or(fallback)
+        .map(|(start, end)| byte_range_to_lsp_range(source, start, end))
+        .unwrap_or_default();
+
+    let message = match &diagnostic.help {
+        Some(help) => format!("{} — {help}", diagnostic.message),
+        None => diagnostic.message.clone(),
+    };
+
+    Diagnostic {
+        range,
+        severity: Some(DiagnosticSeverity::ERROR),
+        code: None,
+        code_description: None,
+        source: Some("comline".to_string()),
+        message,
+        related_information: None,
+        tags: None,
+        data: None,
+    }
 }
 
 #[cfg(test)]
@@ -334,17 +354,16 @@ struct User {
     }
 
     #[test]
-    fn empty_failed_node_falls_back_to_a_generic_message() {
-        // A `FailedNode` can carry zero nested errors — tree-sitter inserts a
-        // zero-width error node with no text, e.g. for input that cuts off
-        // mid-construct with nothing recognizable left to point at (here: an
-        // unclosed `struct` body). Nothing instructive exists to surface, and
-        // no leaf span exists either - the range falls back to this entry's
-        // own (here: the whole trailing garbage span).
+    fn an_unclosed_struct_body_names_the_brace_not_a_generic_message() {
+        // Input that cuts off mid-construct with an unclosed `{` used to
+        // fall all the way back to a bare "unrecognized or incomplete
+        // syntax", spanning the entry's own (often whole-file) range -
+        // `find_unclosed_bracket` now catches this directly and names the
+        // actual problem instead.
         let source = "struct User {\n    name: string\n";
         let result = parser::parse(source).unwrap();
         let diagnostics = generate_diagnostics(source, &result.errors);
-        assert_eq!(diagnostics[0].message, "syntax error: unrecognized or incomplete syntax");
+        assert_eq!(diagnostics[0].message, "unclosed `{` — add a matching `}` to close this block");
     }
 
     #[test]
