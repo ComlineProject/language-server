@@ -29,10 +29,14 @@ pub fn get_semantic_tokens(source: &str, _uri: &Url) -> Option<SemanticTokensRes
     let mut data: Vec<SemanticToken> = Vec::new();
     let mut prev_line = 0u32;
     let mut prev_start = 0u32;
+    // Carried across lines: a `/* ... */` block comment still open at the
+    // end of the previous line, unlike every other token this lexer deals
+    // with.
+    let mut in_block_comment = false;
 
     for (line_idx, line) in source.split('\n').enumerate() {
         let line_no = line_idx as u32;
-        for (start, length, token_type) in lex_line(line) {
+        for (start, length, token_type) in lex_line(line, &mut in_block_comment) {
             let delta_line = line_no - prev_line;
             let delta_start = if delta_line == 0 { start - prev_start } else { start };
             data.push(SemanticToken {
@@ -53,11 +57,29 @@ pub fn get_semantic_tokens(source: &str, _uri: &Url) -> Option<SemanticTokensRes
     }))
 }
 
-/// `(start_char, length, token_type)` for each token on one line.
-fn lex_line(line: &str) -> Vec<(u32, u32, u32)> {
+/// `(start_char, length, token_type)` for each token on one line. `in_block_comment`
+/// carries state in and out: true going in means the previous line left a
+/// `/* ... */` open; this line's prefix up to a closing `*/` (or the whole
+/// line, if there isn't one) is consumed as its continuation before normal
+/// lexing resumes.
+fn lex_line(line: &str, in_block_comment: &mut bool) -> Vec<(u32, u32, u32)> {
     let chars: Vec<char> = line.chars().collect();
     let mut out = Vec::new();
     let mut i = 0usize;
+
+    if *in_block_comment {
+        match block_comment_end(&chars, 0) {
+            Some(end) => {
+                out.push((0, (end + 2) as u32, COMMENT));
+                *in_block_comment = false;
+                i = end + 2;
+            }
+            None => {
+                out.push((0, chars.len() as u32, COMMENT));
+                return out;
+            }
+        }
+    }
 
     while i < chars.len() {
         let c = chars[i];
@@ -65,6 +87,21 @@ fn lex_line(line: &str) -> Vec<(u32, u32, u32)> {
         if c == '/' && chars.get(i + 1) == Some(&'/') {
             out.push((i as u32, (chars.len() - i) as u32, COMMENT));
             break;
+        }
+
+        if c == '/' && chars.get(i + 1) == Some(&'*') {
+            match block_comment_end(&chars, i + 2) {
+                Some(end) => {
+                    out.push((i as u32, (end + 2 - i) as u32, COMMENT));
+                    i = end + 2;
+                }
+                None => {
+                    out.push((i as u32, (chars.len() - i) as u32, COMMENT));
+                    *in_block_comment = true;
+                    break;
+                }
+            }
+            continue;
         }
 
         if c == '"' {
@@ -151,6 +188,12 @@ fn lex_line(line: &str) -> Vec<(u32, u32, u32)> {
     }
 
     out
+}
+
+/// The index of the `*` that starts a `*/` at or after `from`, if the rest
+/// of this line's chars contain one.
+fn block_comment_end(chars: &[char], from: usize) -> Option<usize> {
+    (from..chars.len().saturating_sub(1)).find(|&j| chars[j] == '*' && chars[j + 1] == '/')
 }
 
 #[cfg(test)]
@@ -248,6 +291,38 @@ mod tests {
         // lowercase identifier with no further information about it.
         let ty = types_on("use types\n");
         assert_eq!(ty, vec![KEYWORD]);
+    }
+
+    #[test]
+    fn a_block_comment_on_one_line_highlights_as_a_single_comment_token() {
+        let r = get_semantic_tokens("/* note */ struct S {}\n", &Url::parse("file:///t.ids").unwrap()).unwrap();
+        let SemanticTokensResult::Tokens(t) = r else { panic!() };
+        // The comment token covers exactly `/* note */` (0..10), then
+        // `struct`/`S` highlight normally afterward.
+        assert_eq!(t.data[0].token_type, COMMENT);
+        assert_eq!(t.data[0].delta_start, 0);
+        assert_eq!(t.data[0].length, 10);
+        assert_eq!(t.data[1].token_type, KEYWORD); // struct
+        assert_eq!(t.data[2].token_type, TYPE); // S
+    }
+
+    #[test]
+    fn a_block_comment_spanning_lines_highlights_every_line_it_covers() {
+        // What a commented-out `error Test { ... }` declaration looks like
+        // once the editor actually understands block comments - every line
+        // from the opener through the closer must come back as COMMENT,
+        // never as real `error`/`message` keyword tokens.
+        let src = "/*\nerror Test {\n    message = \"\"\n}\n*/\nstruct S {}\n";
+        let r = get_semantic_tokens(src, &Url::parse("file:///t.ids").unwrap()).unwrap();
+        let SemanticTokensResult::Tokens(t) = r else { panic!() };
+        // Every token through the closing `*/` line is COMMENT; the last
+        // two (struct, S) are the real code after it.
+        assert_eq!(t.data.len(), 7, "{t:?}");
+        for tok in &t.data[..5] {
+            assert_eq!(tok.token_type, COMMENT, "{t:?}");
+        }
+        assert_eq!(t.data[5].token_type, KEYWORD); // struct
+        assert_eq!(t.data[6].token_type, TYPE); // S
     }
 
     #[test]

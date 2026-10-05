@@ -223,20 +223,36 @@ fn type_item(doc: &ProjectDoc, real: &str, label: String, detail: String) -> Com
     CompletionItem { label, kind: Some(kind), detail: Some(detail), ..Default::default() }
 }
 
-/// Blank out `//` line comments and the *contents* of `"…"` string
-/// literals — replacing each covered character with a space, preserving
-/// length and every newline — so a backward token scan never gets confused
-/// by punctuation that only exists inside a comment or a string (an `=`
-/// inside a docstring, a stray `{` inside an error message, …). Comline has
-/// no block comments and no multi-line strings, so this can process one
-/// line at a time. Operates on `char`s throughout (not raw bytes), since a
-/// docstring may contain arbitrary UTF-8.
+/// Blank out `//` line comments, `/* ... */` block comments, and the
+/// *contents* of `"…"` string literals — replacing each covered character
+/// with a space, preserving length and every newline — so a backward token
+/// scan never gets confused by punctuation that only exists inside a
+/// comment or a string (an `=` inside a docstring, a stray `{` inside a
+/// commented-out declaration, …). Strings don't span lines, but a block
+/// comment can, so `in_block_comment` carries across the per-line loop
+/// below the same way it does in `semantic_tokens::lex_line`. Operates on
+/// `char`s throughout (not raw bytes), since a docstring may contain
+/// arbitrary UTF-8.
 fn strip_comments_and_strings(source: &str) -> String {
     let mut out = String::with_capacity(source.len());
+    let mut in_block_comment = false;
     for line in source.split_inclusive('\n') {
         let mut chars = line.char_indices().peekable();
         let mut in_str = false;
         while let Some((_, c)) = chars.next() {
+            if in_block_comment {
+                if c == '\n' {
+                    out.push('\n');
+                } else {
+                    out.push(' ');
+                    if c == '*' && chars.peek().map(|&(_, c2)| c2) == Some('/') {
+                        chars.next();
+                        out.push(' ');
+                        in_block_comment = false;
+                    }
+                }
+                continue;
+            }
             if in_str {
                 if c == '\\' {
                     out.push(' ');
@@ -267,6 +283,13 @@ fn strip_comments_and_strings(source: &str) -> String {
                     out.push(if c2 == '\n' { '\n' } else { ' ' });
                 }
                 break;
+            }
+            if c == '/' && chars.peek().map(|&(_, c2)| c2) == Some('*') {
+                chars.next();
+                out.push(' ');
+                out.push(' ');
+                in_block_comment = true;
+                continue;
             }
             out.push(c);
         }
@@ -956,6 +979,39 @@ mod tests {
         );
         assert!(!cleaned.contains("note"));
         assert!(cleaned.contains("struct M {"));
+    }
+
+    #[test]
+    fn strip_comments_and_strings_blanks_a_block_comment_spanning_lines() {
+        // A brace inside a commented-out declaration must not confuse the
+        // backward brace-balance scan context detection relies on.
+        let source = "/*\nerror Test {\n    message = \"\"\n}\n*/\nstruct M {\n    \n}\n";
+        let cleaned = strip_comments_and_strings(source);
+        assert_eq!(cleaned.chars().count(), source.chars().count());
+        assert_eq!(
+            cleaned.chars().filter(|&c| c == '\n').count(),
+            source.chars().filter(|&c| c == '\n').count()
+        );
+        assert!(!cleaned.contains("error"));
+        // Only `struct M {`'s brace should survive - the one inside the
+        // block comment must be blanked out too.
+        assert_eq!(cleaned.matches('{').count(), 1, "{cleaned:?}");
+        assert!(cleaned.contains("struct M {"));
+    }
+
+    #[test]
+    fn completion_works_right_after_a_multi_line_block_comment() {
+        // The regression this whole change is for: a block-commented-out
+        // declaration sitting earlier in the file must not throw off
+        // completion context for real code afterward.
+        let source = "/*\nerror Test {\n    message = \"\"\n}\n*/\nstruct M {\n    \n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let items = get_completions(source, &uri, Position::new(6, 4));
+        // StructBody context: the one modifier keyword a field can start
+        // with. Confirms the commented-out `error Test { ... }` above
+        // didn't throw off the brace-balance scan that finds this is
+        // inside `struct M`'s body, not `error Test`'s.
+        assert!(items.iter().any(|i| i.label == "optional"), "{items:?}");
     }
 
     #[test]
