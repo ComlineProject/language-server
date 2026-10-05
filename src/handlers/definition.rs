@@ -1,9 +1,10 @@
 // Definition handler - provides go-to-definition functionality
 
+use crate::analysis::modules;
 use crate::analysis::project::Project;
 use crate::analysis::source::ProjectSource;
-use crate::util::{position_to_offset, word_range_at};
-use lsp_types::{GotoDefinitionResponse, Position, Url};
+use crate::util::{byte_range_to_lsp_range, position_to_offset, word_range_at};
+use lsp_types::{GotoDefinitionResponse, Location, Position, Url};
 
 /// Find the definition of a symbol at a position, considering only this file.
 pub fn find_definition(source: &str, uri: &Url, position: Position) -> Option<GotoDefinitionResponse> {
@@ -15,6 +16,16 @@ pub fn find_definition(source: &str, uri: &Url, position: Position) -> Option<Go
 /// pairs) when it isn't declared in this file. See [`Project::resolve`]
 /// for the lookup order (local, then `use`-scoped, then a flat fallback) -
 /// shared with find-references and rename, so the three always agree.
+///
+/// A path segment that names a module rather than a declaration (`std` or
+/// `validators` in `use std::validators::StringBounds`) is checked first,
+/// jumping to that module's own schema file instead - the same detection
+/// hover uses, via [`modules::path_module_at`], so the two always agree on
+/// which positions are "a module" versus "a declaration". A dependency's
+/// file (std included) comes back with its own URI unchanged
+/// (`comline-std:/validators.ids`); the client opens it read-only because
+/// nothing it asks the server for can be saved back anywhere, not because
+/// of any flag set here.
 pub fn find_definition_with_project<S: ProjectSource>(
     source: &str,
     uri: &Url,
@@ -22,6 +33,11 @@ pub fn find_definition_with_project<S: ProjectSource>(
     other_files: &[S],
 ) -> Option<GotoDefinitionResponse> {
     let offset = position_to_offset(source, position)?;
+
+    if let Some(location) = module_definition(source, uri, offset, other_files) {
+        return Some(GotoDefinitionResponse::Scalar(location));
+    }
+
     let (start, end) = word_range_at(source, offset)?;
 
     let project = Project::with_active(uri, source, other_files);
@@ -29,6 +45,23 @@ pub fn find_definition_with_project<S: ProjectSource>(
     let target = project.resolve(active, &source[start..end])?;
 
     project.declaration(&target).map(GotoDefinitionResponse::Scalar)
+}
+
+/// The definition of a module path segment at `offset`: the start of its
+/// own schema file, if it has one. `None` for a pure grouping namespace (a
+/// directory with no schema of its own, or a dependency's package root) -
+/// there's no single file to open for one of those, only a listing (what
+/// hover already shows).
+fn module_definition<S: ProjectSource>(
+    source: &str,
+    uri: &Url,
+    offset: usize,
+    other_files: &[S],
+) -> Option<Location> {
+    let project = Project::with_active(uri, source, other_files);
+    let (namespace, _) = modules::path_module_at(source, uri, offset, &project)?;
+    let doc = project.docs.iter().find(|d| d.namespace == namespace)?;
+    Some(Location { uri: doc.uri.clone(), range: byte_range_to_lsp_range(doc.source, 0, 0) })
 }
 
 #[cfg(test)]
@@ -265,5 +298,94 @@ struct User {
         let location = scalar(find_definition_with_project(chat, &chat_uri, Position::new(3, 8), &others));
         assert_eq!(location.uri.as_str(), "file:///shared/src/models.ids");
         assert_eq!(location.range.start.line, 1);
+    }
+
+    // ---- go-to-definition on a module path segment ----
+
+    fn local(path: &str, text: &str) -> crate::analysis::source::SourceFile {
+        crate::analysis::source::SourceFile::local(Url::parse(&format!("file:///pkg/{path}")).unwrap(), text.to_string())
+    }
+
+    /// The files of a multi-schema package, plus std.
+    fn documented_package() -> Vec<crate::analysis::source::SourceFile> {
+        let mut files = vec![
+            local("src/types.ids", "struct User {\n    id: u64\n}\n"),
+            local("src/api.ids", "struct Root {\n    id: u64\n}\n"),
+            local("src/api/common.ids", "struct Error {\n    code: u32\n}\n"),
+        ];
+        files.extend(crate::analysis::stdlib::files(&crate::analysis::stdlib::root()));
+        files
+    }
+
+    /// Go-to-definition at the first `needle` in `source`, written in
+    /// `pkg/src/<file>`.
+    fn definition_in(file: &str, source: &str, needle: &str) -> Option<Location> {
+        let uri = Url::parse(&format!("file:///pkg/src/{file}")).unwrap();
+        let offset = source.find(needle).unwrap();
+        let position = crate::util::offset_to_position(source, offset);
+        match find_definition_with_project(source, &uri, position, &documented_package())? {
+            GotoDefinitionResponse::Scalar(location) => Some(location),
+            other => panic!("expected a scalar location, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_module_segment_jumps_to_its_own_schema_file() {
+        let location = definition_in("chat.ids", "use types::User\n", "types").expect("module definition");
+        assert_eq!(location.uri.as_str(), "file:///pkg/src/types.ids");
+        assert_eq!(location.range.start, Position::new(0, 0));
+    }
+
+    #[test]
+    fn a_std_module_segment_jumps_to_its_virtual_file() {
+        let source = "use std::validators::StringBounds\n";
+        let location = definition_in("chat.ids", source, "validators").expect("std module definition");
+        assert_eq!(location.uri.as_str(), "comline-std:/validators.ids");
+    }
+
+    #[test]
+    fn the_std_package_root_has_no_single_file_to_jump_to() {
+        // `std` itself is a pure grouping namespace - only its modules
+        // (`std::http`, `std::validators`, ...) have their own schema.
+        let source = "use std::validators::StringBounds\n";
+        assert!(definition_in("chat.ids", source, "std").is_none());
+    }
+
+    #[test]
+    fn a_directory_with_its_own_schema_jumps_to_it() {
+        // `api` has both a schema (`api.ids`) and a deeper module
+        // (`api::common`) - the schema is what a jump lands on.
+        let location = definition_in("chat.ids", "use api::common::Error\n", "api").expect("api.ids exists");
+        assert_eq!(location.uri.as_str(), "file:///pkg/src/api.ids");
+    }
+
+    #[test]
+    fn a_pure_directory_grouping_has_no_single_file_to_jump_to() {
+        // `api::v1` here has no schema of its own, only a deeper one
+        // (`api::v1::user`) - same shape as `std` itself above, just
+        // within the package being edited rather than a dependency.
+        let files = vec![local("src/api/v1/user.ids", "struct Profile {\n    id: u64\n}\n")];
+        let uri = Url::parse("file:///pkg/src/chat.ids").unwrap();
+        let source = "use api::v1::user::Profile\n";
+        let offset = source.find("v1").unwrap();
+        let position = crate::util::offset_to_position(source, offset);
+        assert!(find_definition_with_project(source, &uri, position, &files).is_none());
+    }
+
+    #[test]
+    fn a_last_segment_that_names_a_declaration_still_goes_to_the_declaration() {
+        // `Request` here could be mistaken for a module segment (it's the
+        // last segment of a `::` path) - it must still resolve as the
+        // struct declaration, not as a (nonexistent) module.
+        let location =
+            definition_in("chat.ids", "use std::http::Request\n", "Request").expect("declaration, not module");
+        assert_eq!(location.uri.as_str(), "comline-std:/http.ids");
+        assert_ne!(location.range.start, Position::new(0, 0), "lands on Request's own declaration, not the file start");
+    }
+
+    #[test]
+    fn a_whole_namespace_import_names_a_module_at_the_end() {
+        let location = definition_in("chat.ids", "use types\n", "types").expect("lone word on a use line");
+        assert_eq!(location.uri.as_str(), "file:///pkg/src/types.ids");
     }
 }

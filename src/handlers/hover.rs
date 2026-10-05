@@ -7,7 +7,7 @@ use crate::analysis::source::{self, ProjectSource};
 use crate::analysis::stdlib;
 use crate::analysis::symbols;
 use crate::parser;
-use crate::util::{byte_range_to_lsp_range, in_comment_or_string, path_at, position_to_offset};
+use crate::util::{byte_range_to_lsp_range, position_to_offset};
 use comline_core::schema::idl::annotations;
 use comline_core::schema::idl::grammar::{Declaration, Document, Expression, Field, Type};
 use comline_core::schema::idl::module_docs::summary;
@@ -316,50 +316,14 @@ const LISTED: usize = 20;
 /// string, and for a last segment that names a declaration (`StringBounds`):
 /// that's the declaration's hover.
 fn module_hover<S: ProjectSource>(source: &str, uri: &Url, offset: usize, other_files: &[S]) -> Option<Hover> {
-    if in_comment_or_string(source, offset) {
-        return None;
-    }
-    let at = path_at(source, offset)?;
-    let keyword = statement_keyword(source, offset);
-    // A lone word is a path only in a `use` line (`use types`).
-    if !(at.continues || at.segments.len() > 1 || keyword.is_some()) || is_alias(source, at.range.0) {
-        return None;
-    }
-
-    let namespace = modules::resolve_path(&at.segments, keyword == Some("import"), uri)?;
     let project = Project::with_active(uri, source, other_files);
-
-    if !at.continues {
-        let (last, parent) = namespace.split_last()?;
-        let declared = modules::module(&project, parent)
-            .is_some_and(|parent| parent.declarations.iter().any(|d| d.name == *last));
-        if declared {
-            return None;
-        }
-    }
+    let (namespace, range) = modules::path_module_at(source, uri, offset, &project)?;
 
     let module = modules::module(&project, &namespace)?;
     Some(Hover {
         contents: HoverContents::Array(module_contents(&module)),
-        range: Some(byte_range_to_lsp_range(source, at.range.0, at.range.1)),
+        range: Some(byte_range_to_lsp_range(source, range.0, range.1)),
     })
-}
-
-/// `use` or `import` when the line `offset` is on starts with it.
-fn statement_keyword(source: &str, offset: usize) -> Option<&'static str> {
-    let line_start = source[..offset.min(source.len())].rfind('\n').map_or(0, |i| i + 1);
-    let line = source[line_start..].trim_start();
-    ["use", "import"]
-        .into_iter()
-        .find(|keyword| line.strip_prefix(keyword).is_some_and(|rest| rest.starts_with(char::is_whitespace)))
-}
-
-/// Whether the word starting at `start` is the alias in `... as Alias`.
-fn is_alias(source: &str, start: usize) -> bool {
-    source[..start]
-        .trim_end()
-        .strip_suffix("as")
-        .is_some_and(|before| before.ends_with(char::is_whitespace))
 }
 
 /// A module's hover: what it is, its docs, then what's in it.

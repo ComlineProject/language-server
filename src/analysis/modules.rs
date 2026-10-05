@@ -16,6 +16,7 @@ use lsp_types::Url;
 
 use crate::analysis::imports;
 use crate::analysis::project::{Project, ProjectDoc};
+use crate::util::{in_comment_or_string, path_at};
 
 /// What a path segment names.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,6 +200,56 @@ pub fn resolve_path(segments: &[String], legacy: bool, uri: &Url) -> Option<Vec<
 /// `self`, `parent` or `package`: a path prefix, not a module's name.
 pub fn is_relative_prefix(segment: &str) -> bool {
     vocabulary::keyword(segment).is_some_and(|k| k.kind == KeywordKind::PathPrefix)
+}
+
+/// The module namespace the path segment at `offset` names, plus its byte
+/// range, if `offset` is positioned somewhere a module name - not a bare
+/// declaration reference - can be written: inside a `use`/`import` line, or
+/// continuing with `::` either way. `None` otherwise, and also when the
+/// segment instead names a declaration in its parent module (the ordinary,
+/// symbol-based lookup handles that one). The one place this detection
+/// lives, so hover and go-to-definition can't disagree about which
+/// positions are "a module" versus "a declaration".
+pub fn path_module_at(source: &str, uri: &Url, offset: usize, project: &Project) -> Option<(Vec<String>, (usize, usize))> {
+    if in_comment_or_string(source, offset) {
+        return None;
+    }
+    let at = path_at(source, offset)?;
+    let keyword = statement_keyword(source, offset);
+    // A lone word is a path only in a `use` line (`use types`).
+    if !(at.continues || at.segments.len() > 1 || keyword.is_some()) || is_alias(source, at.range.0) {
+        return None;
+    }
+
+    let namespace = resolve_path(&at.segments, keyword == Some("import"), uri)?;
+
+    if !at.continues {
+        let (last, parent) = namespace.split_last()?;
+        let declared =
+            module(project, parent).is_some_and(|parent| parent.declarations.iter().any(|d| d.name == *last));
+        if declared {
+            return None;
+        }
+    }
+
+    Some((namespace, at.range))
+}
+
+/// `use` or `import` when the line `offset` is on starts with it.
+fn statement_keyword(source: &str, offset: usize) -> Option<&'static str> {
+    let line_start = source[..offset.min(source.len())].rfind('\n').map_or(0, |i| i + 1);
+    let line = source[line_start..].trim_start();
+    ["use", "import"]
+        .into_iter()
+        .find(|keyword| line.strip_prefix(keyword).is_some_and(|rest| rest.starts_with(char::is_whitespace)))
+}
+
+/// Whether the word starting at `start` is the alias in `... as Alias`.
+fn is_alias(source: &str, start: usize) -> bool {
+    source[..start]
+        .trim_end()
+        .strip_suffix("as")
+        .is_some_and(|before| before.ends_with(char::is_whitespace))
 }
 
 #[cfg(test)]
