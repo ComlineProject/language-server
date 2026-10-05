@@ -17,14 +17,18 @@ use crate::analysis::source::SourceFile;
 pub const NAME: &str = stdlib::NAMESPACE;
 
 /// Every std schema as a file under `root` (a directory URL, ending in `/`):
-/// `root/http.ids`, seen as `std::http`.
+/// `root/http.ids`, seen as `std::http`. And std's manifest, `root/config.idp`,
+/// whose `//!` header documents the package itself.
 pub fn files(root: &Url) -> Vec<SourceFile> {
-    stdlib::schemas()
-        .filter_map(|(namespace, source)| {
-            let uri = root.join(&format!("{}.ids", namespace[1..].join("/"))).ok()?;
-            Some(SourceFile::of_dependency(uri, source.to_string(), NAME, namespace))
-        })
-        .collect()
+    let schemas = stdlib::schemas().filter_map(|(namespace, source)| {
+        let uri = root.join(&format!("{}.ids", namespace[1..].join("/"))).ok()?;
+        Some(SourceFile::of_dependency(uri, source.to_string(), NAME, namespace))
+    });
+    let manifest = root
+        .join("config.idp")
+        .ok()
+        .map(|uri| SourceFile::of_dependency(uri, stdlib::manifest().to_string(), NAME, vec![NAME.to_string()]));
+    schemas.chain(manifest).collect()
 }
 
 /// The URL scheme std's files live under. They're never on disk: a client
@@ -72,6 +76,7 @@ mod tests {
         let named: Vec<(String, Vec<String>)> =
             files.iter().map(|f| (f.uri().to_string(), f.namespace().unwrap().to_vec())).collect();
         assert!(named.contains(&("comline-std:/http.ids".to_string(), vec!["std".to_string(), "http".to_string()])));
+        assert!(named.contains(&("comline-std:/config.idp".to_string(), vec!["std".to_string()])), "the package's manifest");
         assert!(files.iter().all(|f| f.dependency() == Some(NAME)));
     }
 

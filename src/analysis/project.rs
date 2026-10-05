@@ -3,10 +3,11 @@
 //! share: [`Project::resolve`]. References are then, by construction,
 //! exactly the places whose go-to-definition lands on the same declaration.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use comline_core::schema::idl::grammar::{Declaration, Document, Type};
+use comline_core::schema::idl::module_docs::module_docs;
 use lsp_types::{Location, Url};
 
 use crate::analysis::imports::{self, ProjectFile, ResolvedUse};
@@ -26,6 +27,8 @@ pub struct ProjectDoc<'a> {
     /// The dependency this file belongs to (see [`ProjectSource::dependency`]):
     /// read-only to the package being edited, and not part of it.
     pub dependency: Option<&'a str>,
+    /// The module's docs: the `//!` lines the file starts with.
+    pub docs: Option<String>,
 }
 
 /// Every schema that parses, in the order given. The order matters only for
@@ -43,6 +46,9 @@ pub struct Project<'a> {
     pub has_manifest: bool,
     /// What that `config.idp` declares.
     pub dependencies: Vec<DeclaredDependency>,
+    /// The docs of each dependency's package (std included), by the name it's
+    /// imported under: the `//!` lines its own `config.idp` starts with.
+    pub package_docs: BTreeMap<String, String>,
 }
 
 /// A declaration [`Project::resolve`] found: which file (an index into
@@ -95,16 +101,32 @@ impl<'a> Project<'a> {
             .map(|(uri, source, document)| ProjectDoc::new(uri, source, document, imports::namespace_of(uri), None))
             .collect();
 
-        Self { docs, unparsed: vec![], has_manifest: false, dependencies: vec![] }
+        Self { docs, unparsed: vec![], has_manifest: false, dependencies: vec![], package_docs: BTreeMap::new() }
     }
 
     fn build(inputs: impl Iterator<Item = Input<'a>>) -> Self {
-        let mut project = Self { docs: vec![], unparsed: vec![], has_manifest: false, dependencies: vec![] };
+        let mut project = Self {
+            docs: vec![],
+            unparsed: vec![],
+            has_manifest: false,
+            dependencies: vec![],
+            package_docs: BTreeMap::new(),
+        };
 
         for input in inputs {
             if source::is_manifest(input.uri) {
-                project.has_manifest = true;
-                project.dependencies = source::declared_dependencies(input.text);
+                match input.dependency {
+                    // A dependency's own manifest: what its package says about itself.
+                    Some(name) => {
+                        if let Some(docs) = module_docs(input.text) {
+                            project.package_docs.insert(name.to_string(), docs);
+                        }
+                    }
+                    None => {
+                        project.has_manifest = true;
+                        project.dependencies = source::declared_dependencies(input.text);
+                    }
+                }
                 continue;
             }
 
@@ -254,7 +276,8 @@ impl<'a> ProjectDoc<'a> {
     ) -> Self {
         let symbols = symbols::build_symbol_table(&document, uri, source);
         let imports = imports::resolved_imports(&document, &namespace);
-        Self { uri, source, document, symbols, imports, namespace, dependency }
+        let docs = module_docs(source);
+        Self { uri, source, document, symbols, imports, namespace, dependency, docs }
     }
 
     fn as_file(&self) -> ProjectFile<'a> {
