@@ -7,7 +7,7 @@ use crate::analysis::source::{self, ProjectSource};
 use crate::analysis::stdlib;
 use crate::analysis::symbols;
 use crate::parser;
-use crate::util::{byte_range_to_lsp_range, position_to_offset};
+use crate::util::{byte_range_to_lsp_range, in_comment_or_string, position_to_offset};
 use comline_core::schema::idl::annotations;
 use comline_core::schema::idl::grammar::{Declaration, Document, Expression, Field, Type};
 use comline_core::schema::idl::module_docs::summary;
@@ -40,6 +40,15 @@ pub fn get_hover_info_with_project<S: ProjectSource>(
 ) -> Option<Hover> {
     // Convert position to byte offset
     let offset = position_to_offset(source, position)?;
+
+    // Inside a `//` comment or a string literal, nothing here is Comline
+    // syntax — not an annotation key, not a symbol reference — regardless
+    // of what text happens to sit under the cursor (`//@settings = Test`
+    // must not hover as the `@settings` annotation). Same guard
+    // `completion.rs` and `modules::path_module_at` already use.
+    if in_comment_or_string(source, offset) {
+        return None;
+    }
 
     // A segment of a `::` path (`std`, `validators` in `use std::validators::X`):
     // the module it names. Only needs the text, so it works while the rest of
@@ -1069,6 +1078,18 @@ struct User {
         let text = hover_text(hover);
         assert!(text.contains("@custom_key"), "got: {text}");
         assert!(text.contains("open namespace"), "got: {text}");
+    }
+
+    #[test]
+    fn hover_on_an_annotation_key_inside_a_comment_shows_nothing() {
+        // `//@settings = Test` is a comment, not a real `@settings`
+        // annotation - must not come back as "not a recognised annotation"
+        // (or any hover at all).
+        let source = "//@settings = Test\nstruct Greeting {\n    test: bool\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let position = Position::new(0, 4);
+
+        assert!(get_hover_info(source, &uri, position).is_none());
     }
 
     #[test]
