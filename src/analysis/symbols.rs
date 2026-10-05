@@ -163,12 +163,69 @@ pub fn build_symbol_table(document: &Document, uri: &Url, source: &str) -> Symbo
                     },
                 );
             }
-            Declaration::Import(_)
-            | Declaration::Use(_)
-            | Declaration::Error(_)
-            | Declaration::Settings(_)
-            | Declaration::Validator(_) => {
-                // Not surfaced in the outline (for now)
+            Declaration::Error(e) => {
+                let name = e.name();
+                let children: Vec<String> = e.fields().iter().map(|f| f.name()).collect();
+                let range = declaration_name_range(source, declaration.span, "error", &name);
+
+                // `EVENT` is the closest LSP-standard fit: a named, raised/
+                // caught thing, same spirit as `TYPE_PARAMETER` standing in
+                // for a type alias above - LSP 3.17 has no dedicated
+                // "error"/"exception" kind.
+                table.insert(
+                    name.clone(),
+                    Symbol {
+                        name: name.clone(),
+                        kind: SymbolKind::EVENT,
+                        location: Location {
+                            uri: uri.clone(),
+                            range,
+                        },
+                        children,
+                    },
+                );
+            }
+            Declaration::Validator(v) => {
+                let name = v.name();
+                let children: Vec<String> = v.properties().iter().map(|p| p.name()).collect();
+                let range = declaration_name_range(source, declaration.span, "validator", &name);
+
+                // `FUNCTION`: a validator is referenced like one is called
+                // (`StringBounds(min=3, max=10)`), parameters and all.
+                table.insert(
+                    name.clone(),
+                    Symbol {
+                        name: name.clone(),
+                        kind: SymbolKind::FUNCTION,
+                        location: Location {
+                            uri: uri.clone(),
+                            range,
+                        },
+                        children,
+                    },
+                );
+            }
+            Declaration::Settings(s) => {
+                let name = s.name();
+                let children: Vec<String> = s.entries().iter().map(|e| e.key()).collect();
+                let range = declaration_name_range(source, declaration.span, "settings", &name);
+
+                // `OBJECT`: a named object of key/value entries.
+                table.insert(
+                    name.clone(),
+                    Symbol {
+                        name: name.clone(),
+                        kind: SymbolKind::OBJECT,
+                        location: Location {
+                            uri: uri.clone(),
+                            range,
+                        },
+                        children,
+                    },
+                );
+            }
+            Declaration::Import(_) | Declaration::Use(_) => {
+                // Not a declaration that can be referred to by name.
             }
         }
     }
