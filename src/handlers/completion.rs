@@ -103,7 +103,7 @@ pub fn get_completions_with_project<S: ProjectSource>(
             // already exists, so there is nothing useful to suggest.
         }
         CompletionContext::SettingsBody => {
-            completions.extend(get_settings_completions());
+            completions.extend(get_settings_completions(source, offset));
         }
         CompletionContext::Unknown => {
             // Context couldn't be narrowed down — offer the same broad
@@ -658,14 +658,17 @@ fn annotation_insert_text(key: &str) -> Option<&'static str> {
 
 /// `<name>` replaced with a snippet tab-stop, plus a trailing
 /// ` = <value>` tab-stop of its own — a completion inserts a whole,
-/// immediately-editable entry, not just the key.
-fn settings_insert_text(key_pattern: &str) -> String {
-    if key_pattern == "mode" {
+/// immediately-editable entry, not just the key. `segments` is already
+/// scoped to whatever's left to type (see [`matching_remaining`]) — asking
+/// at the very start of a block passes a catalog entry's full path, same
+/// as it always has.
+fn settings_insert_text(segments: &[&str]) -> String {
+    if segments == ["mode"] {
         return "mode = replace".to_string();
     }
     let mut n = 0;
     let mut out = String::new();
-    for segment in key_pattern.split('.') {
+    for &segment in segments {
         if !out.is_empty() {
             out.push('.');
         }
@@ -681,21 +684,83 @@ fn settings_insert_text(key_pattern: &str) -> String {
     out
 }
 
+/// The dotted settings-key path already typed immediately before the
+/// cursor — e.g. `["validators", ""]` right after `validators.`, or
+/// `["v"]` for a bare partial word with no dot yet. Scanned directly off
+/// `source` (not the comment/string-stripped text `determine_context`
+/// uses): by the time this runs, the caller has already confirmed the
+/// cursor isn't inside a comment or string. Always at least one (possibly
+/// empty) entry, so the caller never needs to special-case "nothing typed
+/// yet".
+fn settings_path_prefix(source: &str, offset: usize) -> Vec<String> {
+    let end = offset.min(source.len());
+    let start = source[..end]
+        .char_indices()
+        .rev()
+        .take_while(|&(_, c)| c.is_alphanumeric() || c == '_' || c == '.')
+        .last()
+        .map(|(i, _)| i)
+        .unwrap_or(end);
+    source[start..end].split('.').map(str::to_string).collect()
+}
+
+/// Whether `key_pattern` is still reachable given the key path already
+/// typed before the cursor (`typed`, from [`settings_path_prefix`]), and
+/// if so, the segments still left to offer. A `<name>` segment in the
+/// pattern matches any typed segment (names are user-chosen); every other
+/// segment must match the already-finished part of `typed` exactly, and
+/// prefix-match its in-progress last part. `typed == [""]` (nothing typed
+/// yet) always matches, returning the whole pattern unchanged.
+///
+/// This is what keeps completion scoped to the actual current context: once
+/// `validators.` is typed, `mode` and `annotations.<name>.allowed` no
+/// longer match (their first segment isn't `validators`), and what's
+/// offered for `validators.<name>.allowed` is just `<name>.allowed` — not
+/// the whole path again.
+fn matching_remaining<'a>(key_pattern: &'a str, typed: &[String]) -> Option<Vec<&'a str>> {
+    let pattern: Vec<&str> = key_pattern.split('.').collect();
+    let done = &typed[..typed.len() - 1];
+    let partial = typed.last().map(String::as_str).unwrap_or("");
+
+    if pattern.len() <= done.len() {
+        return None;
+    }
+    for (i, seg) in done.iter().enumerate() {
+        if pattern[i] != "<name>" && pattern[i] != seg {
+            return None;
+        }
+    }
+    let next = pattern[done.len()];
+    if next != "<name>" && !next.starts_with(partial) {
+        return None;
+    }
+    Some(pattern[done.len()..].to_vec())
+}
+
 /// Settings-entry completions inside a `settings { ... }` block (named or
 /// unnamed), sourced from [`comline_core::settings::catalog::block_summary`]
 /// — the same catalog [`hover`] reads for a settings entry's own tooltip,
-/// so the two can't describe one key two different ways.
-fn get_settings_completions() -> Vec<CompletionItem> {
+/// so the two can't describe one key two different ways. Scoped to the key
+/// path already typed before `offset` (see [`matching_remaining`]): a
+/// catalog entry that can't follow what's already there (wrong branch, or
+/// its next segment doesn't match what's partially typed) isn't offered at
+/// all, and the ones that are only show what's left to type, not the whole
+/// dotted path again.
+fn get_settings_completions(source: &str, offset: usize) -> Vec<CompletionItem> {
+    let typed = settings_path_prefix(source, offset);
     comline_core::settings::catalog::block_summary()
         .iter()
-        .map(|f| CompletionItem {
-            label: f.key_pattern.to_string(),
-            kind: Some(CompletionItemKind::PROPERTY),
-            detail: Some(f.summary.to_string()),
-            documentation: Some(lsp_types::Documentation::String(f.description.to_string())),
-            insert_text: Some(settings_insert_text(f.key_pattern)),
-            insert_text_format: Some(lsp_types::InsertTextFormat::SNIPPET),
-            ..Default::default()
+        .filter_map(|f| {
+            let remaining = matching_remaining(f.key_pattern, &typed)?;
+            Some(CompletionItem {
+                label: remaining.join("."),
+                kind: Some(CompletionItemKind::PROPERTY),
+                detail: Some(f.summary.to_string()),
+                documentation: Some(lsp_types::Documentation::String(f.description.to_string())),
+                insert_text: Some(settings_insert_text(&remaining)),
+                insert_text_format: Some(lsp_types::InsertTextFormat::SNIPPET),
+                ..Default::default()
+            })
         })
         .collect()
 }
@@ -918,6 +983,55 @@ mod tests {
 
         let completions = get_completions(source, &uri, position);
         assert!(completions.iter().any(|c| c.label == "annotations.<name>.allowed"), "{completions:?}");
+    }
+
+    #[test]
+    fn after_a_dot_only_the_remaining_segment_is_offered_not_the_whole_path_again() {
+        // The reported bug: typing `validators.` re-offered the whole
+        // `validators.<name>.allowed` / `validators.allowed` labels, plus
+        // entirely unrelated entries (`mode`, `annotations.<name>.allowed`)
+        // — because completion never looked at what was already typed.
+        // Accepting one of the old labels here would have printed
+        // `validators.` twice.
+        let source = "settings Test {\n    validators.";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let position = Position::new(1, 15);
+
+        let completions = get_completions(source, &uri, position);
+        let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+        assert!(labels.contains(&"<name>.allowed"), "{labels:?}");
+        assert!(labels.contains(&"allowed"), "{labels:?}");
+        assert!(!labels.contains(&"validators.<name>.allowed"), "{labels:?}");
+        assert!(!labels.contains(&"validators.allowed"), "{labels:?}");
+        assert!(!labels.contains(&"mode"), "{labels:?}");
+        assert!(!labels.iter().any(|l| l.starts_with("annotations")), "{labels:?}");
+    }
+
+    #[test]
+    fn a_partial_segment_after_a_dot_filters_by_its_own_prefix() {
+        // `al` could still become either the literal `allowed` (the coarse
+        // form) or the start of a validator's own name (`<name>.allowed`)
+        // — both stay candidates; unrelated catalog branches don't.
+        let source = "settings Test {\n    validators.al";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let position = Position::new(1, 17);
+
+        let completions = get_completions(source, &uri, position);
+        let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+        assert!(labels.contains(&"allowed"), "{labels:?}");
+        assert!(labels.contains(&"<name>.allowed"), "{labels:?}");
+        assert_eq!(labels.len(), 2, "{labels:?}");
+    }
+
+    #[test]
+    fn settings_insert_text_after_a_dot_only_fills_in_the_rest() {
+        let source = "settings Test {\n    validators.";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let position = Position::new(1, 15);
+
+        let completions = get_completions(source, &uri, position);
+        let allowed = completions.iter().find(|c| c.label == "allowed").expect("allowed should be offered");
+        assert_eq!(allowed.insert_text.as_deref(), Some("allowed = ${1:True}$0"));
     }
 
     #[test]
