@@ -121,6 +121,26 @@ pub fn declared_dependencies(manifest: &str) -> Vec<DeclaredDependency> {
     declared
 }
 
+/// The package-level `settings` dict `config.idp`'s text declares - read
+/// with core's own interpreter, so the editor and `comline build` agree
+/// on what's forbidden. Empty when the manifest doesn't parse (mid-edit),
+/// declares no `settings` key, or fails to interpret for any reason -
+/// never panics, never blocks the editor.
+pub fn declared_settings(manifest: &str) -> comline_core::settings::SettingsDict {
+    use comline_core::package::config::ir::context::ProjectContext;
+    use comline_core::package::config::ir::frozen;
+    use comline_core::package::config::ir::interpreter::interpret::interpret_context;
+
+    let Some(congregation) = parser::parse_idp(manifest).ok().and_then(|r| r.document) else {
+        return Default::default();
+    };
+    let context = ProjectContext::with_config(congregation);
+    let Ok(units) = interpret_context(&context) else {
+        return Default::default();
+    };
+    frozen::settings(&units).cloned().unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,5 +168,30 @@ mod tests {
     fn a_manifest_mid_edit_declares_nothing() {
         assert!(declared_dependencies("congregation app\ndependencies = {").is_empty());
         assert!(declared_dependencies("congregation app\nspecification_version = 1\n").is_empty());
+    }
+
+    #[test]
+    fn declared_settings_reads_a_well_formed_dict() {
+        use comline_core::settings::value::SettingsValue;
+
+        let manifest = "congregation app\nspecification_version = 1\n\
+            settings = {\n    validators = {\n        allowed = false\n    }\n}\n";
+
+        let settings = declared_settings(manifest);
+        let SettingsValue::Dict(validators) = settings.get("validators").unwrap() else {
+            panic!("expected a dict at 'validators'");
+        };
+        assert_eq!(validators.get("allowed"), Some(&SettingsValue::Bool(false)));
+    }
+
+    #[test]
+    fn declared_settings_is_empty_with_no_settings_key() {
+        let manifest = "congregation app\nspecification_version = 1\n";
+        assert!(declared_settings(manifest).is_empty());
+    }
+
+    #[test]
+    fn declared_settings_is_empty_mid_edit() {
+        assert!(declared_settings("congregation app\nsettings = {").is_empty());
     }
 }

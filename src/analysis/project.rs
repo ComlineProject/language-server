@@ -49,6 +49,10 @@ pub struct Project<'a> {
     /// The docs of each dependency's package (std included), by the name it's
     /// imported under: the `//!` lines its own `config.idp` starts with.
     pub package_docs: BTreeMap<String, String>,
+    /// The package-level `settings` dict that `config.idp` declares - empty
+    /// when there's no manifest, or it has no `settings` key. Checked by
+    /// settings enforcement alongside each schema's own effective settings.
+    pub settings: comline_core::settings::SettingsDict,
 }
 
 /// A declaration [`Project::resolve`] found: which file (an index into
@@ -101,7 +105,10 @@ impl<'a> Project<'a> {
             .map(|(uri, source, document)| ProjectDoc::new(uri, source, document, imports::namespace_of(uri), None))
             .collect();
 
-        Self { docs, unparsed: vec![], has_manifest: false, dependencies: vec![], package_docs: BTreeMap::new() }
+        Self {
+            docs, unparsed: vec![], has_manifest: false, dependencies: vec![],
+            package_docs: BTreeMap::new(), settings: Default::default(),
+        }
     }
 
     fn build(inputs: impl Iterator<Item = Input<'a>>) -> Self {
@@ -111,6 +118,7 @@ impl<'a> Project<'a> {
             has_manifest: false,
             dependencies: vec![],
             package_docs: BTreeMap::new(),
+            settings: Default::default(),
         };
 
         for input in inputs {
@@ -125,6 +133,7 @@ impl<'a> Project<'a> {
                     None => {
                         project.has_manifest = true;
                         project.dependencies = source::declared_dependencies(input.text);
+                        project.settings = source::declared_settings(input.text);
                     }
                 }
                 continue;
