@@ -206,7 +206,9 @@ pub fn build_symbol_table(document: &Document, uri: &Url, source: &str) -> Symbo
                 );
             }
             Declaration::Settings(s) => {
-                let name = s.name();
+                // An unnamed settings block applies implicitly to its own
+                // file - not a named symbol for the outline/go-to-symbol.
+                let Some(name) = s.name() else { continue };
                 let children: Vec<String> = s.entries().iter().map(|e| e.key()).collect();
                 let range = declaration_name_range(source, declaration.span, "settings", &name);
 

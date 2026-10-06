@@ -174,7 +174,9 @@ pub fn declarations(doc: &ProjectDoc) -> Vec<Declared> {
                 Declaration::TypeAlias(t) => (DeclKind::Type, t.name(), t.docstring()),
                 Declaration::Error(e) => (DeclKind::Error, e.name(), e.docstring()),
                 Declaration::Validator(v) => (DeclKind::Validator, v.name(), v.docstring()),
-                Declaration::Settings(s) => (DeclKind::Settings, s.name(), s.docstring()),
+                // An unnamed settings block applies implicitly to its own
+                // file and isn't a named, importable declaration.
+                Declaration::Settings(s) => (DeclKind::Settings, s.name()?, s.docstring()),
                 Declaration::Use(_) | Declaration::Import(_) => return None,
             };
             Some(Declared { kind, name, docs })

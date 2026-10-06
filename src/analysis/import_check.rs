@@ -367,7 +367,9 @@ fn importable_names(doc: &ProjectDoc) -> BTreeSet<String> {
     names.extend(doc.document.0.iter().filter_map(|decl| match &decl.value {
         Declaration::Error(e) => Some(e.name.text.clone()),
         Declaration::Validator(v) => Some(v.name.text.clone()),
-        Declaration::Settings(s) => Some(s.name.text.clone()),
+        // An unnamed settings block applies implicitly to its own file
+        // and isn't importable by name.
+        Declaration::Settings(s) => s.name.as_ref().map(|n| n.text.clone()),
         _ => None,
     }));
     names

@@ -916,7 +916,7 @@ fn find_validator_declaration<'a>(document: &'a comline_core::schema::idl::gramm
 fn find_settings_declaration<'a>(document: &'a comline_core::schema::idl::grammar::Document, name: &str) -> Option<&'a comline_core::schema::idl::grammar::Settings> {
     for decl in &document.0 {
         if let Declaration::Settings(s) = &**decl {
-            if s.name() == name {
+            if s.name().as_deref() == Some(name) {
                 return Some(s);
             }
         }
