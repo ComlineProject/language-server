@@ -102,6 +102,9 @@ pub fn get_completions_with_project<S: ProjectSource>(
             // an arbitrary new name, not a reference to anything that
             // already exists, so there is nothing useful to suggest.
         }
+        CompletionContext::SettingsBody => {
+            completions.extend(get_settings_completions());
+        }
         CompletionContext::Unknown => {
             // Context couldn't be narrowed down — offer the same broad
             // mix completion has always fallen back to, rather than
@@ -415,12 +418,12 @@ fn determine_context(source: &str, offset: usize) -> CompletionContext {
                 return CompletionContext::AnnotationKey(AnnotationScope::Function)
             }
             None => return CompletionContext::AnnotationKey(AnnotationScope::Leading),
-            // An enum variant or some other block don't take annotations —
-            // fall through to the same handling `enclosing_block` gives
-            // any other token there (nothing for an enum, the broad
-            // fallback otherwise), rather than inventing a separate rule
-            // just for a stray `@`.
-            Some(EnclosingBlock::Enum) | Some(EnclosingBlock::Other) => {}
+            // An enum variant, a settings entry, or some other block don't
+            // take annotations — fall through to the same handling
+            // `enclosing_block` gives any other token there (nothing for
+            // an enum, the broad fallback otherwise), rather than
+            // inventing a separate rule just for a stray `@`.
+            Some(EnclosingBlock::Enum) | Some(EnclosingBlock::Settings) | Some(EnclosingBlock::Other) => {}
         }
     }
 
@@ -446,6 +449,7 @@ fn determine_context(source: &str, offset: usize) -> CompletionContext {
         // An enum variant, like a declaration's own name, is an arbitrary
         // new identifier — nothing to suggest.
         Some(EnclosingBlock::Enum) => CompletionContext::DeclarationName,
+        Some(EnclosingBlock::Settings) => CompletionContext::SettingsBody,
         Some(EnclosingBlock::Other) => CompletionContext::Unknown,
         None => CompletionContext::TopLevel,
     }
@@ -474,6 +478,7 @@ enum EnclosingBlock {
     Struct,
     Protocol,
     Enum,
+    Settings,
     Other,
 }
 
@@ -495,11 +500,16 @@ fn enclosing_block(toks: &[(Tok, usize)]) -> Option<EnclosingBlock> {
                 }
                 // Found the innermost unclosed `{`. Walk back past the
                 // block's own name (one Word, if present) to the
-                // declaration keyword that introduced it.
+                // declaration keyword that introduced it - unless that
+                // Word is itself `settings` (the one keyword here whose
+                // name is optional: an unnamed `settings { ... }` has
+                // nothing between the keyword and `{` to skip past).
                 let mut j = i;
                 if j > 0 {
-                    if let Tok::Word(_) = toks[j - 1].0 {
-                        j -= 1;
+                    if let Tok::Word(w) = toks[j - 1].0 {
+                        if w != "settings" {
+                            j -= 1;
+                        }
                     }
                 }
                 let kw = (j > 0).then(|| toks[j - 1].0).and_then(|t| match t {
@@ -510,6 +520,7 @@ fn enclosing_block(toks: &[(Tok, usize)]) -> Option<EnclosingBlock> {
                     Some("struct") | Some("error") => EnclosingBlock::Struct,
                     Some("protocol") => EnclosingBlock::Protocol,
                     Some("enum") => EnclosingBlock::Enum,
+                    Some("settings") => EnclosingBlock::Settings,
                     _ => EnclosingBlock::Other,
                 });
             }
@@ -645,6 +656,50 @@ fn annotation_insert_text(key: &str) -> Option<&'static str> {
     }
 }
 
+/// `<name>` replaced with a snippet tab-stop, plus a trailing
+/// ` = <value>` tab-stop of its own — a completion inserts a whole,
+/// immediately-editable entry, not just the key.
+fn settings_insert_text(key_pattern: &str) -> String {
+    if key_pattern == "mode" {
+        return "mode = replace".to_string();
+    }
+    let mut n = 0;
+    let mut out = String::new();
+    for segment in key_pattern.split('.') {
+        if !out.is_empty() {
+            out.push('.');
+        }
+        if segment == "<name>" {
+            n += 1;
+            out.push_str(&format!("${{{n}:name}}"));
+        } else {
+            out.push_str(segment);
+        }
+    }
+    n += 1;
+    out.push_str(&format!(" = ${{{n}:True}}$0"));
+    out
+}
+
+/// Settings-entry completions inside a `settings { ... }` block (named or
+/// unnamed), sourced from [`comline_core::settings::catalog::block_summary`]
+/// — the same catalog [`hover`] reads for a settings entry's own tooltip,
+/// so the two can't describe one key two different ways.
+fn get_settings_completions() -> Vec<CompletionItem> {
+    comline_core::settings::catalog::block_summary()
+        .iter()
+        .map(|f| CompletionItem {
+            label: f.key_pattern.to_string(),
+            kind: Some(CompletionItemKind::PROPERTY),
+            detail: Some(f.summary.to_string()),
+            documentation: Some(lsp_types::Documentation::String(f.description.to_string())),
+            insert_text: Some(settings_insert_text(f.key_pattern)),
+            insert_text_format: Some(lsp_types::InsertTextFormat::SNIPPET),
+            ..Default::default()
+        })
+        .collect()
+}
+
 /// Annotation-key completions for `scope`, sourced from
 /// [`annotations::KNOWN_ANNOTATIONS`] — the same table [`hover`] reads for
 /// an annotation key's own tooltip, so the two can't describe one key two
@@ -684,6 +739,9 @@ enum CompletionContext {
     /// Typing an arbitrary new name: right after a declaration keyword, or
     /// an enum variant. Nothing to suggest.
     DeclarationName,
+    /// Inside a `settings { ... }` block (named or unnamed), before an
+    /// entry's dotted key.
+    SettingsBody,
     /// Context couldn't be narrowed down.
     Unknown,
 }
@@ -826,6 +884,54 @@ mod tests {
         let position = Position::new(2, 5);
 
         assert!(get_completions(source, &uri, position).is_empty());
+    }
+
+    #[test]
+    fn named_settings_body_offers_catalog_keys_not_global_keywords() {
+        // Direct regression guard: before `EnclosingBlock::Settings`
+        // existed, a named block fell through to `CompletionContext::Unknown`
+        // (the "walk back past the block's own name" logic skipped past
+        // "Test" expecting one more Word behind it, found none matching
+        // any known keyword) and offered the same broad keyword/type mix
+        // as anywhere else - "validator" (a declaration keyword) showed up
+        // for a bare "v".
+        let source = "settings Test {\n    v";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let position = Position::new(1, 5);
+
+        let completions = get_completions(source, &uri, position);
+        assert!(completions.iter().any(|c| c.label == "validators.<name>.allowed"), "{completions:?}");
+        assert!(completions.iter().any(|c| c.label == "validators.allowed"), "{completions:?}");
+        assert!(!completions.iter().any(|c| c.label == "validator"), "{completions:?}");
+        assert!(!completions.iter().any(|c| c.label == "struct"), "{completions:?}");
+    }
+
+    #[test]
+    fn unnamed_settings_body_offers_catalog_keys() {
+        // The unnamed case needed its own fix: the "skip the block's own
+        // name" step would otherwise skip past `settings` itself (the
+        // only Word between the keyword and `{` when there's no name),
+        // landing one token too far back.
+        let source = "settings {\n    an";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let position = Position::new(1, 6);
+
+        let completions = get_completions(source, &uri, position);
+        assert!(completions.iter().any(|c| c.label == "annotations.<name>.allowed"), "{completions:?}");
+    }
+
+    #[test]
+    fn settings_completions_are_sourced_from_the_catalog_as_snippets() {
+        let source = "settings {\n    m";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let position = Position::new(1, 5);
+
+        let completions = get_completions(source, &uri, position);
+        let mode = completions.iter().find(|c| c.label == "mode").expect("mode should be offered");
+        assert_eq!(mode.insert_text.as_deref(), Some("mode = replace"));
+        assert_eq!(mode.insert_text_format, Some(lsp_types::InsertTextFormat::SNIPPET));
+        assert_eq!(mode.kind, Some(CompletionItemKind::PROPERTY));
+        assert!(mode.detail.is_some());
     }
 
     #[test]
