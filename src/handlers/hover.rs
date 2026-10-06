@@ -630,7 +630,7 @@ fn create_settings_block_hover(settings: &Settings) -> Hover {
     }
 
     let catalog_lines: Vec<String> =
-        catalog::block_summary().iter().map(|f| format!("- `{}`", f.summary)).collect();
+        catalog::block_summary().iter().map(|f| format!("- `{}` - {}", f.key_pattern, f.summary)).collect();
     contents.push(MarkedString::from_markdown(format!("**recognized keys**\n{}", catalog_lines.join("\n"))));
 
     contents.push(MarkedString::from_markdown(format!("*{} settings*", settings.entries().len())));

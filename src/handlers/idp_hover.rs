@@ -103,7 +103,7 @@ fn entry_hover(path: &[String], value: &Value) -> Hover {
 fn group_hover(path: &[String]) -> Hover {
     let signature = path.join(".");
     let catalog_lines: Vec<String> =
-        catalog::block_summary().iter().map(|f| format!("- `{}`", f.summary)).collect();
+        catalog::block_summary().iter().map(|f| format!("- `{}` - {}", f.key_pattern, f.summary)).collect();
 
     let contents = vec![
         MarkedString::from_language_code("comline".to_string(), signature),
