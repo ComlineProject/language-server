@@ -6,9 +6,11 @@ use crate::analysis::project::Project;
 use crate::util::byte_range_to_lsp_range;
 use comline_core::schema::idl::grammar::Document;
 use comline_core::schema::ir::compiler::interpreter::incremental::IncrementalInterpreter;
+use comline_core::schema::ir::compiler::settings::enforcement::check_settings_enforcement;
 use comline_core::schema::ir::compiler::Compile;
 use comline_core::schema::ir::frozen::unit::FrozenUnit;
 use comline_core::schema::ir::validation;
+use comline_core::settings::SettingsDict;
 use lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Url};
 
 /// The `code` of a missing-import diagnostic - what the quick fix in
@@ -26,19 +28,29 @@ pub const UNVERIFIED_IMPORT: &str = "unverified-import";
 /// references, duplicate declarations, and the like: the same checks
 /// `comline build` runs. Call only on a document that parsed cleanly.
 pub fn validation_diagnostics(source: &str, document: &Document) -> Vec<Diagnostic> {
-    validation_diagnostics_with(source, document, vec![])
+    validation_diagnostics_with(source, document, vec![], &SettingsDict::default())
 }
 
 /// [`validation_diagnostics`], with `extra` imports appended to the file's
 /// own units first - the ones core can't see from this file alone (see
-/// `analysis::import_check`).
-fn validation_diagnostics_with(source: &str, document: &Document, extra: Vec<FrozenUnit>) -> Vec<Diagnostic> {
+/// `analysis::import_check`) - and `package_settings`, the package-level
+/// settings dict (empty when there's no manifest in view) checked
+/// alongside core's own validation.
+fn validation_diagnostics_with(
+    source: &str,
+    document: &Document,
+    extra: Vec<FrozenUnit>,
+    package_settings: &SettingsDict,
+) -> Vec<Diagnostic> {
     let mut units = IncrementalInterpreter::from_declarations(document.0.clone());
     units.extend(extra);
-    let errors = match validation::validate(&units) {
-        Ok(()) => return vec![],
-        Err(errors) => errors,
-    };
+
+    let mut errors = validation::validate(&units).err().unwrap_or_default();
+    errors.extend(check_settings_enforcement(&units, package_settings).err().unwrap_or_default());
+
+    if errors.is_empty() {
+        return vec![];
+    }
 
     errors
         .into_iter()
@@ -98,7 +110,8 @@ pub fn project_diagnostics(project: &Project, doc: usize) -> Vec<Diagnostic> {
     let here = &project.docs[doc];
     let check = import_check::check(project, doc);
 
-    let mut diagnostics = validation_diagnostics_with(here.source, &here.document, check.scope);
+    let mut diagnostics =
+        validation_diagnostics_with(here.source, &here.document, check.scope, &project.settings);
     diagnostics.extend(check.missing.iter().map(|m| missing_import_diagnostic(here.source, m)));
     diagnostics.extend(check.unresolved.iter().map(|u| unresolved_import_diagnostic(here.source, u)));
     diagnostics.extend(check.unverified.iter().map(|u| unverified_import_diagnostic(here.source, u)));
@@ -481,5 +494,45 @@ struct User {
         let found = project_messages(&[("file:///pkg/src/chat.ids", chat), TYPES]);
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].0, "`Message` is imported here as `Msg` — write `Msg`, or add `use types::Message`");
+    }
+
+    const MANIFEST_URI: &str = "file:///pkg/config.idp";
+
+    #[test]
+    fn a_package_forbidden_annotation_surfaces_as_a_live_diagnostic() {
+        // `.idp` has no dotted-key sugar (that's `.ids`-only) - a nested
+        // key needs real nested braces here.
+        let manifest = "congregation pkg\nspecification_version = 1\n\
+            settings = {\n    protocol = {\n        annotations = {\n            \
+            framing = {\n                allowed = false\n            }\n        }\n    }\n}\n";
+        let chat = "@framing = \"jsonrpc\"\nprotocol Chat {\n    function ping() -> str;\n}\n";
+
+        let found = project_messages(&[(MANIFEST_URI, manifest), ("file:///pkg/src/chat.ids", chat)]);
+        assert!(
+            found.iter().any(|(msg, ..)| msg.contains("framing")),
+            "expected a forbidden-annotation diagnostic, got {found:?}"
+        );
+    }
+
+    #[test]
+    fn editing_the_manifest_to_allow_it_clears_the_diagnostic() {
+        let manifest = "congregation pkg\nspecification_version = 1\n\
+            settings = {\n    protocol = {\n        annotations = {\n            \
+            framing = {\n                allowed = true\n            }\n        }\n    }\n}\n";
+        let chat = "@framing = \"jsonrpc\"\nprotocol Chat {\n    function ping() -> str;\n}\n";
+
+        let found = project_messages(&[(MANIFEST_URI, manifest), ("file:///pkg/src/chat.ids", chat)]);
+        assert!(
+            !found.iter().any(|(msg, ..)| msg.contains("framing")),
+            "expected no forbidden-annotation diagnostic once the manifest allows it, got {found:?}"
+        );
+    }
+
+    #[test]
+    fn no_manifest_means_no_package_settings_to_enforce() {
+        // Mirrors `all_diagnostics`'s "project of one" path - no config.idp
+        // in view, so nothing can forbid anything.
+        let found = project_messages(&[("file:///pkg/src/chat.ids", TYPES.1)]);
+        assert!(found.is_empty(), "{found:?}");
     }
 }
