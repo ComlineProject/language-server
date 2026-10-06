@@ -9,7 +9,13 @@ use crate::analysis::symbols;
 use crate::parser;
 use crate::util::{byte_range_to_lsp_range, in_comment_or_string, position_to_offset};
 use comline_core::schema::idl::annotations;
-use comline_core::schema::idl::grammar::{Declaration, Document, Expression, Field, Type};
+use comline_core::schema::idl::grammar::{Declaration, Document, Expression, Field, Settings, Type};
+use comline_core::schema::ir::compiler::interpreter::incremental::IncrementalInterpreter;
+use comline_core::schema::ir::compiler::Compile;
+use comline_core::settings::catalog;
+use comline_core::settings::effective::{
+    effective_declaration_settings, effective_schema_settings, schema_settings,
+};
 use comline_core::schema::idl::module_docs::summary;
 use comline_core::schema::idl::size::{self, SizeLookup, SizeTarget, WireSize};
 use comline_core::schema::idl::vocabulary;
@@ -77,6 +83,16 @@ pub fn get_hover_info_with_project<S: ProjectSource>(
             Some(info) => create_annotation_hover(info),
             None => create_unknown_annotation_hover(&word),
         });
+    }
+
+    // Cursor is literally inside a `settings { ... }` block's own text
+    // (named or unnamed) — checked directly by span, not through the
+    // symbol table (which only tracks *named* settings blocks, since an
+    // unnamed one has no name to be a symbol under — see `symbols.rs`).
+    // This only needs `other_files` directly (for the manifest's package-
+    // level settings), not any parsed sibling `Document`.
+    if let Some(settings) = settings_block_at(&document, offset) {
+        return Some(create_settings_hover(settings, offset, &document, other_files));
     }
 
     // Parse every sibling file once, up front, and keep them all alive for
@@ -564,6 +580,107 @@ fn create_symbol_hover(symbol: &symbols::Symbol, document: &Document, lookup: &H
         contents: HoverContents::Array(contents),
         range: None,
     }
+}
+
+/// Find the `settings { ... }` (or `settings Name { ... }`) declaration
+/// whose own span contains `offset`, by position rather than by name — the
+/// symbol table only tracks *named* blocks (see `symbols.rs`), so this is
+/// the only way to reach an unnamed one at all.
+fn settings_block_at(document: &Document, offset: usize) -> Option<&Settings> {
+    document.0.iter().find_map(|decl| {
+        let (start, end) = decl.span;
+        if offset >= start && offset < end {
+            if let Declaration::Settings(s) = &**decl {
+                return Some(s);
+            }
+        }
+        None
+    })
+}
+
+/// Hover for a `settings` block the cursor is literally inside of —
+/// dispatches to entry-level (cursor on one specific `key = value` line)
+/// or block-level (cursor on the `settings` keyword, the block's name, or
+/// anywhere else in the block that isn't one specific entry).
+fn create_settings_hover<S: ProjectSource>(
+    settings: &Settings,
+    offset: usize,
+    document: &Document,
+    other_files: &[S],
+) -> Hover {
+    match settings.entries().iter().find(|e| offset >= e.span.0 && offset < e.span.1) {
+        Some(entry) => create_settings_entry_hover(settings, entry, document, other_files),
+        None => create_settings_block_hover(settings),
+    }
+}
+
+/// Block-level: the same raw signature/entries rendering the symbol-table
+/// path already built for named blocks (`SymbolKind::OBJECT`,
+/// `find_settings_declaration`) — now also reachable for unnamed ones —
+/// plus a "what's recognized here" catalog listing.
+fn create_settings_block_hover(settings: &Settings) -> Hover {
+    let entries: Vec<String> =
+        settings.entries().iter().map(|e| format!("  {} = {}", e.key(), e.value_string())).collect();
+    let label = settings.name().unwrap_or_default();
+    let signature = format!("settings {}{{\n{}\n}}", if label.is_empty() { String::new() } else { format!("{label} ") }, entries.join("\n"));
+
+    let mut contents = vec![MarkedString::from_language_code("comline".to_string(), signature)];
+    if let Some(doc) = settings.docstring() {
+        contents.push(MarkedString::from_markdown(doc));
+    }
+
+    let catalog_lines: Vec<String> =
+        catalog::block_summary().iter().map(|f| format!("- `{}`", f.summary)).collect();
+    contents.push(MarkedString::from_markdown(format!("**recognized keys**\n{}", catalog_lines.join("\n"))));
+
+    contents.push(MarkedString::from_markdown(format!("*{} settings*", settings.entries().len())));
+
+    Hover { contents: HoverContents::Array(contents), range: None }
+}
+
+/// Entry-level: the raw as-written `key = value` (unchanged content), a
+/// catalog match for what this key actually controls (if it matches a
+/// shape `settings::enforcement` recognizes), and the resolved effective
+/// value after package+schema(+preset) layering — not just the raw one.
+fn create_settings_entry_hover<S: ProjectSource>(
+    settings: &Settings,
+    entry: &rust_sitter::Spanned<comline_core::schema::idl::grammar::Setting>,
+    document: &Document,
+    other_files: &[S],
+) -> Hover {
+    let key = entry.key();
+    let mut contents = vec![MarkedString::from_language_code(
+        "comline".to_string(),
+        format!("{} = {}", key, entry.value_string()),
+    )];
+
+    let key_path = entry.key_path();
+    let segments: Vec<&str> = key_path.iter().map(String::as_str).collect();
+    if let Some(m) = catalog::match_path(&segments) {
+        contents.push(MarkedString::from_markdown(catalog::doc_for(&m).description.to_string()));
+    }
+
+    let package_settings = other_files
+        .iter()
+        .find(|f| source::is_manifest(f.uri()))
+        .map(|f| source::declared_settings(f.text()))
+        .unwrap_or_default();
+    let schema_units = IncrementalInterpreter::from_declarations(document.0.clone());
+    let schema = schema_settings(&schema_units);
+    let schema_effective = effective_schema_settings(&package_settings, &schema);
+    let effective = effective_declaration_settings(&schema_effective, &schema, settings.name().as_deref());
+
+    let effective_line = match effective.get_path(&key) {
+        Some(value) => format!("effective: `{value:?}`"),
+        None => "effective: not set — allowed by default".to_string(),
+    };
+    let effective_line = match settings.name() {
+        Some(name) => format!("{effective_line} (applies to declarations using `@settings = {name}`)"),
+        None => effective_line,
+    };
+    contents.push(MarkedString::from_markdown(effective_line));
+
+    Hover { contents: HoverContents::Array(contents), range: None }
 }
 
 /// Create hover for a type reference
@@ -1676,6 +1793,80 @@ protocol Chat {
         let text = hover_text(hover);
         assert!(text.contains("settings AAA"), "got: {text}");
         assert!(text.contains("k = True"), "got: {text}");
+    }
+
+    #[test]
+    fn hover_on_an_unnamed_settings_block_shows_its_entries() {
+        // Direct regression guard: an unnamed block has no name to be a
+        // symbol under, so the old symbol-table-only path returned no
+        // hover at all here.
+        let source = "settings {\n    k = True\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let offset = source.find("settings").unwrap();
+        let position = crate::util::offset_to_position(source, offset);
+
+        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let text = hover_text(hover);
+        assert!(text.contains("k = True"), "got: {text}");
+        assert!(text.contains("recognized keys"), "got: {text}");
+    }
+
+    #[test]
+    fn hover_on_a_settings_entry_shows_the_catalog_doc_and_its_raw_value() {
+        let source = "settings {\n    validators.allowed = False\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let offset = source.find("allowed").unwrap();
+        let position = crate::util::offset_to_position(source, offset);
+
+        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let text = hover_text(hover);
+        assert!(text.contains("validators.allowed = False"), "got: {text}");
+        assert!(text.contains("permitted"), "got: {text}");
+        assert!(text.contains("effective"), "got: {text}");
+    }
+
+    #[test]
+    fn hover_on_a_settings_entry_with_no_catalog_match_only_shows_raw_and_effective() {
+        // A key that doesn't match any shape `settings::enforcement`
+        // recognizes still gets raw + effective, just no catalog doc —
+        // the catalog section should be conditional, not always-on noise.
+        let source = "settings {\n    timeout_ms = 500\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let offset = source.find("timeout_ms").unwrap();
+        let position = crate::util::offset_to_position(source, offset);
+
+        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let text = hover_text(hover);
+        assert!(text.contains("timeout_ms = 500"), "got: {text}");
+        assert!(text.contains("effective"), "got: {text}");
+        assert!(!text.contains("permitted"), "got: {text}");
+    }
+
+    #[test]
+    fn hover_on_a_named_preset_entry_notes_which_settings_name_it_applies_to() {
+        // Also exercises the cross-file manifest-sibling wiring end to end
+        // (parses a real `.idp`, extracts its settings) rather than just
+        // defaulting to empty — a regression guard for that plumbing, even
+        // though the preset's own written value always wins at its own
+        // key regardless of what the package says (last-write-wins merge).
+        let source = "settings Strict {\n    validators.StringBounds.allowed = False\n}\n";
+        let manifest = "congregation acme\nspecification_version = 1\nsettings = {\n    annotations = {\n        framing = {\n            allowed = true\n        }\n    }\n}\n";
+        let schema_uri = Url::parse("file:///test.ids").unwrap();
+        let manifest_uri = Url::parse("file:///config.idp").unwrap();
+
+        let offset = source.find("allowed").unwrap();
+        let position = crate::util::offset_to_position(source, offset);
+
+        let hover = get_hover_info_with_project(
+            source,
+            &schema_uri,
+            position,
+            &[(manifest_uri, manifest.to_string())],
+        );
+        let hover = hover.expect("hover should resolve");
+        let text = hover_text(hover);
+        assert!(text.contains("validators.StringBounds.allowed = False"), "got: {text}");
+        assert!(text.contains("@settings = Strict"), "got: {text}");
     }
 
     #[test]

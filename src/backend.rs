@@ -408,7 +408,16 @@ impl LanguageServer for Backend {
         let position = params.text_document_position_params.position;
 
         if is_idp(&uri) {
-            return Ok(None); // handled client-side — see idpSchema.ts
+            let document = match self.documents.get(&uri) {
+                Some(doc) => doc,
+                None => return Ok(None),
+            };
+            // `None` (cursor isn't inside a `settings` block) falls
+            // through to VS Code's own idpSchema.ts-backed client
+            // provider — an independent registration, merged by VS Code
+            // with whatever the server returns, not middleware.
+            use crate::handlers::idp_hover;
+            return Ok(idp_hover::get_idp_hover_info(&document.text, position));
         }
 
         tracing::debug!("Hover request for {} at {:?}", uri, position);
