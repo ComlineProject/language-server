@@ -22,7 +22,7 @@ impl ParseResult {
 
 /// Parse Comline schema source code
 pub fn parse(source: &str) -> Result<ParseResult> {
-    tracing::debug!("Parsing {} bytes of source", source.len());
+    tracing::debug!("Parsing {} byte(s) of source", source.len());
 
     match grammar::parse(source) {
         Ok(document) => {
@@ -62,7 +62,7 @@ impl IdpParseResult {
 
 /// Parse `.idp` package/congregation config source code.
 pub fn parse_idp(source: &str) -> Result<IdpParseResult> {
-    tracing::debug!("Parsing {} bytes of .idp source", source.len());
+    tracing::debug!("Parsing {} byte(s) of .idp source", source.len());
 
     match idp_grammar::parse(source) {
         Ok(congregation) => {

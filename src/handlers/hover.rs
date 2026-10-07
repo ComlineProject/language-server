@@ -6,6 +6,7 @@ use crate::analysis::project::Project;
 use crate::analysis::source::{self, ProjectSource};
 use crate::analysis::stdlib;
 use crate::analysis::symbols;
+use crate::handlers::annotation_hover::AnnotationHover;
 use crate::parser;
 use crate::util::{byte_range_to_lsp_range, in_comment_or_string, position_to_offset};
 use comline_core::schema::idl::annotations;
@@ -286,7 +287,7 @@ fn fully_resolve_alias_chain(
 fn format_wire_size(size: WireSize) -> String {
     match size {
         WireSize::Fixed(bytes) => {
-            format!("wire size (fixed, raw-packed estimate): {bytes} bytes ({} bits)", bytes * 8)
+            format!("wire size (fixed, raw-packed estimate): {} ({} bits)", byte_count(bytes), bytes * 8)
         }
         WireSize::Variable => "wire size: variable".to_string(),
         WireSize::Unknown => "wire size: unknown".to_string(),
@@ -298,9 +299,19 @@ fn format_wire_size(size: WireSize) -> String {
 /// field's own hover.
 fn render_size_oneline(size: WireSize) -> String {
     match size {
-        WireSize::Fixed(bytes) => format!("{bytes} bytes"),
+        WireSize::Fixed(bytes) => byte_count(bytes),
         WireSize::Variable => "variable".to_string(),
         WireSize::Unknown => "unknown".to_string(),
+    }
+}
+
+/// "1 byte" / "N bytes" — 0 reads as plural ("0 bytes"), same as English
+/// normally treats a zero count.
+fn byte_count(bytes: u32) -> String {
+    if bytes == 1 {
+        "1 byte".to_string()
+    } else {
+        format!("{bytes} bytes")
     }
 }
 
@@ -716,26 +727,17 @@ fn is_annotation_key(source: &str, offset: usize) -> bool {
 /// same table `completion` reads for the key's suggestion, so the two
 /// can't describe one key two different ways.
 fn create_annotation_hover(info: &annotations::AnnotationInfo) -> Hover {
-    let consumed = if info.consumed_by.is_empty() {
-        "**not consumed anywhere yet** — decided, advisory metadata only".to_string()
-    } else {
-        format!("consumed by: {}", info.consumed_by.join(", "))
-    };
-    let detail = [
-        format!("default: {}", info.default),
-        format!("value: {}", info.value),
-        consumed,
-    ]
-    .join("\n\n");
+    let hover = AnnotationHover::new(info.key)
+        .description(info.description)
+        .default(info.default)
+        .value(info.value);
 
-    Hover {
-        contents: HoverContents::Array(vec![
-            MarkedString::from_language_code("comline".to_string(), format!("@{}", info.key)),
-            MarkedString::from_markdown(info.description.to_string()),
-            MarkedString::from_markdown(detail),
-        ]),
-        range: None,
+    if info.consumed_by.is_empty() {
+        hover.warning("not consumed anywhere yet — decided, advisory metadata only")
+    } else {
+        hover.note(format!("consumed by: {}", info.consumed_by.join(", ")))
     }
+    .build()
 }
 
 /// Hover for an `@key` this server doesn't have a description for.
@@ -1132,6 +1134,33 @@ struct User {
         assert!(text.contains("3 fields"), "got: {text}");
         assert!(text.contains("optional: no"), "got: {text}");
         assert!(text.contains("variable"), "got: {text}"); // `string` is unbounded
+    }
+
+    #[test]
+    fn a_one_byte_field_says_1_byte_not_1_bytes() {
+        let source = "struct Greeting {\n    message: string\n    language: string\n    test: bool\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        // Hover over "test" (the `bool` field, 1 byte wide) on line 3.
+        let position = Position::new(3, 6);
+
+        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let text = hover_text(hover);
+        assert!(text.contains("1 byte"), "got: {text}");
+        assert!(!text.contains("1 bytes"), "got: {text}");
+    }
+
+    #[test]
+    fn a_one_byte_struct_says_1_byte_not_1_bytes() {
+        let source = "struct Flag {\n    on: bool\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        // Hover over "Flag" on line 0.
+        let position = Position::new(0, 8);
+
+        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let text = hover_text(hover);
+        assert!(text.contains("1 byte"), "got: {text}");
+        assert!(!text.contains("1 bytes"), "got: {text}");
+        assert!(text.contains("8 bits"), "got: {text}");
     }
 
     #[test]
