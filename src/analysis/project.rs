@@ -52,7 +52,17 @@ pub struct Project<'a> {
     /// The package-level `settings` dict that `config.idp` declares - empty
     /// when there's no manifest, or it has no `settings` key. Checked by
     /// settings enforcement alongside each schema's own effective settings.
+    /// A cross-package reference (`settings = dep::settings::Name`) is
+    /// already resolved here when it succeeds; see [`settings_error`] when
+    /// it doesn't.
+    ///
+    /// [`settings_error`]: Project::settings_error
     pub settings: comline_core::settings::SettingsDict,
+    /// Set when `settings` is a cross-package reference that failed to
+    /// resolve (undeclared dependency, missing block, ambiguous block, or
+    /// a malformed shape) - `settings` above is left empty in that case.
+    /// Surfaced as a diagnostic on the manifest's `settings` line.
+    pub settings_error: Option<String>,
 }
 
 /// A declaration [`Project::resolve`] found: which file (an index into
@@ -107,11 +117,17 @@ impl<'a> Project<'a> {
 
         Self {
             docs, unparsed: vec![], has_manifest: false, dependencies: vec![],
-            package_docs: BTreeMap::new(), settings: Default::default(),
+            package_docs: BTreeMap::new(), settings: Default::default(), settings_error: None,
         }
     }
 
     fn build(inputs: impl Iterator<Item = Input<'a>>) -> Self {
+        // Materialized up front (not just streamed) so a cross-package
+        // `settings` reference can be resolved against every dependency
+        // file regardless of where in the input order the local manifest
+        // happens to fall relative to them.
+        let inputs: Vec<Input<'a>> = inputs.collect();
+
         let mut project = Self {
             docs: vec![],
             unparsed: vec![],
@@ -119,9 +135,10 @@ impl<'a> Project<'a> {
             dependencies: vec![],
             package_docs: BTreeMap::new(),
             settings: Default::default(),
+            settings_error: None,
         };
 
-        for input in inputs {
+        for &input in &inputs {
             if source::is_manifest(input.uri) {
                 match input.dependency {
                     // A dependency's own manifest: what its package says about itself.
@@ -133,7 +150,11 @@ impl<'a> Project<'a> {
                     None => {
                         project.has_manifest = true;
                         project.dependencies = source::declared_dependencies(input.text);
-                        project.settings = source::declared_settings(input.text);
+                        match source::resolve_cross_package_settings(input.text, &inputs) {
+                            Some(Ok(dict)) => project.settings = dict,
+                            Some(Err(message)) => project.settings_error = Some(message),
+                            None => project.settings = source::declared_settings(input.text),
+                        }
                     }
                 }
                 continue;
@@ -268,11 +289,27 @@ impl<'a> Project<'a> {
 }
 
 /// One file handed to [`Project::build`].
+#[derive(Clone, Copy)]
 struct Input<'a> {
     uri: &'a Url,
     text: &'a str,
     namespace: Option<&'a [String]>,
     dependency: Option<&'a str>,
+}
+
+impl<'a> ProjectSource for Input<'a> {
+    fn uri(&self) -> &Url {
+        self.uri
+    }
+    fn text(&self) -> &str {
+        self.text
+    }
+    fn namespace(&self) -> Option<&[String]> {
+        self.namespace
+    }
+    fn dependency(&self) -> Option<&str> {
+        self.dependency
+    }
 }
 
 impl<'a> ProjectDoc<'a> {
@@ -411,6 +448,7 @@ fn collect_named_text(ty: &Type, names: &mut BTreeSet<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::source::SourceFile;
 
     fn files(list: &[(&str, &str)]) -> Vec<(Url, String)> {
         list.iter().map(|(u, s)| (Url::parse(u).unwrap(), s.to_string())).collect()
@@ -513,5 +551,65 @@ mod tests {
             vec![("chat.ids".into(), 0, 11)],
             "`m: Message` is the local struct; only the `use` line names `types`'s"
         );
+    }
+
+    #[test]
+    fn a_resolved_cross_package_settings_reference_becomes_the_projects_settings() {
+        use comline_core::settings::value::SettingsValue;
+
+        let manifest = "congregation app\nspecification_version = 1\n\n\
+            dependencies = {\n    shared = {\n        path = \"../shared\"\n    }\n}\n\n\
+            settings = shared::settings::Strict\n";
+        let other = [
+            SourceFile::local(Url::parse("file:///pkg/config.idp").unwrap(), manifest.to_string()),
+            SourceFile::of_dependency(
+                Url::parse("file:///shared/src/policy.ids").unwrap(),
+                "settings Strict {\n    max_depth = 4\n}\n".to_string(),
+                "shared",
+                vec!["shared".to_string(), "policy".to_string()],
+            ),
+        ];
+        let project = Project::new(other.iter());
+
+        assert_eq!(project.settings.get("max_depth"), Some(&SettingsValue::Integer(4)));
+        assert!(project.settings_error.is_none(), "{:?}", project.settings_error);
+    }
+
+    #[test]
+    fn an_unresolvable_cross_package_settings_reference_sets_settings_error() {
+        let manifest = "congregation app\nspecification_version = 1\n\n\
+            settings = nonexistent::settings::Strict\n";
+        let other = [SourceFile::local(Url::parse("file:///pkg/config.idp").unwrap(), manifest.to_string())];
+        let project = Project::new(other.iter());
+
+        assert!(project.settings.is_empty());
+        let error = project.settings_error.expect("should carry the resolution error");
+        assert!(error.contains("no dependency named `nonexistent`"), "got: {error}");
+    }
+
+    #[test]
+    fn input_order_does_not_matter_for_cross_package_settings_resolution() {
+        // The dependency file arriving BEFORE the local manifest in the
+        // input iterator must still resolve - `build` materializes inputs
+        // up front specifically so this doesn't depend on caller ordering
+        // (unlike backend.rs's real package_view, which happens to push
+        // local files first today).
+        use comline_core::settings::value::SettingsValue;
+
+        let manifest = "congregation app\nspecification_version = 1\n\n\
+            dependencies = {\n    shared = {\n        path = \"../shared\"\n    }\n}\n\n\
+            settings = shared::settings::Strict\n";
+        let other = [
+            SourceFile::of_dependency(
+                Url::parse("file:///shared/src/policy.ids").unwrap(),
+                "settings Strict {\n    max_depth = 4\n}\n".to_string(),
+                "shared",
+                vec!["shared".to_string(), "policy".to_string()],
+            ),
+            SourceFile::local(Url::parse("file:///pkg/config.idp").unwrap(), manifest.to_string()),
+        ];
+        let project = Project::new(other.iter());
+
+        assert_eq!(project.settings.get("max_depth"), Some(&SettingsValue::Integer(4)));
     }
 }

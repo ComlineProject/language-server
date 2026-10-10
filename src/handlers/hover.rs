@@ -662,8 +662,12 @@ fn create_settings_entry_hover<S: ProjectSource>(
 
     let package_settings = other_files
         .iter()
-        .find(|f| source::is_manifest(f.uri()))
-        .map(|f| source::declared_settings(f.text()))
+        .find(|f| f.dependency().is_none() && source::is_manifest(f.uri()))
+        .map(|f| match source::resolve_cross_package_settings(f.text(), other_files) {
+            Some(Ok(dict)) => dict,
+            Some(Err(_)) => Default::default(),
+            None => source::declared_settings(f.text()),
+        })
         .unwrap_or_default();
     let schema_units = IncrementalInterpreter::from_declarations(document.0.clone());
     let schema = schema_settings(&schema_units);
@@ -1867,6 +1871,44 @@ protocol Chat {
         let text = hover_text(hover);
         assert!(text.contains("validators.StringBounds.allowed = False"), "got: {text}");
         assert!(text.contains("@settings = Strict"), "got: {text}");
+    }
+
+    #[test]
+    fn settings_hover_does_not_crash_when_a_dependencys_manifest_is_also_a_cross_package_reference() {
+        // The manifest lookup here used to be `.find(|f| is_manifest(..))`
+        // with no dependency filter — just the first `.idp` in `other_files`,
+        // which this now fixes (`f.dependency().is_none()`). Whichever
+        // manifest it reads, it must never crash: the dependency's own
+        // manifest here has a `settings` value that's itself a cross-package
+        // reference (`declared_settings` used to panic on that shape with no
+        // override available, before being made to recognize and skip it).
+        use crate::analysis::source::SourceFile;
+
+        let source = "settings {\n    max_depth = 2\n}\n";
+        let local_manifest = "congregation app\nspecification_version = 1\n";
+        let dep_manifest = "congregation shared\nspecification_version = 1\n\
+            settings = other::settings::Whatever\n";
+        let schema_uri = Url::parse("file:///pkg/src/main.ids").unwrap();
+        let local_manifest_uri = Url::parse("file:///pkg/config.idp").unwrap();
+        let dep_manifest_uri = Url::parse("file:///shared/config.idp").unwrap();
+
+        let offset = source.find("max_depth").unwrap();
+        let position = crate::util::offset_to_position(source, offset);
+
+        let other_files = [
+            SourceFile::of_dependency(
+                dep_manifest_uri,
+                dep_manifest.to_string(),
+                "shared",
+                vec!["shared".to_string()],
+            ),
+            SourceFile::local(local_manifest_uri, local_manifest.to_string()),
+        ];
+
+        let hover = get_hover_info_with_project(source, &schema_uri, position, &other_files)
+            .expect("hover should resolve without panicking");
+        let text = hover_text(hover);
+        assert!(text.contains("max_depth = 2"), "got: {text}");
     }
 
     #[test]
