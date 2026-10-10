@@ -757,7 +757,9 @@ impl Backend {
 
     async fn parse_and_publish_idp_diagnostics(&self, uri: &Url) {
         use crate::analysis::diagnostics;
+        use crate::analysis::project::Project;
         use crate::parser;
+        use crate::util::byte_range_to_lsp_range;
 
         let document = match self.documents.get(uri) {
             Some(doc) => doc,
@@ -770,6 +772,24 @@ impl Backend {
                 if !result.has_errors() {
                     if let Some(package_dir) = uri.to_file_path().ok().and_then(|p| p.parent().map(PathBuf::from)) {
                         lsp_diagnostics.extend(dependencies::manifest_diagnostics(&package_dir, &document.text));
+                    }
+
+                    // A cross-package `settings = dep::settings::Name` that
+                    // didn't resolve (undeclared dependency, missing block,
+                    // ambiguous block, malformed shape) - `project_diagnostics`
+                    // never sees this itself, since it only runs per `.ids`
+                    // document, not on the manifest.
+                    let view = self.package_view(uri);
+                    let project = Project::new(view.iter());
+                    if let Some(message) = project.settings_error {
+                        let at = document.text.find("settings").map(|i| (i, i + "settings".len())).unwrap_or((0, 0));
+                        lsp_diagnostics.push(Diagnostic {
+                            range: byte_range_to_lsp_range(&document.text, at.0, at.1),
+                            severity: Some(DiagnosticSeverity::ERROR),
+                            source: Some("comline".to_string()),
+                            message,
+                            ..Default::default()
+                        });
                     }
                 }
 
