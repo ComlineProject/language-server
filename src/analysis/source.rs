@@ -297,9 +297,15 @@ mod tests {
     }
 
     #[test]
-    fn declared_settings_is_empty_with_no_settings_key() {
+    fn declared_settings_is_the_built_in_default_with_no_settings_key() {
+        use comline_core::settings::value::SettingsValue;
+
         let manifest = "congregation app\nspecification_version = 1\n";
-        assert!(declared_settings(manifest).is_empty());
+        assert_eq!(
+            declared_settings(manifest).get_path("annotations.framing.allowed"),
+            Some(&SettingsValue::Bool(false)),
+            "framing is forbidden by Comline's built-in default"
+        );
     }
 
     #[test]
