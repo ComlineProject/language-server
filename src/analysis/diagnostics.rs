@@ -10,8 +10,10 @@ use comline_core::schema::ir::compiler::settings::enforcement::check_settings_en
 use comline_core::schema::ir::compiler::Compile;
 use comline_core::schema::ir::frozen::unit::FrozenUnit;
 use comline_core::schema::ir::validation;
-use comline_core::settings::SettingsDict;
-use lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Url};
+use comline_core::settings::{SettingsDict, SettingsSpans};
+use lsp_types::{
+    Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, Location, NumberOrString, Url,
+};
 
 /// The `code` of a missing-import diagnostic - what the quick fix in
 /// `handlers::code_actions` answers to.
@@ -28,25 +30,33 @@ pub const UNVERIFIED_IMPORT: &str = "unverified-import";
 /// references, duplicate declarations, and the like: the same checks
 /// `comline build` runs. Call only on a document that parsed cleanly.
 pub fn validation_diagnostics(source: &str, document: &Document) -> Vec<Diagnostic> {
-    validation_diagnostics_with(source, document, vec![], &SettingsDict::default())
+    let uri = Url::parse("file:///schema.ids").expect("static URL");
+    validation_diagnostics_with(source, document, vec![], &SettingsDict::default(), &uri)
 }
 
 /// [`validation_diagnostics`], with `extra` imports appended to the file's
 /// own units first - the ones core can't see from this file alone (see
-/// `analysis::import_check`) - and `package_settings`, the package-level
-/// settings dict (empty when there's no manifest in view) checked
-/// alongside core's own validation.
+/// `analysis::import_check`) - `package_settings`, the package-level
+/// settings dict (empty when there's no manifest in view) checked alongside
+/// core's own validation - and `uri`, this document's own URI, needed to
+/// build a same-file `related_information` location for a two-site error
+/// (see the `secondary`-span handling below).
 fn validation_diagnostics_with(
     source: &str,
     document: &Document,
     extra: Vec<FrozenUnit>,
     package_settings: &SettingsDict,
+    uri: &Url,
 ) -> Vec<Diagnostic> {
     let mut units = IncrementalInterpreter::from_declarations(document.0.clone());
     units.extend(extra);
 
     let mut errors = validation::validate(&units).err().unwrap_or_default();
-    errors.extend(check_settings_enforcement(&units, package_settings).err().unwrap_or_default());
+    errors.extend(
+        check_settings_enforcement(&units, package_settings, &SettingsSpans::default())
+            .err()
+            .unwrap_or_default(),
+    );
 
     if errors.is_empty() {
         return vec![];
@@ -54,7 +64,7 @@ fn validation_diagnostics_with(
 
     errors
         .into_iter()
-        .map(|error| {
+        .flat_map(|error| {
             let range = error
                 .span
                 .map(|(start, end)| byte_range_to_lsp_range(source, start, end))
@@ -66,17 +76,57 @@ fn validation_diagnostics_with(
                 format!("{} — {}", error.message, error.context)
             };
 
-            Diagnostic {
+            // No secondary span: today's single-diagnostic shape, unchanged.
+            let Some((sec_span, sec_label)) = &error.secondary else {
+                return vec![Diagnostic {
+                    range,
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    code: None,
+                    code_description: None,
+                    source: Some("comline".to_string()),
+                    message,
+                    related_information: None,
+                    tags: None,
+                    data: None,
+                }];
+            };
+
+            // A two-site error (e.g. a malformed settings value): the real
+            // error, at its origin, plus a related-information link to
+            // where it's used - and a second, `HINT`-severity diagnostic
+            // right at that usage site, rendered by the editor as a faint
+            // dotted underline (standard LSP client behavior, no extension
+            // changes needed) pointing back to the real error.
+            let sec_range = byte_range_to_lsp_range(source, sec_span.0, sec_span.1);
+            let primary = Diagnostic {
                 range,
                 severity: Some(DiagnosticSeverity::ERROR),
                 code: None,
                 code_description: None,
                 source: Some("comline".to_string()),
-                message,
-                related_information: None,
+                message: message.clone(),
+                related_information: Some(vec![DiagnosticRelatedInformation {
+                    location: Location { uri: uri.clone(), range: sec_range },
+                    message: sec_label.clone(),
+                }]),
                 tags: None,
                 data: None,
-            }
+            };
+            let hint = Diagnostic {
+                range: sec_range,
+                severity: Some(DiagnosticSeverity::HINT),
+                code: None,
+                code_description: None,
+                source: Some("comline".to_string()),
+                message: format!("{sec_label} — see the error at the settings entry"),
+                related_information: Some(vec![DiagnosticRelatedInformation {
+                    location: Location { uri: uri.clone(), range },
+                    message,
+                }]),
+                tags: None,
+                data: None,
+            };
+            vec![primary, hint]
         })
         .collect()
 }
@@ -110,8 +160,13 @@ pub fn project_diagnostics(project: &Project, doc: usize) -> Vec<Diagnostic> {
     let here = &project.docs[doc];
     let check = import_check::check(project, doc);
 
-    let mut diagnostics =
-        validation_diagnostics_with(here.source, &here.document, check.scope, &project.settings);
+    let mut diagnostics = validation_diagnostics_with(
+        here.source,
+        &here.document,
+        check.scope,
+        &project.settings,
+        here.uri,
+    );
     diagnostics.extend(check.missing.iter().map(|m| missing_import_diagnostic(here.source, m)));
     diagnostics.extend(check.unresolved.iter().map(|u| unresolved_import_diagnostic(here.source, u)));
     diagnostics.extend(check.unverified.iter().map(|u| unverified_import_diagnostic(here.source, u)));
@@ -425,6 +480,52 @@ struct User {
     fn messages(source: &str) -> Vec<String> {
         let r = parser::parse(source).unwrap();
         all_diagnostics(source, &r.errors, r.document.as_ref()).into_iter().map(|d| d.message).collect()
+    }
+
+    #[test]
+    fn malformed_settings_value_produces_an_error_at_origin_and_a_hint_at_usage() {
+        // Same reproduction as `comline-core`'s own end-to-end test for
+        // this (`core::schema::ir::compiler::settings::enforcement::
+        // malformed_settings_value_from_real_parsed_source_points_at_its_
+        // true_origin`), but through the real LSP diagnostic-building path
+        // - confirms `uri`/`related_information`/the `HINT` diagnostic
+        // actually reach the editor, not just that `comline-core`'s
+        // `Diagnostic.secondary` field is populated correctly.
+        let source = "validator StringBounds {\n    min_chars: u32\n    max_chars: u32\n}\n\nstruct Message {\n    @validators = [StringBounds(min_chars=3, max_chars=10)]\n    message: str\n}\n\nsettings {\n    validators.allowed = Tru\n}\n";
+        let d = diags(source);
+
+        let errors: Vec<_> =
+            d.iter().filter(|x| x.severity == Some(DiagnosticSeverity::ERROR)).collect();
+        let hints: Vec<_> = d.iter().filter(|x| x.severity == Some(DiagnosticSeverity::HINT)).collect();
+        assert_eq!(errors.len(), 1, "{d:?}");
+        assert_eq!(hints.len(), 1, "{d:?}");
+
+        let error = errors[0];
+        assert!(error.message.contains("must be a boolean"), "{error:?}");
+        assert!(error.related_information.is_some(), "error should link to the usage site: {error:?}");
+
+        let hint = hints[0];
+        assert!(hint.related_information.is_some(), "hint should link back to the real error: {hint:?}");
+
+        // The settings block is textually after the struct, so its origin
+        // span's line must be later than the usage site's - the mix-up
+        // this whole change fixes would otherwise put the error where the
+        // hint is and vice versa.
+        assert!(
+            error.range.start.line > hint.range.start.line,
+            "the error should land on the settings entry, after the usage site in this source: {d:?}"
+        );
+    }
+
+    #[test]
+    fn forbidden_by_false_is_still_exactly_one_error_diagnostic_with_no_hint() {
+        // The sibling case: a correctly-written `= false` forbidding this
+        // usage must stay exactly as it was before this change - one error,
+        // at the usage site, no secondary `HINT` diagnostic.
+        let source = "validator StringBounds {\n    min_chars: u32\n    max_chars: u32\n}\n\nstruct Message {\n    @validators = [StringBounds(min_chars=3, max_chars=10)]\n    message: str\n}\n\nsettings {\n    validators.allowed = False\n}\n";
+        let d = diags(source);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].severity, Some(DiagnosticSeverity::ERROR));
     }
 
     fn project_messages(files: &[(&str, &str)]) -> Vec<(String, Option<NumberOrString>, u32, u32)> {
