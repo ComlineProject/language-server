@@ -236,7 +236,7 @@ protocol UserService {
         // These three used to be entirely absent from the symbol table
         // (`analysis::symbols::build_symbol_table` skipped them outright),
         // so they never showed up here either.
-        let source = "error NotFound {\n    message = \"missing\"\n}\n\nvalidator StringBounds {\n    min: u32\n}\n\nsettings AAA {\n    k = True\n}\n";
+        let source = "error NotFound {\n    message = \"missing\"\n}\n\nvalidator StringBounds {\n    min: u32\n}\n\nsettings AAA {\n    k = true\n}\n";
         let uri = Url::parse("file:///test.ids").unwrap();
         let symbols = get_document_symbols(source, &uri);
 

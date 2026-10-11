@@ -67,7 +67,7 @@ fn render_value(value: &Value) -> String {
     match value {
         Value::String(s) => s.value.clone(),
         Value::Number(n) => n.value.clone(),
-        Value::Boolean(b) => b.value.clone(),
+        Value::Boolean(b) => b.as_text().to_string(),
         Value::Identifier(id) => id.value.clone(),
         Value::Namespaced(ns) => ns.value.clone(),
         Value::Variable(v) => v.value.clone(),

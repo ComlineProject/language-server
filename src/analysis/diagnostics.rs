@@ -573,7 +573,7 @@ struct User {
         // The sibling case: a correctly-written `= false` forbidding this
         // usage must stay exactly as it was before this change - one error,
         // at the usage site, no secondary `HINT` diagnostic.
-        let source = "validator StringBounds {\n    min_chars: u32\n    max_chars: u32\n}\n\nstruct Message {\n    @validators = [StringBounds(min_chars=3, max_chars=10)]\n    message: str\n}\n\nsettings {\n    validators.allowed = False\n}\n";
+        let source = "validator StringBounds {\n    min_chars: u32\n    max_chars: u32\n}\n\nstruct Message {\n    @validators = [StringBounds(min_chars=3, max_chars=10)]\n    message: str\n}\n\nsettings {\n    validators.allowed = false\n}\n";
         let d = diags(source);
         assert_eq!(d.len(), 1, "{d:?}");
         assert_eq!(d[0].severity, Some(DiagnosticSeverity::ERROR));
