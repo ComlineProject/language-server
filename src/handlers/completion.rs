@@ -680,7 +680,7 @@ fn settings_insert_text(segments: &[&str]) -> String {
         }
     }
     n += 1;
-    out.push_str(&format!(" = ${{{n}:True}}$0"));
+    out.push_str(&format!(" = ${{{n}:true}}$0"));
     out
 }
 
@@ -1031,7 +1031,7 @@ mod tests {
 
         let completions = get_completions(source, &uri, position);
         let allowed = completions.iter().find(|c| c.label == "allowed").expect("allowed should be offered");
-        assert_eq!(allowed.insert_text.as_deref(), Some("allowed = ${1:True}$0"));
+        assert_eq!(allowed.insert_text.as_deref(), Some("allowed = ${1:true}$0"));
     }
 
     #[test]

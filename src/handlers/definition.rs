@@ -421,7 +421,7 @@ struct User {
 
     #[test]
     fn test_goto_definition_settings() {
-        let source = "settings AAA {\n    k = True\n}\n";
+        let source = "settings AAA {\n    k = true\n}\n";
         let uri = Url::parse("file:///test.ids").unwrap();
         // The declaration's own name - a settings block has no reference
         // syntax elsewhere yet, so this just confirms the symbol itself is

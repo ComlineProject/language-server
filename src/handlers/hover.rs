@@ -950,6 +950,7 @@ fn field_info_in(
 /// text — just enough for a hover line, not a general pretty-printer.
 fn format_expression(e: &Expression) -> String {
     match e {
+        Expression::Bool(b) => b.as_text().to_string(),
         Expression::Integer(i) => i.value.to_string(),
         Expression::String(s) => format!("\"{}\"", s.value),
         Expression::FString(f) => f.source(),
@@ -1817,7 +1818,7 @@ protocol Chat {
 
     #[test]
     fn hover_on_a_settings_declaration_shows_its_entries() {
-        let source = "settings AAA {\n    k = True\n}\n";
+        let source = "settings AAA {\n    k = true\n}\n";
         let uri = Url::parse("file:///test.ids").unwrap();
         let offset = source.find("AAA").unwrap();
         let position = crate::util::offset_to_position(source, offset);
@@ -1825,7 +1826,7 @@ protocol Chat {
         let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
         let text = hover_text(hover);
         assert!(text.contains("settings AAA"), "got: {text}");
-        assert!(text.contains("k = True"), "got: {text}");
+        assert!(text.contains("k = true"), "got: {text}");
     }
 
     #[test]
@@ -1833,27 +1834,27 @@ protocol Chat {
         // Direct regression guard: an unnamed block has no name to be a
         // symbol under, so the old symbol-table-only path returned no
         // hover at all here.
-        let source = "settings {\n    k = True\n}\n";
+        let source = "settings {\n    k = true\n}\n";
         let uri = Url::parse("file:///test.ids").unwrap();
         let offset = source.find("settings").unwrap();
         let position = crate::util::offset_to_position(source, offset);
 
         let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
         let text = hover_text(hover);
-        assert!(text.contains("k = True"), "got: {text}");
+        assert!(text.contains("k = true"), "got: {text}");
         assert!(text.contains("recognized keys"), "got: {text}");
     }
 
     #[test]
     fn hover_on_a_settings_entry_shows_the_catalog_doc_and_its_raw_value() {
-        let source = "settings {\n    validators.allowed = False\n}\n";
+        let source = "settings {\n    validators.allowed = false\n}\n";
         let uri = Url::parse("file:///test.ids").unwrap();
         let offset = source.find("allowed").unwrap();
         let position = crate::util::offset_to_position(source, offset);
 
         let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
         let text = hover_text(hover);
-        assert!(text.contains("validators.allowed = False"), "got: {text}");
+        assert!(text.contains("validators.allowed = false"), "got: {text}");
         assert!(text.contains("permitted"), "got: {text}");
         assert!(text.contains("effective"), "got: {text}");
     }
@@ -1882,7 +1883,7 @@ protocol Chat {
         // defaulting to empty — a regression guard for that plumbing, even
         // though the preset's own written value always wins at its own
         // key regardless of what the package says (last-write-wins merge).
-        let source = "settings Strict {\n    validators.StringBounds.allowed = False\n}\n";
+        let source = "settings Strict {\n    validators.StringBounds.allowed = false\n}\n";
         let manifest = "congregation acme\nspecification_version = 1\nsettings = {\n    annotations = {\n        framing = {\n            allowed = true\n        }\n    }\n}\n";
         let schema_uri = Url::parse("file:///test.ids").unwrap();
         let manifest_uri = Url::parse("file:///config.idp").unwrap();
@@ -1898,7 +1899,7 @@ protocol Chat {
         );
         let hover = hover.expect("hover should resolve");
         let text = hover_text(hover);
-        assert!(text.contains("validators.StringBounds.allowed = False"), "got: {text}");
+        assert!(text.contains("validators.StringBounds.allowed = false"), "got: {text}");
         assert!(text.contains("@settings = Strict"), "got: {text}");
     }
 
