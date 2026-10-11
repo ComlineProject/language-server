@@ -4,6 +4,7 @@
 use crate::analysis::import_check::{self, MissingImport, UnresolvedImport, UnverifiedImport};
 use crate::analysis::project::Project;
 use crate::util::byte_range_to_lsp_range;
+use comline_core::diagnostics::Severity;
 use comline_core::schema::idl::grammar::Document;
 use comline_core::schema::ir::compiler::interpreter::incremental::IncrementalInterpreter;
 use comline_core::schema::ir::compiler::settings::enforcement::check_settings_enforcement;
@@ -17,14 +18,25 @@ use lsp_types::{
 
 /// The `code` of a missing-import diagnostic - what the quick fix in
 /// `handlers::code_actions` answers to.
-pub const MISSING_IMPORT: &str = "missing-import";
+pub const MISSING_IMPORT: &str = "import::missing";
 
 /// The `code` of an unresolved-import diagnostic (its "did you mean" has a
 /// quick fix too).
-pub const UNRESOLVED_IMPORT: &str = "unresolved-import";
+pub const UNRESOLVED_IMPORT: &str = "import::unresolved";
 
 /// The `code` of a dependency import that can't be checked.
-pub const UNVERIFIED_IMPORT: &str = "unverified-import";
+pub const UNVERIFIED_IMPORT: &str = "import::unverified";
+
+/// `comline_core::diagnostics::Severity` -> the matching LSP tier - direct
+/// 1:1, no surprises (the two enums were designed to line up exactly).
+fn lsp_severity(severity: Severity) -> DiagnosticSeverity {
+    match severity {
+        Severity::Error => DiagnosticSeverity::ERROR,
+        Severity::Warning => DiagnosticSeverity::WARNING,
+        Severity::Info => DiagnosticSeverity::INFORMATION,
+        Severity::Hint => DiagnosticSeverity::HINT,
+    }
+}
 
 /// Semantic diagnostics from `comline-core`'s validation pass — undefined type
 /// references, duplicate declarations, and the like: the same checks
@@ -69,6 +81,8 @@ fn validation_diagnostics_with(
                 .span
                 .map(|(start, end)| byte_range_to_lsp_range(source, start, end))
                 .unwrap_or_default();
+            let code = error.code;
+            let lsp_code = Some(NumberOrString::String(code.id.to_string()));
 
             let message = if error.context.is_empty() {
                 error.message
@@ -80,8 +94,8 @@ fn validation_diagnostics_with(
             let Some((sec_span, sec_label)) = &error.secondary else {
                 return vec![Diagnostic {
                     range,
-                    severity: Some(DiagnosticSeverity::ERROR),
-                    code: None,
+                    severity: Some(lsp_severity(code.severity)),
+                    code: lsp_code,
                     code_description: None,
                     source: Some("comline".to_string()),
                     message,
@@ -96,12 +110,15 @@ fn validation_diagnostics_with(
             // where it's used - and a second, `HINT`-severity diagnostic
             // right at that usage site, rendered by the editor as a faint
             // dotted underline (standard LSP client behavior, no extension
-            // changes needed) pointing back to the real error.
+            // changes needed) pointing back to the real error. Both share
+            // the same code - they describe one problem from two vantage
+            // points, so "jump to all diagnostics with this code" should
+            // find both.
             let sec_range = byte_range_to_lsp_range(source, sec_span.0, sec_span.1);
             let primary = Diagnostic {
                 range,
-                severity: Some(DiagnosticSeverity::ERROR),
-                code: None,
+                severity: Some(lsp_severity(code.severity)),
+                code: lsp_code.clone(),
                 code_description: None,
                 source: Some("comline".to_string()),
                 message: message.clone(),
@@ -115,7 +132,7 @@ fn validation_diagnostics_with(
             let hint = Diagnostic {
                 range: sec_range,
                 severity: Some(DiagnosticSeverity::HINT),
-                code: None,
+                code: lsp_code,
                 code_description: None,
                 source: Some("comline".to_string()),
                 message: format!("{sec_label} — see the error at the settings entry"),
@@ -503,9 +520,15 @@ struct User {
         let error = errors[0];
         assert!(error.message.contains("must be a boolean"), "{error:?}");
         assert!(error.related_information.is_some(), "error should link to the usage site: {error:?}");
+        assert_eq!(
+            error.code,
+            Some(NumberOrString::String("settings::malformed-value".to_string())),
+            "{error:?}"
+        );
 
         let hint = hints[0];
         assert!(hint.related_information.is_some(), "hint should link back to the real error: {hint:?}");
+        assert_eq!(hint.code, error.code, "the hint should share the error's own code: {hint:?}");
 
         // The settings block is textually after the struct, so its origin
         // span's line must be later than the usage site's - the mix-up
@@ -526,6 +549,12 @@ struct User {
         let d = diags(source);
         assert_eq!(d.len(), 1, "{d:?}");
         assert_eq!(d[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(
+            d[0].code,
+            Some(NumberOrString::String("settings::forbidden".to_string())),
+            "{:?}",
+            d[0]
+        );
     }
 
     fn project_messages(files: &[(&str, &str)]) -> Vec<(String, Option<NumberOrString>, u32, u32)> {
@@ -565,6 +594,16 @@ struct User {
     #[test]
     fn a_type_used_with_no_import_at_all_is_still_unknown_on_its_own() {
         assert_eq!(messages("struct S {\n    m: Message\n}\n").len(), 1);
+    }
+
+    #[test]
+    fn import_codes_use_the_namespaced_convention() {
+        // Explicit value assertions (not just "the constant is referenced
+        // correctly" via the tests below) so an accidental revert to the
+        // old bare-string codes is actually caught.
+        assert_eq!(MISSING_IMPORT, "import::missing");
+        assert_eq!(UNRESOLVED_IMPORT, "import::unresolved");
+        assert_eq!(UNVERIFIED_IMPORT, "import::unverified");
     }
 
     #[test]
