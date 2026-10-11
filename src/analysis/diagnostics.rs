@@ -13,7 +13,8 @@ use comline_core::schema::ir::frozen::unit::FrozenUnit;
 use comline_core::schema::ir::validation;
 use comline_core::settings::{SettingsDict, SettingsSpans};
 use lsp_types::{
-    Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, Location, NumberOrString, Url,
+    Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, DiagnosticTag, Location,
+    NumberOrString, Url,
 };
 
 /// The `code` of a missing-import diagnostic - what the quick fix in
@@ -35,6 +36,18 @@ fn lsp_severity(severity: Severity) -> DiagnosticSeverity {
         Severity::Warning => DiagnosticSeverity::WARNING,
         Severity::Info => DiagnosticSeverity::INFORMATION,
         Severity::Hint => DiagnosticSeverity::HINT,
+    }
+}
+
+/// The LSP tags a diagnostic's own code implies, if any - `DEPRECATED`
+/// makes VS Code strike through the affected range, the standard editor
+/// presentation for "this still works, but don't use it" (same as
+/// rust-analyzer on a deprecated-item reference). Every other code keeps
+/// `tags: None`.
+fn lsp_tags(code_id: &str) -> Option<Vec<DiagnosticTag>> {
+    match code_id {
+        "validation::deprecated-type-usage" => Some(vec![DiagnosticTag::DEPRECATED]),
+        _ => None,
     }
 }
 
@@ -63,7 +76,10 @@ fn validation_diagnostics_with(
     let mut units = IncrementalInterpreter::from_declarations(document.0.clone());
     units.extend(extra);
 
-    let mut errors = validation::validate(&units).err().unwrap_or_default();
+    let mut errors = match validation::validate(&units) {
+        Ok(warnings) => warnings,
+        Err(errors) => errors,
+    };
     errors.extend(
         check_settings_enforcement(&units, package_settings, &SettingsSpans::default())
             .err()
@@ -100,7 +116,7 @@ fn validation_diagnostics_with(
                     source: Some("comline".to_string()),
                     message,
                     related_information: None,
-                    tags: None,
+                    tags: lsp_tags(code.id),
                     data: None,
                 }];
             };
@@ -126,7 +142,7 @@ fn validation_diagnostics_with(
                     location: Location { uri: uri.clone(), range: sec_range },
                     message: sec_label.clone(),
                 }]),
-                tags: None,
+                tags: lsp_tags(code.id),
                 data: None,
             };
             let hint = Diagnostic {
@@ -555,6 +571,27 @@ struct User {
             "{:?}",
             d[0]
         );
+    }
+
+    #[test]
+    fn deprecated_struct_usage_is_a_warning_with_a_deprecated_tag() {
+        // The first diagnostic in this codebase that isn't `Severity::Error`
+        // - confirms `lsp_severity`'s non-Error branches and the
+        // `DiagnosticTag::DEPRECATED` strikethrough actually reach the LSP
+        // diagnostic, not just that `comline-core`'s own `Severity::Warning`
+        // is correct in isolation.
+        let source = "@deprecated = \"use NewAuthor instead\"\nstruct Author {\n    name: str\n}\n\nstruct Post {\n    author: Author\n}\n";
+        let d = diags(source);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].severity, Some(DiagnosticSeverity::WARNING), "{:?}", d[0]);
+        assert_eq!(
+            d[0].code,
+            Some(NumberOrString::String("validation::deprecated-type-usage".to_string())),
+            "{:?}",
+            d[0]
+        );
+        assert_eq!(d[0].tags, Some(vec![DiagnosticTag::DEPRECATED]), "{:?}", d[0]);
+        assert!(d[0].message.contains("use NewAuthor instead"), "{:?}", d[0]);
     }
 
     fn project_messages(files: &[(&str, &str)]) -> Vec<(String, Option<NumberOrString>, u32, u32)> {
