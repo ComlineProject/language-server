@@ -8,6 +8,7 @@ use comline_core::diagnostics::Severity;
 use comline_core::schema::idl::grammar::Document;
 use comline_core::schema::ir::compiler::interpreter::incremental::IncrementalInterpreter;
 use comline_core::schema::ir::compiler::settings::enforcement::check_settings_enforcement;
+use comline_core::schema::ir::compiler::settings::severity::resolve_diagnostic_overrides;
 use comline_core::schema::ir::compiler::Compile;
 use comline_core::schema::ir::frozen::unit::FrozenUnit;
 use comline_core::schema::ir::validation;
@@ -77,7 +78,17 @@ fn validation_diagnostics_with(
     units.extend(extra);
 
     let mut errors = match validation::validate(&units) {
-        Ok(warnings) => warnings,
+        Ok(warnings) => {
+            // No real build to fail here, unlike the CLI's compile pass -
+            // an "error"-escalated or malformed-level diagnostic just
+            // renders as a real LSP error alongside everything else.
+            let (warnings, fatal) = resolve_diagnostic_overrides(
+                &units, warnings, package_settings, &SettingsSpans::default(),
+            );
+            let mut combined = warnings;
+            combined.extend(fatal);
+            combined
+        }
         Err(errors) => errors,
     };
     errors.extend(
@@ -98,6 +109,7 @@ fn validation_diagnostics_with(
                 .map(|(start, end)| byte_range_to_lsp_range(source, start, end))
                 .unwrap_or_default();
             let code = error.code;
+            let effective_severity = error.effective_severity();
             let lsp_code = Some(NumberOrString::String(code.id.to_string()));
 
             let message = if error.context.is_empty() {
@@ -110,7 +122,7 @@ fn validation_diagnostics_with(
             let Some((sec_span, sec_label)) = &error.secondary else {
                 return vec![Diagnostic {
                     range,
-                    severity: Some(lsp_severity(code.severity)),
+                    severity: Some(lsp_severity(effective_severity)),
                     code: lsp_code,
                     code_description: None,
                     source: Some("comline".to_string()),
@@ -133,7 +145,7 @@ fn validation_diagnostics_with(
             let sec_range = byte_range_to_lsp_range(source, sec_span.0, sec_span.1);
             let primary = Diagnostic {
                 range,
-                severity: Some(lsp_severity(code.severity)),
+                severity: Some(lsp_severity(effective_severity)),
                 code: lsp_code.clone(),
                 code_description: None,
                 source: Some("comline".to_string()),
@@ -592,6 +604,27 @@ struct User {
         );
         assert_eq!(d[0].tags, Some(vec![DiagnosticTag::DEPRECATED]), "{:?}", d[0]);
         assert!(d[0].message.contains("use NewAuthor instead"), "{:?}", d[0]);
+    }
+
+    #[test]
+    fn settings_allow_suppresses_the_deprecation_warning_entirely() {
+        let source = "@deprecated\nstruct Author {\n    name: str\n}\n\nstruct Post {\n    author: Author\n}\n\nsettings {\n    diagnostics.\"validation::deprecated-type-usage\".level = \"allow\"\n}\n";
+        let d = diags(source);
+        assert!(d.is_empty(), "{d:?}");
+    }
+
+    #[test]
+    fn settings_error_escalates_the_deprecation_warning_to_a_real_lsp_error() {
+        let source = "@deprecated\nstruct Author {\n    name: str\n}\n\nstruct Post {\n    author: Author\n}\n\nsettings {\n    diagnostics.\"validation::deprecated-type-usage\".level = \"error\"\n}\n";
+        let d = diags(source);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].severity, Some(DiagnosticSeverity::ERROR), "{:?}", d[0]);
+        assert_eq!(
+            d[0].code,
+            Some(NumberOrString::String("validation::deprecated-type-usage".to_string())),
+            "{:?}",
+            d[0]
+        );
     }
 
     fn project_messages(files: &[(&str, &str)]) -> Vec<(String, Option<NumberOrString>, u32, u32)> {
