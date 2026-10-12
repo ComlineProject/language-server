@@ -73,12 +73,16 @@ fn renameable_at(project: &Project, source: &str, uri: &Url, position: Position)
     let (start, end) = word_range_at(source, offset)?;
     let word = &source[start..end];
 
-    let target = project.resolve(project.index_of(uri)?, word)?;
+    let target = project.target_at_cursor(project.index_of(uri)?, source, offset)?;
     // Declared in a dependency: not this package's to rename.
     if project.docs[target.doc].dependency.is_some() {
         return None;
     }
-    (target.name == word).then(|| (target, byte_range_to_lsp_range(source, start, end)))
+    // Only the target's own spelling is renameable, never an `as` alias of
+    // it - and never a same-named declaration in another namespace, which
+    // `target_at_cursor` has already ruled out.
+    (project.symbol(&target)?.name == word)
+        .then(|| (target, byte_range_to_lsp_range(source, start, end)))
 }
 
 /// Check if a string is a valid Comline identifier
@@ -103,6 +107,29 @@ fn is_valid_identifier(name: &str) -> bool {
 mod tests {
     use super::*;
     
+    #[test]
+    fn renaming_a_struct_leaves_a_same_named_settings_preset_alone() {
+        // `renameable_at` resolved by name, so renaming either of these
+        // followed whichever symbol the table had kept.
+        let source = "struct Test {\n    a: str\n}\n\n\
+                      settings Test {\n    validators.allowed = true\n}\n\n\
+                      struct Holder {\n    t: Test\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let offset = source.find("struct Test").unwrap() + "struct ".len();
+        let position = crate::util::offset_to_position(source, offset);
+
+        let edit = rename_symbol(source, &uri, position, "Renamed").expect("should rename");
+        let changes = edit.changes.unwrap();
+        let edits = changes.get(&uri).unwrap();
+
+        // The struct's own name and the field that references it - never
+        // the settings block's name on line 4.
+        let lines: Vec<u32> = edits.iter().map(|e| e.range.start.line).collect();
+        assert!(lines.contains(&0), "the declaration: {lines:?}");
+        assert!(lines.contains(&9), "the reference: {lines:?}");
+        assert!(!lines.contains(&4), "must not touch `settings Test`: {lines:?}");
+    }
+
     #[test]
     fn test_rename_struct() {
         let source = r#"

@@ -29,6 +29,7 @@ use crate::analysis::imports::ResolvedUse;
 use crate::analysis::project::{named_type_sites, Project, ProjectDoc};
 use crate::analysis::source::DependencyKind;
 use crate::analysis::stdlib;
+use crate::analysis::symbols::Namespace;
 use crate::util::{closest, word_occurrences};
 
 /// What [`check`] found for one file.
@@ -109,7 +110,10 @@ pub fn check(project: &Project, doc: usize) -> ImportCheck {
     let bare_sites: BTreeSet<&str> = sites
         .iter()
         .map(|(name, _)| name.as_str())
-        .filter(|name| !name.contains("::") && here.symbols.get(name).is_none())
+        .filter(|name| {
+            !name.contains("::")
+                && here.symbols.get_in(name, Namespace::Declaration).is_none()
+        })
         .collect();
 
     let mut scope = Vec::new();
@@ -175,7 +179,10 @@ pub fn check(project: &Project, doc: usize) -> ImportCheck {
 
     let mut missing = Vec::new();
     for (name, offset) in &sites {
-        if name.contains("::") || here.symbols.get(name).is_some() || covered.contains(name) {
+        if name.contains("::")
+            || here.symbols.get_in(name, Namespace::Declaration).is_some()
+            || covered.contains(name)
+        {
             continue;
         }
 
@@ -363,7 +370,7 @@ fn find_in(text: &str, base: usize, word: &str, segment: bool) -> Option<(usize,
 /// consts, plus errors (`! Name` throws), validators and settings - what
 /// core's `check_imports` accepts.
 fn importable_names(doc: &ProjectDoc) -> BTreeSet<String> {
-    let mut names: BTreeSet<String> = doc.symbols.all_symbols().into_iter().map(|s| s.name.clone()).collect();
+    let mut names: BTreeSet<String> = doc.symbols.all_symbols().iter().map(|s| s.name.clone()).collect();
     names.extend(doc.document.0.iter().filter_map(|decl| match &decl.value {
         Declaration::Error(e) => Some(e.name.text.clone()),
         Declaration::Validator(v) => Some(v.name.text.clone()),
@@ -408,13 +415,36 @@ fn single_symbol_name(use_decl: &ResolvedUse, remaining: &[String], aliases: &mu
 
 /// Every name a file declares, the way core expands a glob or
 /// whole-namespace `use` (`declared_symbol_names`).
+///
+/// Core's list is struct, enum, protocol, const and type alias - an error,
+/// a validator and a settings preset are not importable. This took
+/// everything in the symbol table, so a glob brought in names core would
+/// not, and - once same-named units stopped collapsing into one entry -
+/// would have brought the same name in twice.
 fn declared_names(doc: &ProjectDoc) -> Vec<String> {
-    doc.symbols.all_symbols().into_iter().map(|s| s.name.clone()).collect()
+    doc.symbols
+        .all_symbols()
+        .iter()
+        .filter(|s| is_importable_kind(s.kind))
+        .map(|s| s.name.clone())
+        .collect()
+}
+
+/// The kinds core's `declared_symbol_names` expands a glob `use` to.
+fn is_importable_kind(kind: SymbolKind) -> bool {
+    matches!(
+        kind,
+        SymbolKind::STRUCT
+            | SymbolKind::ENUM
+            | SymbolKind::INTERFACE
+            | SymbolKind::CONSTANT
+            | SymbolKind::TYPE_PARAMETER
+    )
 }
 
 /// Whether `doc` declares `name` as something usable in a type position.
 pub(crate) fn declares_type(doc: &ProjectDoc, name: &str) -> bool {
-    doc.symbols.get(name).is_some_and(|s| is_type_kind(s.kind))
+    doc.symbols.get_in(name, Namespace::Declaration).is_some_and(|s| is_type_kind(s.kind))
 }
 
 /// Struct, enum and type alias - not protocols or consts.

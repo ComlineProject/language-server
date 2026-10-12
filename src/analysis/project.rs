@@ -13,7 +13,7 @@ use lsp_types::{Location, Url};
 use crate::analysis::imports::{self, ProjectFile, ResolvedUse};
 use crate::analysis::parse_cache;
 use crate::analysis::source::{self, DeclaredDependency, ProjectSource};
-use crate::analysis::symbols::{self, SymbolTable};
+use crate::analysis::symbols::{self, Namespace, Symbol, SymbolTable};
 use crate::util::{byte_range_to_lsp_range, word_occurrences};
 
 /// One parsed project file.
@@ -66,11 +66,16 @@ pub struct Project<'a> {
 }
 
 /// A declaration [`Project::resolve`] found: which file (an index into
-/// [`Project::docs`]) and the name it's declared under there.
+/// [`Project::docs`]) and which symbol within it.
+///
+/// The symbol is an index, not a name. Keyed by name, a target could not
+/// tell `struct Test` from a `settings Test` in the same file - so
+/// go-to-definition, find-references and rename all followed whichever one
+/// the symbol table happened to keep.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
     pub doc: usize,
-    pub name: String,
+    pub symbol: usize,
 }
 
 /// One place a [`Target`] is referred to.
@@ -184,11 +189,18 @@ impl<'a> Project<'a> {
     /// 3. failing both, the first other file declaring `name` - a fallback,
     ///    since a miss in step 2 is often just a `use` being typed, or a
     ///    sibling that doesn't parse mid-edit.
-    pub fn resolve(&self, doc: usize, name: &str) -> Option<Target> {
+    pub fn resolve(&self, doc: usize, name: &str, namespace: Namespace) -> Option<Target> {
         let here = &self.docs[doc];
 
-        if here.symbols.get(name).is_some() {
-            return Some(Target { doc, name: name.to_string() });
+        if let Some(symbol) = here.symbols.index_in(name, namespace) {
+            return Some(Target { doc, symbol });
+        }
+
+        // A settings preset is only ever named by an `@settings = Name` in
+        // the same schema - there is no `use` that brings one into scope -
+        // so the cross-file steps below are the declaration namespace's.
+        if namespace != Namespace::Declaration {
+            return None;
         }
 
         let indices: Vec<usize> = self.others(doc).map(|(i, _)| i).collect();
@@ -196,19 +208,49 @@ impl<'a> Project<'a> {
 
         if let Some(found) = imports::resolve_symbol(name, &here.imports, &files) {
             let index = indices[files.iter().position(|f| std::ptr::eq(f, found.file))?];
-            if self.docs[index].symbols.get(&found.real_name).is_some() {
-                return Some(Target { doc: index, name: found.real_name });
+            if let Some(symbol) = self.docs[index].symbols.index_in(&found.real_name, namespace) {
+                return Some(Target { doc: index, symbol });
             }
         }
 
         self.others(doc)
-            .find(|(_, d)| d.symbols.get(name).is_some())
-            .map(|(i, _)| Target { doc: i, name: name.to_string() })
+            .find_map(|(i, d)| {
+                d.symbols.index_in(name, namespace).map(|symbol| Target { doc: i, symbol })
+            })
+    }
+
+    /// The declaration a cursor sits directly on - its own name, in
+    /// whatever namespace it belongs to.
+    ///
+    /// Resolved by position, so it is exact: the right answer needs no
+    /// guess about which namespace the name was meant in, and holds even
+    /// where two declarations do share a name.
+    pub fn target_at(&self, doc: usize, offset: usize) -> Option<Target> {
+        self.docs[doc].symbols.index_at_offset(offset).map(|symbol| Target { doc, symbol })
+    }
+
+    /// What the cursor at `offset` names.
+    ///
+    /// A declaration's own name resolves by position; anything else is a
+    /// reference, resolved by name in whatever namespace its position
+    /// allows. Shared by go-to-definition, find-references and rename so
+    /// the three cannot disagree about which `Test` is meant.
+    pub fn target_at_cursor(&self, doc: usize, source: &str, offset: usize) -> Option<Target> {
+        if let Some(target) = self.target_at(doc, offset) {
+            return Some(target);
+        }
+        let (start, end) = crate::util::word_range_at(source, offset)?;
+        self.resolve(doc, &source[start..end], symbols::namespace_at(source, offset))
+    }
+
+    /// The symbol `target` names.
+    pub fn symbol(&self, target: &Target) -> Option<&Symbol> {
+        self.docs[target.doc].symbols.by_index(target.symbol)
     }
 
     /// The declaration site of `target`.
     pub fn declaration(&self, target: &Target) -> Option<Location> {
-        self.docs[target.doc].symbols.get(&target.name).map(|s| s.location.clone())
+        self.symbol(target).map(|s| s.location.clone())
     }
 
     /// Every reference to `target` across the project, declaration
@@ -217,6 +259,9 @@ impl<'a> Project<'a> {
     /// a `use` line that imports it.
     pub fn references(&self, target: &Target) -> Vec<Reference> {
         let mut found = Vec::new();
+        let Some(target_name) = self.symbol(target).map(|s| s.name.as_str()) else {
+            return found;
+        };
 
         for (index, doc) in self.docs.iter().enumerate() {
             // A dependency's own files aren't this package's to search: their
@@ -231,12 +276,15 @@ impl<'a> Project<'a> {
                 collect_named(span.1, &mut names);
 
                 for name in names {
-                    if self.resolve(index, &name).as_ref() != Some(target) {
+                    // A type position, so the declaration namespace - a
+                    // settings preset of the same name is a different
+                    // symbol and must not be swept up here.
+                    if self.resolve(index, &name, Namespace::Declaration).as_ref() != Some(target) {
                         continue;
                     }
                     for offset in occurrences_in(doc.source, span.0, &name) {
                         if seen.insert(offset) {
-                            found.push(self.reference(doc, offset, &name, name == target.name));
+                            found.push(self.reference(doc, offset, &name, name == target_name));
                         }
                     }
                 }
@@ -257,19 +305,22 @@ impl<'a> Project<'a> {
         let here = &self.docs[doc];
         let siblings: Vec<ProjectFile> = self.others(doc).map(|(_, d)| d.as_file()).collect();
         let target_uri = self.docs[target.doc].uri;
+        let Some(target_name) = self.symbol(target).map(|s| s.name.clone()) else {
+            return Vec::new();
+        };
 
         here.imports
             .iter()
             .filter(|u| {
-                imports::resolve_symbol(&target.name, std::slice::from_ref(*u), &siblings)
-                    .is_some_and(|r| r.file.uri == target_uri && r.real_name == target.name)
+                imports::resolve_symbol(&target_name, std::slice::from_ref(*u), &siblings)
+                    .is_some_and(|r| r.file.uri == target_uri && r.real_name == target_name)
             })
             .flat_map(|u| {
-                occurrences_in(here.source, u.span, &target.name)
+                occurrences_in(here.source, u.span, &target_name)
                     .into_iter()
                     .filter(move |&offset| !follows_as(here.source, u.span.0, offset))
             })
-            .map(|offset| self.reference(here, offset, &target.name, true))
+            .map(|offset| self.reference(here, offset, &target_name, true))
             .collect()
     }
 
@@ -475,7 +526,7 @@ mod tests {
             "struct User {\n    name: string\n}\n\nstruct A {\n    u: User\n}\n\nstruct B {\n    list: User[]\n}\n",
         )]);
         let project = Project::new(all.iter());
-        let target = project.resolve(0, "User").unwrap();
+        let target = project.resolve(0, "User", Namespace::Declaration).unwrap();
 
         let refs = project.references(&target);
         assert_eq!(lines(&refs), vec![("a.ids".into(), 5, 7), ("a.ids".into(), 9, 10)]);
@@ -490,7 +541,7 @@ mod tests {
             ("file:///unrelated.ids", "use other::Message\n\nstruct S {\n    m: Message\n}\n"),
         ]);
         let project = Project::new(all.iter());
-        let target = project.resolve(0, "Message").unwrap();
+        let target = project.resolve(0, "Message", Namespace::Declaration).unwrap();
 
         let refs = project.references(&target);
         assert_eq!(
@@ -507,8 +558,9 @@ mod tests {
             ("file:///chat.ids", "use types::Message as Msg\n\nstruct S {\n    m: Msg\n}\n"),
         ]);
         let project = Project::new(all.iter());
-        let target = project.resolve(1, "Msg").unwrap();
-        assert_eq!(target, Target { doc: 0, name: "Message".into() });
+        let target = project.resolve(1, "Msg", Namespace::Declaration).unwrap();
+        assert_eq!(target.doc, 0);
+        assert_eq!(project.symbol(&target).unwrap().name, "Message");
 
         let refs = project.references(&target);
         let mut spelled: Vec<_> = refs
@@ -526,7 +578,7 @@ mod tests {
             ("file:///pkg/src/app.ids", "use User::User\n\nstruct S {\n    u: User\n}\n"),
         ]);
         let project = Project::new(all.iter());
-        let target = project.resolve(0, "User").unwrap();
+        let target = project.resolve(0, "User", Namespace::Declaration).unwrap();
 
         let refs = project.references(&target);
         assert_eq!(
@@ -543,7 +595,7 @@ mod tests {
             ("file:///chat.ids", "use types::Message\n\nstruct Message {\n    local: bool\n}\n\nstruct S {\n    m: Message\n}\n"),
         ]);
         let project = Project::new(all.iter());
-        let target = project.resolve(0, "Message").unwrap();
+        let target = project.resolve(0, "Message", Namespace::Declaration).unwrap();
 
         let refs = project.references(&target);
         assert_eq!(

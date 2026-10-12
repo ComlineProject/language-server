@@ -3,7 +3,7 @@
 use crate::analysis::modules;
 use crate::analysis::project::Project;
 use crate::analysis::source::ProjectSource;
-use crate::util::{byte_range_to_lsp_range, position_to_offset, word_range_at};
+use crate::util::{byte_range_to_lsp_range, position_to_offset};
 use lsp_types::{GotoDefinitionResponse, Location, Position, Url};
 
 /// Find the definition of a symbol at a position, considering only this file.
@@ -38,11 +38,9 @@ pub fn find_definition_with_project<S: ProjectSource>(
         return Some(GotoDefinitionResponse::Scalar(location));
     }
 
-    let (start, end) = word_range_at(source, offset)?;
-
     let project = Project::with_active(uri, source, other_files);
     let active = project.index_of(uri)?;
-    let target = project.resolve(active, &source[start..end])?;
+    let target = project.target_at_cursor(active, source, offset)?;
 
     project.declaration(&target).map(GotoDefinitionResponse::Scalar)
 }
@@ -68,6 +66,26 @@ fn module_definition<S: ProjectSource>(
 mod tests {
     use super::*;
     
+    #[test]
+    fn a_type_reference_goes_to_the_declaration_not_a_settings_preset() {
+        // Keyed by name, a `Target` could not tell the two apart, so this
+        // jumped to whichever the symbol table had kept - the settings
+        // block, since it is declared last.
+        let source = "struct Test {\n    a: str\n}\n\n\
+                      settings Test {\n    validators.allowed = true\n}\n\n\
+                      struct Holder {\n    t: Test\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let offset = source.find("t: Test").unwrap() + "t: ".len();
+        let position = crate::util::offset_to_position(source, offset);
+
+        let Some(GotoDefinitionResponse::Scalar(location)) =
+            find_definition(source, &uri, position)
+        else {
+            panic!("a type reference should resolve");
+        };
+        assert_eq!(location.range.start.line, 0, "the struct, on line 0");
+    }
+
     #[test]
     fn test_goto_definition_struct() {
         let source = r#"
