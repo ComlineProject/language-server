@@ -30,7 +30,10 @@ lsp-types = "0.94"
 rust-sitter = "0.4.5"
 tracing = "0.1"
 anyhow = "1.0"
-comline-core = { git = "https://github.com/ComlineProject/core", rev = "338a707854e1b25450a9a438c039250382aae6fd" }
+# `Command::arguments` is `Vec<serde_json::Value>` — the interactive-rename
+# quick fix below hands the client a URI and a position through it.
+serde_json = "1.0"
+comline-core = { git = "https://github.com/ComlineProject/core", rev = "5c1f3474b462ed912f4f2f5a518b87a5f6576aaa" }
 
 # `server`-only.
 tower-lsp = { version = "0.20.0", optional = true }

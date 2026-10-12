@@ -30,6 +30,16 @@ pub const UNRESOLVED_IMPORT: &str = "import::unresolved";
 /// The `code` of a dependency import that can't be checked.
 pub const UNVERIFIED_IMPORT: &str = "import::unverified";
 
+/// The `code` of a name declared twice in one schema - a struct and an
+/// error, two errors, two validators. Both the quick fixes in
+/// `handlers::code_actions` and the span narrowing below answer to it.
+pub const DUPLICATE_DECLARATION: &str = "validation::duplicate-declaration";
+
+/// The `code` of a `settings` block declared twice in one schema. Treated
+/// exactly like [`DUPLICATE_DECLARATION`] here - same shape of problem, same
+/// two-site report.
+pub const DUPLICATE_BLOCK: &str = "settings::duplicate-block";
+
 /// `comline_core::diagnostics::Severity` -> the matching LSP tier - direct
 /// 1:1, no surprises (the two enums were designed to line up exactly).
 fn lsp_severity(severity: Severity) -> DiagnosticSeverity {
@@ -38,6 +48,17 @@ fn lsp_severity(severity: Severity) -> DiagnosticSeverity {
         Severity::Warning => DiagnosticSeverity::WARNING,
         Severity::Info => DiagnosticSeverity::INFORMATION,
         Severity::Hint => DiagnosticSeverity::HINT,
+    }
+}
+
+/// Where the `HINT` half of a two-site diagnostic sends the reader. The
+/// wording used to name the settings entry unconditionally - true of the
+/// only two-site diagnostic there was when it was written, and wrong the
+/// moment a duplicate declaration became another.
+fn hint_pointer(code_id: &str) -> &'static str {
+    match code_id {
+        DUPLICATE_DECLARATION | DUPLICATE_BLOCK => "see the error at the duplicate",
+        _ => "see the error at the settings entry",
     }
 }
 
@@ -58,7 +79,9 @@ fn lsp_tags(code_id: &str) -> Option<Vec<DiagnosticTag>> {
 /// `comline build` runs. Call only on a document that parsed cleanly.
 pub fn validation_diagnostics(source: &str, document: &Document) -> Vec<Diagnostic> {
     let uri = Url::parse("file:///schema.ids").expect("static URL");
-    validation_diagnostics_with(source, document, vec![], &crate::analysis::source::base_settings(), &uri)
+    validation_diagnostics_with(
+        source, document, vec![], &crate::analysis::source::base_settings(), &uri, &[],
+    )
 }
 
 /// [`validation_diagnostics`], with `extra` imports appended to the file's
@@ -67,13 +90,17 @@ pub fn validation_diagnostics(source: &str, document: &Document) -> Vec<Diagnost
 /// settings dict (empty when there's no manifest in view) checked alongside
 /// core's own validation - and `uri`, this document's own URI, needed to
 /// build a same-file `related_information` location for a two-site error
-/// (see the `secondary`-span handling below).
+/// (see the `secondary`-span handling below), and `namespace`, this
+/// schema's own module path - core names a declaration by it (`error
+/// 'test::main::Test'`), and without it the editor would say `'Test'` where
+/// `comline build` says the qualified form.
 fn validation_diagnostics_with(
     source: &str,
     document: &Document,
     extra: Vec<FrozenUnit>,
     package_settings: &SettingsDict,
     uri: &Url,
+    namespace: &[String],
 ) -> Vec<Diagnostic> {
     // The `settings` block's own checks - duplicate and conflicting keys,
     // a bad `mode` value, an unrecognised key, a wrongly-typed value. The
@@ -87,6 +114,12 @@ fn validation_diagnostics_with(
 
     let mut units = IncrementalInterpreter::from_declarations(document.0.clone());
     units.extend(extra);
+    if !namespace.is_empty() {
+        // `from_declarations` has no project context and so emits no
+        // `Namespace` unit of its own; the project does know the file's
+        // module path, so core gets told the same thing a real build knows.
+        units.insert(0, FrozenUnit::Namespace(namespace.join("::")));
+    }
 
     let mut errors = match validation::validate(&units) {
         Ok(warnings) => {
@@ -127,9 +160,31 @@ fn validation_diagnostics_with(
         return vec![];
     }
 
+    // Core spans a declaration whole, having no span for the name itself
+    // (`grammar::Identifier` carries none). For a duplicate that means two
+    // entire blocks underlined; the editor has the exact name ranges, so it
+    // narrows both ends back down to them. Built only when something
+    // actually needs it - this runs on every keystroke.
+    let table = errors
+        .iter()
+        .any(|e| matches!(e.code.id, DUPLICATE_DECLARATION | DUPLICATE_BLOCK))
+        .then(|| crate::analysis::symbols::build_symbol_table(document, uri, source));
+    let names = |span: (usize, usize)| -> (usize, usize) {
+        table.as_ref().and_then(|t| t.name_span_of_decl(span)).unwrap_or(span)
+    };
+
     errors
         .into_iter()
         .flat_map(|error| {
+            let narrow = matches!(error.code.id, DUPLICATE_DECLARATION | DUPLICATE_BLOCK);
+            let error = if narrow {
+                let span = error.span.map(&names);
+                let secondary =
+                    error.secondary.map(|(span, label)| (names(span), label));
+                comline_core::diagnostics::Diagnostic { span, secondary, ..error }
+            } else {
+                error
+            };
             let range = error
                 .span
                 .map(|(start, end)| byte_range_to_lsp_range(source, start, end))
@@ -196,7 +251,7 @@ fn validation_diagnostics_with(
                 code: lsp_code,
                 code_description: None,
                 source: Some("comline".to_string()),
-                message: format!("{sec_label} — see the error at the settings entry"),
+                message: format!("{sec_label} — {}", hint_pointer(code.id)),
                 related_information: Some(vec![DiagnosticRelatedInformation {
                     location: Location { uri: uri.clone(), range },
                     message,
@@ -244,6 +299,7 @@ pub fn project_diagnostics(project: &Project, doc: usize) -> Vec<Diagnostic> {
         check.scope,
         &project.settings,
         here.uri,
+        &here.namespace,
     );
     diagnostics.extend(check.missing.iter().map(|m| missing_import_diagnostic(here.source, m)));
     diagnostics.extend(check.unresolved.iter().map(|u| unresolved_import_diagnostic(here.source, u)));
@@ -813,5 +869,127 @@ struct User {
         // in view, so nothing can forbid anything.
         let found = project_messages(&[("file:///pkg/src/chat.ids", TYPES.1)]);
         assert!(found.is_empty(), "{found:?}");
+    }
+}
+
+/// The duplicate-declaration error used to land at 0:0 - `FrozenUnit::Error`
+/// carried no span, so the editor had nothing to point at and fell back to
+/// the top of the file. Core now spans both declarations; these cover the
+/// narrowing from core's declaration-wide spans down to the two names.
+#[cfg(test)]
+mod duplicate_declaration_tests {
+    use super::*;
+    use crate::parser;
+
+    /// The screenshot's file: a struct, an error and a settings preset all
+    /// called `Test`.
+    const THREE_TESTS: &str = "struct Test {\n    a: str\n}\n\n\
+                               error Test {\n    message = \"\"\n}\n\n\
+                               /// Restricting some stuff\n\
+                               settings Test {\n    validators.allowed = true\n}\n";
+
+    fn diagnostics(source: &str) -> Vec<Diagnostic> {
+        let r = parser::parse(source).unwrap();
+        all_diagnostics(source, &r.errors, r.document.as_ref())
+    }
+
+    /// The range `source` quotes for an LSP range.
+    fn quoted<'a>(source: &'a str, range: &lsp_types::Range) -> &'a str {
+        let start = crate::util::position_to_offset(source, range.start).unwrap();
+        let end = crate::util::position_to_offset(source, range.end).unwrap();
+        &source[start..end]
+    }
+
+    #[test]
+    fn both_colliding_names_are_underlined_and_nothing_else() {
+        let found = diagnostics(THREE_TESTS);
+        assert_eq!(found.len(), 2, "one error, one linked hint: {found:?}");
+
+        let error = found.iter().find(|d| d.severity == Some(DiagnosticSeverity::ERROR)).unwrap();
+        let hint = found.iter().find(|d| d.severity == Some(DiagnosticSeverity::HINT)).unwrap();
+
+        // Both land on the name, not on the whole declaration and not at 0:0.
+        assert_eq!(quoted(THREE_TESTS, &error.range), "Test");
+        assert_eq!(quoted(THREE_TESTS, &hint.range), "Test");
+        assert_ne!(error.range, hint.range, "two different declarations");
+        assert_eq!(error.range.start.line, 4, "the error, which collided");
+        assert_eq!(hint.range.start.line, 0, "the struct, which held the name");
+
+        // And they point at each other.
+        assert_eq!(
+            error.related_information.as_ref().unwrap()[0].location.range,
+            hint.range,
+        );
+        assert_eq!(
+            hint.related_information.as_ref().unwrap()[0].location.range,
+            error.range,
+        );
+        assert_eq!(error.code, Some(NumberOrString::String(DUPLICATE_DECLARATION.to_string())));
+
+        // The hint sends you to the duplicate, not to a settings entry -
+        // that wording was true of the only two-site diagnostic there was
+        // when it was written.
+        assert!(hint.message.ends_with("see the error at the duplicate"), "{}", hint.message);
+    }
+
+    /// A `settings` preset shares no namespace with a declaration, so the
+    /// third `Test` in the file is not part of the collision.
+    #[test]
+    fn the_settings_preset_is_left_alone() {
+        for d in diagnostics(THREE_TESTS) {
+            assert!(d.range.start.line < 9, "the settings block was flagged: {d:?}");
+        }
+    }
+
+    #[test]
+    fn the_message_names_the_kinds() {
+        let found = diagnostics(THREE_TESTS);
+        let error = found.iter().find(|d| d.severity == Some(DiagnosticSeverity::ERROR)).unwrap();
+        // Qualified by the schema's own namespace, which here is the
+        // `schema.ids` the project-of-one path names the file.
+        assert!(error.message.contains("error 'schema::Test'"), "{}", error.message);
+        assert!(error.message.contains("rename this error"), "{}", error.message);
+        assert_eq!(
+            error.related_information.as_ref().unwrap()[0].message,
+            "struct 'schema::Test' declared here",
+        );
+    }
+
+    /// A duplicate `settings` block gets the same two-site treatment, and
+    /// the same narrowing.
+    #[test]
+    fn a_duplicate_settings_block_underlines_both_names() {
+        let source = "settings Strict {\n    validators.allowed = true\n}\n\n\
+                      settings Strict {\n    validators.allowed = false\n}\n";
+        let found = diagnostics(source);
+        let error = found
+            .iter()
+            .find(|d| d.code == Some(NumberOrString::String(DUPLICATE_BLOCK.to_string())))
+            .expect("a duplicate block is reported");
+        assert_eq!(quoted(source, &error.range), "Strict");
+        let hint = error.related_information.as_ref().unwrap();
+        assert_eq!(quoted(source, &hint[0].location.range), "Strict");
+        assert_ne!(error.range, hint[0].location.range);
+    }
+
+    /// A schema namespace is `src`-relative and package-name-free
+    /// throughout (see `imports::namespace_of`), so `src/chat.ids` in
+    /// package `app` is `chat` - the same string `comline build` puts in
+    /// the schema's own `FrozenUnit::Namespace`, and the same one you'd
+    /// write in a `use`.
+    #[test]
+    fn a_known_namespace_qualifies_the_name() {
+        use crate::analysis::source::SourceFile;
+        let chat = Url::parse("file:///pkg/src/chat.ids").unwrap();
+        let others = [SourceFile::local(
+            Url::parse("file:///pkg/config.idp").unwrap(),
+            "congregation app\nspecification_version = 1\n".to_string(),
+        )];
+        let project = Project::with_active(&chat, THREE_TESTS, &others);
+        let doc = project.index_of(&chat).unwrap();
+
+        let found = project_diagnostics(&project, doc);
+        let error = found.iter().find(|d| d.severity == Some(DiagnosticSeverity::ERROR)).unwrap();
+        assert!(error.message.contains("'chat::Test'"), "{}", error.message);
     }
 }
