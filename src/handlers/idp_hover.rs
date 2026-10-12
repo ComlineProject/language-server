@@ -89,7 +89,16 @@ fn entry_hover(path: &[String], value: &Value) -> Hover {
         format!("{key} = {}", render_value(value)),
     )];
 
-    let segments: Vec<&str> = path.iter().map(String::as_str).collect();
+    // `path`'s leading `settings` is synthetic - it names the `.idp`
+    // assignment this dict hangs off, and exists for the signature line
+    // above. The registry's keys are relative to the inside of a settings
+    // block, and its matcher is anchored at the front, so that segment has
+    // to come off before lookup. Leaving it on silently lost the doc for
+    // every key here: a three-segment path like
+    // `settings.validators.allowed` no longer looked like `<group>.<leaf>`
+    // to the matcher, and `diagnostics."<code>".level` never had a chance
+    // at four.
+    let segments: Vec<&str> = path.iter().skip(1).map(String::as_str).collect();
     if let Some(m) = catalog::match_path(&segments) {
         contents.push(MarkedString::from_markdown(catalog::doc_for(&m).description.to_string()));
     }

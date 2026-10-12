@@ -12,6 +12,8 @@ use crate::parser;
 use crate::util::{in_comment_or_string, position_to_offset};
 use comline_core::schema::idl::annotations::{self, AnnotationScope};
 use comline_core::schema::idl::vocabulary::{self, KeywordKind};
+use comline_core::config_value::{self, ValueType};
+use comline_core::settings::keys::{self, NameKind};
 use lsp_types::{CompletionItem, CompletionItemKind, Position, SymbolKind, Url};
 use std::collections::BTreeSet;
 
@@ -640,47 +642,85 @@ fn get_type_completions(symbol_table: Option<&symbols::SymbolTable>) -> Vec<Comp
         .collect()
 }
 
-/// The snippet a known annotation key inserts — completion-specific
-/// (editor insertion mechanics), so it lives here rather than in the
-/// shared `comline_core::schema::idl::annotations` table, which only
-/// describes *meaning*.
-/// `None` falls back to inserting just the bare key name — correct as-is
-/// for a bare-marker annotation like `idempotent` (no `=value`), not just
-/// a fallback for one this function hasn't gotten to yet.
-fn annotation_insert_text(key: &str) -> Option<&'static str> {
-    match key {
-        "validators" => Some("validators = [$0]"),
-        "timeout_ms" => Some("timeout_ms = $0"),
-        "framing" => Some("framing = \"${1|jsonrpc,datagram|}\"$0"),
-        _ => None,
-    }
+/// The snippet for one `= value` tab-stop of the given type, numbered
+/// `n`. Insertion mechanics are the editor's business; *what values are
+/// legal* is core's, so the shape comes from [`ValueType`] rather than
+/// from a table here that would have to be kept in step with it by hand.
+///
+/// Returns `None` for a type that takes no value at all, so the caller
+/// inserts a bare marker rather than `key = ` with nothing after it.
+fn value_snippet(ty: &ValueType, n: usize) -> Option<String> {
+    let spellings = config_value::spellings(ty);
+    Some(match ty {
+        ValueType::Marker => return None,
+        ValueType::Bool | ValueType::BoolOrStr => format!("${{{n}:true}}"),
+        ValueType::Integer => format!("${{{n}:0}}"),
+        ValueType::Str => format!("\"${{{n}:text}}\""),
+        // A closed set the editor can offer as a choice list. Quoted for
+        // `StrEnum` (a string from a set), bare for `Keyword`.
+        ValueType::StrEnum(_) => format!("\"${{{n}|{}|}}\"", spellings.join(",")),
+        // A single legal keyword is not a choice - insert it finished.
+        ValueType::Keyword(_) if spellings.len() == 1 => spellings[0].to_string(),
+        ValueType::Keyword(_) => format!("${{{n}|{}|}}", spellings.join(",")),
+        ValueType::Name => format!("${{{n}:Name}}"),
+        ValueType::ValidatorList => format!("[${n}]"),
+    })
 }
 
-/// `<name>` replaced with a snippet tab-stop, plus a trailing
-/// ` = <value>` tab-stop of its own — a completion inserts a whole,
-/// immediately-editable entry, not just the key. `segments` is already
-/// scoped to whatever's left to type (see [`matching_remaining`]) — asking
-/// at the very start of a block passes a catalog entry's full path, same
-/// as it always has.
-fn settings_insert_text(segments: &[&str]) -> String {
-    if segments == ["mode"] {
-        return "mode = replace".to_string();
-    }
+/// The snippet a known annotation key inserts. The value half comes from
+/// the annotation's own [`ValueType`] in core, so a key whose accepted
+/// values change does not need a matching edit here - this used to carry
+/// its own copy of `framing`'s choice list, and listed only the two
+/// canonical spellings while core accepted five.
+///
+/// `None` inserts just the bare key name, which is what a marker
+/// annotation like `idempotent` should produce.
+fn annotation_insert_text(info: &annotations::AnnotationInfo) -> Option<String> {
+    let value = value_snippet(&info.value, 1)?;
+    Some(format!("{} = {value}$0", info.key))
+}
+
+/// Each placeholder segment replaced with a snippet tab-stop, plus a
+/// trailing ` = <value>` tab-stop whose shape comes from the key's own
+/// [`ValueType`] — a completion inserts a whole, immediately-editable
+/// entry, not just the key. `segments` is already scoped to whatever's
+/// left to type (see [`matching_remaining`]) — asking at the very start of
+/// a block passes a catalog entry's full path, same as it always has.
+///
+/// Two things used to be hardcoded here. The value was always
+/// `${n:true}`, which is wrong for `diagnostics.<code>.level` (one of five
+/// strings) and only right for the boolean keys by coincidence; and
+/// `mode` was special-cased to insert its single legal keyword. Both now
+/// fall out of the type: `mode`'s `Keyword` has exactly one spelling, so
+/// it still inserts `mode = replace`.
+///
+/// A placeholder that must be quoted to parse is quoted — see
+/// [`NameKind::quoted_in_ids`]. Inserting `diagnostics.<code>.level`
+/// unquoted produced a syntax error.
+fn settings_insert_text(segments: &[&str], value: &ValueType) -> String {
     let mut n = 0;
     let mut out = String::new();
     for &segment in segments {
         if !out.is_empty() {
             out.push('.');
         }
-        if segment == "<name>" {
-            n += 1;
-            out.push_str(&format!("${{{n}:name}}"));
-        } else {
-            out.push_str(segment);
+        match NameKind::from_placeholder(segment) {
+            Some(kind) => {
+                n += 1;
+                let stop = format!("${{{n}:{}}}", kind.hint());
+                if kind.quoted_in_ids() {
+                    out.push_str(&format!("\"{stop}\""));
+                } else {
+                    out.push_str(&stop);
+                }
+            }
+            None => out.push_str(segment),
         }
     }
-    n += 1;
-    out.push_str(&format!(" = ${{{n}:true}}$0"));
+    match value_snippet(value, n + 1) {
+        Some(v) => out.push_str(&format!(" = {v}$0")),
+        None => out.push_str("$0"),
+    }
     out
 }
 
@@ -694,14 +734,34 @@ fn settings_insert_text(segments: &[&str]) -> String {
 /// yet".
 fn settings_path_prefix(source: &str, offset: usize) -> Vec<String> {
     let end = offset.min(source.len());
+    // A diagnostic code id has to be written as a quoted segment, so the
+    // scan has to accept `"`, `:` and `-` too. Stopping at them meant that
+    // typing a real code - the only way this key is ever written - left
+    // the scan seeing just `.`, and every entry was then filtered out as
+    // being on the wrong branch.
     let start = source[..end]
         .char_indices()
         .rev()
-        .take_while(|&(_, c)| c.is_alphanumeric() || c == '_' || c == '.')
+        .take_while(|&(_, c)| {
+            c.is_alphanumeric() || matches!(c, '_' | '.' | '"' | ':' | '-')
+        })
         .last()
         .map(|(i, _)| i)
         .unwrap_or(end);
-    source[start..end].split('.').map(str::to_string).collect()
+
+    // Split on `.` outside quotes, so a quoted segment containing one
+    // stays whole, then unquote - the caller compares against unquoted
+    // registry segments.
+    let mut segments = vec![String::new()];
+    let mut in_quotes = false;
+    for c in source[start..end].chars() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            '.' if !in_quotes => segments.push(String::new()),
+            _ => segments.last_mut().expect("seeded with one entry").push(c),
+        }
+    }
+    segments
 }
 
 /// Whether `key_pattern` is still reachable given the key path already
@@ -726,12 +786,12 @@ fn matching_remaining<'a>(key_pattern: &'a str, typed: &[String]) -> Option<Vec<
         return None;
     }
     for (i, seg) in done.iter().enumerate() {
-        if pattern[i] != "<name>" && pattern[i] != seg {
+        if !keys::is_placeholder(pattern[i]) && pattern[i] != seg {
             return None;
         }
     }
     let next = pattern[done.len()];
-    if next != "<name>" && !next.starts_with(partial) {
+    if !keys::is_placeholder(next) && !next.starts_with(partial) {
         return None;
     }
     Some(pattern[done.len()..].to_vec())
@@ -751,13 +811,13 @@ fn get_settings_completions(source: &str, offset: usize) -> Vec<CompletionItem> 
     comline_core::settings::catalog::block_summary()
         .iter()
         .filter_map(|f| {
-            let remaining = matching_remaining(f.key_pattern, &typed)?;
+            let remaining = matching_remaining(&f.key_pattern, &typed)?;
             Some(CompletionItem {
                 label: remaining.join("."),
                 kind: Some(CompletionItemKind::PROPERTY),
                 detail: Some(f.summary.to_string()),
                 documentation: Some(lsp_types::Documentation::String(f.description.to_string())),
-                insert_text: Some(settings_insert_text(&remaining)),
+                insert_text: Some(settings_insert_text(&remaining, &f.value)),
                 insert_text_format: Some(lsp_types::InsertTextFormat::SNIPPET),
                 ..Default::default()
             })
@@ -772,13 +832,15 @@ fn get_settings_completions(source: &str, offset: usize) -> Vec<CompletionItem> 
 fn get_annotation_completions(scope: AnnotationScope) -> Vec<CompletionItem> {
     annotations::for_scope(scope)
         .map(|info| {
-            let snippet = annotation_insert_text(info.key);
+            let snippet = annotation_insert_text(info);
             CompletionItem {
                 label: info.key.to_string(),
                 kind: Some(CompletionItemKind::PROPERTY),
                 detail: Some(info.description.to_string()),
-                insert_text: snippet.map(str::to_string),
-                insert_text_format: snippet.map(|_| lsp_types::InsertTextFormat::SNIPPET),
+                insert_text_format: snippet
+                    .as_ref()
+                    .map(|_| lsp_types::InsertTextFormat::SNIPPET),
+                insert_text: snippet,
                 ..Default::default()
             }
         })
@@ -1042,10 +1104,89 @@ mod tests {
 
         let completions = get_completions(source, &uri, position);
         let mode = completions.iter().find(|c| c.label == "mode").expect("mode should be offered");
-        assert_eq!(mode.insert_text.as_deref(), Some("mode = replace"));
+        // `mode`'s single legal keyword is still inserted finished rather
+        // than as a one-item choice list - it just falls out of
+        // `Keyword(["replace"])` now instead of being special-cased. The
+        // trailing `$0` is the final cursor stop every entry now ends with.
+        assert_eq!(mode.insert_text.as_deref(), Some("mode = replace$0"));
         assert_eq!(mode.insert_text_format, Some(lsp_types::InsertTextFormat::SNIPPET));
         assert_eq!(mode.kind, Some(CompletionItemKind::PROPERTY));
         assert!(mode.detail.is_some());
+    }
+
+    #[test]
+    fn the_diagnostics_level_key_inserts_a_usable_entry() {
+        // Triple-broken before: it inserted the literal text `<code>` with
+        // no tab-stop, unquoted (so it did not parse), and `= true` where
+        // one of five level strings is required.
+        let source = "settings {\n    d";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let position = Position::new(1, 5);
+
+        let completions = get_completions(source, &uri, position);
+        let level = completions
+            .iter()
+            .find(|c| c.label == "diagnostics.<code>.level")
+            .expect("the diagnostics level key should be offered");
+        assert_eq!(
+            level.insert_text.as_deref(),
+            Some(
+                "diagnostics.\"${1:namespace::code}\".level = \
+                 \"${2|allow,hint,info,warn,error|}\"$0"
+            )
+        );
+    }
+
+    #[test]
+    fn the_diagnostics_level_key_survives_typing_past_its_group() {
+        // `matching_remaining` treated only the literal `<name>` as a
+        // wildcard, so this entry was filtered out the moment anything was
+        // typed after `diagnostics.` - exactly when it is most wanted.
+        let source = "settings {\n    diagnostics.\"validation::deprecated-type-usage\".";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let position = Position::new(1, source.lines().last().unwrap().chars().count() as u32);
+
+        let completions = get_completions(source, &uri, position);
+        let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+        assert!(labels.contains(&"level"), "{labels:?}");
+    }
+
+    #[test]
+    fn a_bool_key_and_a_level_key_do_not_insert_the_same_value() {
+        // The editor assumed every settings key took a boolean. The value
+        // half now comes from each key's own `ValueType`.
+        let bool_key = settings_insert_text(&["allowed"], &ValueType::Bool);
+        assert_eq!(bool_key, "allowed = ${1:true}$0");
+
+        let level = comline_core::settings::catalog::block_summary()
+            .iter()
+            .find(|d| d.key_pattern == "diagnostics.<code>.level")
+            .expect("the registry lists it");
+        assert!(
+            settings_insert_text(&["level"], &level.value).contains("allow,hint"),
+            "a level key offers the level set, not a boolean"
+        );
+    }
+
+    #[test]
+    fn framings_choice_list_comes_from_core_not_a_local_copy() {
+        // This used to be a hardcoded `jsonrpc,datagram` here. Core is the
+        // authority on the set, so the two cannot drift.
+        let info = annotations::for_scope(AnnotationScope::Leading)
+            .find(|i| i.key == "framing")
+            .expect("framing is a protocol annotation");
+        let snippet = annotation_insert_text(info).expect("framing takes a value");
+        for spelling in config_value::spellings(&info.value) {
+            assert!(snippet.contains(spelling), "{spelling} missing from {snippet}");
+        }
+    }
+
+    #[test]
+    fn a_marker_annotation_inserts_no_value_half() {
+        let info = annotations::for_scope(AnnotationScope::Function)
+            .find(|i| i.key == "idempotent")
+            .expect("idempotent is a function annotation");
+        assert_eq!(annotation_insert_text(info), None, "a marker takes no `= value`");
     }
 
     #[test]

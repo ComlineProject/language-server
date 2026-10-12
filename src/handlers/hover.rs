@@ -734,7 +734,7 @@ fn create_annotation_hover(info: &annotations::AnnotationInfo) -> Hover {
     let hover = AnnotationHover::new(info.key)
         .description(info.description)
         .default(info.default)
-        .value(info.value);
+        .value(annotations::describe_value(info));
 
     if info.consumed_by.is_empty() {
         hover.warning("not consumed anywhere yet — decided, advisory metadata only")
