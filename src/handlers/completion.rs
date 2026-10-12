@@ -12,6 +12,8 @@ use crate::parser;
 use crate::util::{in_comment_or_string, position_to_offset};
 use comline_core::schema::idl::annotations::{self, AnnotationScope};
 use comline_core::schema::idl::vocabulary::{self, KeywordKind};
+use comline_core::config_value::{self, ValueType};
+use comline_core::settings::keys::{self, NameKind};
 use lsp_types::{CompletionItem, CompletionItemKind, Position, SymbolKind, Url};
 use std::collections::BTreeSet;
 
@@ -94,7 +96,8 @@ pub fn get_completions_with_project<S: ProjectSource>(
             completions.push(function_keyword_completion());
         }
         CompletionContext::AnnotationKey(scope) => {
-            completions.extend(get_annotation_completions(scope));
+            completions
+                .extend(get_annotation_completions(scope, &effective_settings(source, offset, other_files)));
         }
         CompletionContext::DeclarationName => {
             // Naming something new — the identifier right after `struct`/
@@ -640,47 +643,85 @@ fn get_type_completions(symbol_table: Option<&symbols::SymbolTable>) -> Vec<Comp
         .collect()
 }
 
-/// The snippet a known annotation key inserts — completion-specific
-/// (editor insertion mechanics), so it lives here rather than in the
-/// shared `comline_core::schema::idl::annotations` table, which only
-/// describes *meaning*.
-/// `None` falls back to inserting just the bare key name — correct as-is
-/// for a bare-marker annotation like `idempotent` (no `=value`), not just
-/// a fallback for one this function hasn't gotten to yet.
-fn annotation_insert_text(key: &str) -> Option<&'static str> {
-    match key {
-        "validators" => Some("validators = [$0]"),
-        "timeout_ms" => Some("timeout_ms = $0"),
-        "framing" => Some("framing = \"${1|jsonrpc,datagram|}\"$0"),
-        _ => None,
-    }
+/// The snippet for one `= value` tab-stop of the given type, numbered
+/// `n`. Insertion mechanics are the editor's business; *what values are
+/// legal* is core's, so the shape comes from [`ValueType`] rather than
+/// from a table here that would have to be kept in step with it by hand.
+///
+/// Returns `None` for a type that takes no value at all, so the caller
+/// inserts a bare marker rather than `key = ` with nothing after it.
+fn value_snippet(ty: &ValueType, n: usize) -> Option<String> {
+    let spellings = config_value::spellings(ty);
+    Some(match ty {
+        ValueType::Marker => return None,
+        ValueType::Bool | ValueType::BoolOrStr => format!("${{{n}:true}}"),
+        ValueType::Integer => format!("${{{n}:0}}"),
+        ValueType::Str => format!("\"${{{n}:text}}\""),
+        // A closed set the editor can offer as a choice list. Quoted for
+        // `StrEnum` (a string from a set), bare for `Keyword`.
+        ValueType::StrEnum(_) => format!("\"${{{n}|{}|}}\"", spellings.join(",")),
+        // A single legal keyword is not a choice - insert it finished.
+        ValueType::Keyword(_) if spellings.len() == 1 => spellings[0].to_string(),
+        ValueType::Keyword(_) => format!("${{{n}|{}|}}", spellings.join(",")),
+        ValueType::Name => format!("${{{n}:Name}}"),
+        ValueType::ValidatorList => format!("[${n}]"),
+    })
 }
 
-/// `<name>` replaced with a snippet tab-stop, plus a trailing
-/// ` = <value>` tab-stop of its own — a completion inserts a whole,
-/// immediately-editable entry, not just the key. `segments` is already
-/// scoped to whatever's left to type (see [`matching_remaining`]) — asking
-/// at the very start of a block passes a catalog entry's full path, same
-/// as it always has.
-fn settings_insert_text(segments: &[&str]) -> String {
-    if segments == ["mode"] {
-        return "mode = replace".to_string();
-    }
+/// The snippet a known annotation key inserts. The value half comes from
+/// the annotation's own [`ValueType`] in core, so a key whose accepted
+/// values change does not need a matching edit here - this used to carry
+/// its own copy of `framing`'s choice list, and listed only the two
+/// canonical spellings while core accepted five.
+///
+/// `None` inserts just the bare key name, which is what a marker
+/// annotation like `idempotent` should produce.
+fn annotation_insert_text(info: &annotations::AnnotationInfo) -> Option<String> {
+    let value = value_snippet(&info.value, 1)?;
+    Some(format!("{} = {value}$0", info.key))
+}
+
+/// Each placeholder segment replaced with a snippet tab-stop, plus a
+/// trailing ` = <value>` tab-stop whose shape comes from the key's own
+/// [`ValueType`] — a completion inserts a whole, immediately-editable
+/// entry, not just the key. `segments` is already scoped to whatever's
+/// left to type (see [`matching_remaining`]) — asking at the very start of
+/// a block passes a catalog entry's full path, same as it always has.
+///
+/// Two things used to be hardcoded here. The value was always
+/// `${n:true}`, which is wrong for `diagnostics.<code>.level` (one of five
+/// strings) and only right for the boolean keys by coincidence; and
+/// `mode` was special-cased to insert its single legal keyword. Both now
+/// fall out of the type: `mode`'s `Keyword` has exactly one spelling, so
+/// it still inserts `mode = replace`.
+///
+/// A placeholder that must be quoted to parse is quoted — see
+/// [`NameKind::quoted_in_ids`]. Inserting `diagnostics.<code>.level`
+/// unquoted produced a syntax error.
+fn settings_insert_text(segments: &[&str], value: &ValueType) -> String {
     let mut n = 0;
     let mut out = String::new();
     for &segment in segments {
         if !out.is_empty() {
             out.push('.');
         }
-        if segment == "<name>" {
-            n += 1;
-            out.push_str(&format!("${{{n}:name}}"));
-        } else {
-            out.push_str(segment);
+        match NameKind::from_placeholder(segment) {
+            Some(kind) => {
+                n += 1;
+                let stop = format!("${{{n}:{}}}", kind.hint());
+                if kind.quoted_in_ids() {
+                    out.push_str(&format!("\"{stop}\""));
+                } else {
+                    out.push_str(&stop);
+                }
+            }
+            None => out.push_str(segment),
         }
     }
-    n += 1;
-    out.push_str(&format!(" = ${{{n}:true}}$0"));
+    match value_snippet(value, n + 1) {
+        Some(v) => out.push_str(&format!(" = {v}$0")),
+        None => out.push_str("$0"),
+    }
     out
 }
 
@@ -694,14 +735,34 @@ fn settings_insert_text(segments: &[&str]) -> String {
 /// yet".
 fn settings_path_prefix(source: &str, offset: usize) -> Vec<String> {
     let end = offset.min(source.len());
+    // A diagnostic code id has to be written as a quoted segment, so the
+    // scan has to accept `"`, `:` and `-` too. Stopping at them meant that
+    // typing a real code - the only way this key is ever written - left
+    // the scan seeing just `.`, and every entry was then filtered out as
+    // being on the wrong branch.
     let start = source[..end]
         .char_indices()
         .rev()
-        .take_while(|&(_, c)| c.is_alphanumeric() || c == '_' || c == '.')
+        .take_while(|&(_, c)| {
+            c.is_alphanumeric() || matches!(c, '_' | '.' | '"' | ':' | '-')
+        })
         .last()
         .map(|(i, _)| i)
         .unwrap_or(end);
-    source[start..end].split('.').map(str::to_string).collect()
+
+    // Split on `.` outside quotes, so a quoted segment containing one
+    // stays whole, then unquote - the caller compares against unquoted
+    // registry segments.
+    let mut segments = vec![String::new()];
+    let mut in_quotes = false;
+    for c in source[start..end].chars() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            '.' if !in_quotes => segments.push(String::new()),
+            _ => segments.last_mut().expect("seeded with one entry").push(c),
+        }
+    }
+    segments
 }
 
 /// Whether `key_pattern` is still reachable given the key path already
@@ -726,12 +787,12 @@ fn matching_remaining<'a>(key_pattern: &'a str, typed: &[String]) -> Option<Vec<
         return None;
     }
     for (i, seg) in done.iter().enumerate() {
-        if pattern[i] != "<name>" && pattern[i] != seg {
+        if !keys::is_placeholder(pattern[i]) && pattern[i] != seg {
             return None;
         }
     }
     let next = pattern[done.len()];
-    if next != "<name>" && !next.starts_with(partial) {
+    if !keys::is_placeholder(next) && !next.starts_with(partial) {
         return None;
     }
     Some(pattern[done.len()..].to_vec())
@@ -748,16 +809,49 @@ fn matching_remaining<'a>(key_pattern: &'a str, typed: &[String]) -> Option<Vec<
 /// dotted path again.
 fn get_settings_completions(source: &str, offset: usize) -> Vec<CompletionItem> {
     let typed = settings_path_prefix(source, offset);
-    comline_core::settings::catalog::block_summary()
+    let listing = comline_core::settings::catalog::block_summary();
+
+    // A key may be written with a declaration path in front of it
+    // (`struct.field.validators.allowed`), which `enforcement` honours and
+    // the plain listing never mentioned. Offering every prefix crossed
+    // with every key at the top level would bury the common case, so the
+    // scoped forms are offered only once a decl path has actually been
+    // typed - which is also the point where the unscoped patterns stop
+    // matching and the list used to go empty.
+    let (decl, _) = keys::DeclPath::split_prefix(
+        &typed.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    let patterns: Vec<(String, &comline_core::settings::catalog::FieldDoc)> = listing
         .iter()
-        .filter_map(|f| {
-            let remaining = matching_remaining(f.key_pattern, &typed)?;
+        .flat_map(|f| {
+            let mut forms = vec![(f.key_pattern.clone(), f)];
+            if f.decl_scopable {
+                for path in keys::DeclPath::ALL {
+                    forms.push((format!("{}.{}", path.dotted(), f.key_pattern), f));
+                }
+            }
+            forms
+        })
+        // With no decl path typed, offer only the unscoped forms; once one
+        // is, offer the scoped ones that extend it.
+        .filter(|(pattern, _)| {
+            let starts_scoped = keys::DeclPath::ALL
+                .iter()
+                .any(|p| pattern.starts_with(&format!("{}.", p.dotted())));
+            starts_scoped == decl.is_some()
+        })
+        .collect();
+
+    patterns
+        .iter()
+        .filter_map(|(pattern, f)| {
+            let remaining = matching_remaining(pattern, &typed)?;
             Some(CompletionItem {
                 label: remaining.join("."),
                 kind: Some(CompletionItemKind::PROPERTY),
                 detail: Some(f.summary.to_string()),
                 documentation: Some(lsp_types::Documentation::String(f.description.to_string())),
-                insert_text: Some(settings_insert_text(&remaining)),
+                insert_text: Some(settings_insert_text(&remaining, &f.value)),
                 insert_text_format: Some(lsp_types::InsertTextFormat::SNIPPET),
                 ..Default::default()
             })
@@ -769,20 +863,139 @@ fn get_settings_completions(source: &str, offset: usize) -> Vec<CompletionItem> 
 /// [`annotations::KNOWN_ANNOTATIONS`] — the same table [`hover`] reads for
 /// an annotation key's own tooltip, so the two can't describe one key two
 /// different ways.
-fn get_annotation_completions(scope: AnnotationScope) -> Vec<CompletionItem> {
+/// `source` with the line containing `offset` replaced by blanks - same
+/// byte length, so every other span stays put.
+fn blank_line_at(source: &str, offset: usize) -> String {
+    let offset = offset.min(source.len());
+    let start = source[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let end = source[offset..].find('\n').map(|i| offset + i).unwrap_or(source.len());
+    let mut out = String::with_capacity(source.len());
+    out.push_str(&source[..start]);
+    out.extend(source[start..end].chars().map(|c| if c == '\n' { c } else { ' ' }));
+    out.push_str(&source[end..]);
+    out
+}
+
+/// The settings in force for this schema: the package manifest's (or
+/// Comline's built-in defaults when no manifest is in view) with the
+/// file's own `settings { ... }` block layered on top. The same resolution
+/// `hover` does, so the two agree on whether an annotation is permitted.
+///
+/// Declaration-scoped keys are deliberately not resolved here - see
+/// [`forbidding_key`].
+fn effective_settings<S: ProjectSource>(
+    source: &str,
+    offset: usize,
+    other_files: &[S],
+) -> comline_core::settings::SettingsDict {
+    use comline_core::schema::ir::compiler::interpreter::incremental::IncrementalInterpreter;
+    use comline_core::schema::ir::compiler::Compile;
+    use comline_core::settings::effective::{effective_schema_settings, schema_settings};
+
+    let package = other_files
+        .iter()
+        .find(|f| f.dependency().is_none() && crate::analysis::source::is_manifest(f.uri()))
+        .map(|f| crate::analysis::source::declared_settings(f.text()))
+        .unwrap_or_else(crate::analysis::source::base_settings);
+
+    // The half-typed annotation the cursor is on does not parse, and a
+    // document with one parse error is no document at all - so asking
+    // about the file as it stands yields nothing, which is exactly when
+    // this is called. Blank that one line and ask about the rest: the
+    // `settings` block the answer depends on is elsewhere in the file.
+    let document = parser::parse(source)
+        .ok()
+        .and_then(|r| r.document)
+        .or_else(|| {
+            let without_cursor_line = blank_line_at(source, offset);
+            parser::parse(&without_cursor_line).ok().and_then(|r| r.document)
+        });
+    let Some(document) = document else {
+        return package;
+    };
+    let units = IncrementalInterpreter::from_declarations(document.0);
+    let schema = schema_settings(&units);
+    effective_schema_settings(&package, &schema)
+}
+
+fn get_annotation_completions(
+    scope: AnnotationScope,
+    effective: &comline_core::settings::SettingsDict,
+) -> Vec<CompletionItem> {
     annotations::for_scope(scope)
         .map(|info| {
-            let snippet = annotation_insert_text(info.key);
+            let snippet = annotation_insert_text(info);
+            let forbidden = forbidding_key(info.key, scope, effective);
             CompletionItem {
                 label: info.key.to_string(),
                 kind: Some(CompletionItemKind::PROPERTY),
-                detail: Some(info.description.to_string()),
-                insert_text: snippet.map(str::to_string),
-                insert_text_format: snippet.map(|_| lsp_types::InsertTextFormat::SNIPPET),
+                detail: Some(match &forbidden {
+                    Some(key) => format!("forbidden here by `{key}` — {}", info.description),
+                    None => info.description.to_string(),
+                }),
+                // Shown but marked, not hidden: the settings forbidding it
+                // may well be the thing the author wants to change, and a
+                // key that silently vanishes from the list is not a usable
+                // explanation of why.
+                tags: forbidden
+                    .as_ref()
+                    .map(|_| vec![lsp_types::CompletionItemTag::DEPRECATED]),
+                insert_text_format: snippet
+                    .as_ref()
+                    .map(|_| lsp_types::InsertTextFormat::SNIPPET),
+                insert_text: snippet,
                 ..Default::default()
             }
         })
         .collect()
+}
+
+/// The settings key that forbids `@key` at `scope`, if one does.
+///
+/// Resolved through the registry's own candidate order, the same one
+/// `enforcement` consults, so the label cannot contradict the build. A
+/// declaration-scoped key can allow an annotation the schema-level key
+/// forbids, and completion only knows the *scope* a cursor is in, not
+/// which declaration - so an annotation is called forbidden only when
+/// every declaration path with that scope forbids it. Anything less
+/// conservative would mark keys the build then accepts.
+fn forbidding_key(
+    key: &str,
+    scope: AnnotationScope,
+    effective: &comline_core::settings::SettingsDict,
+) -> Option<String> {
+    use comline_core::settings::value::SettingsValue;
+
+    let shape = keys::annotations_allowed();
+    let paths: Vec<keys::DeclPath> = keys::DeclPath::ALL
+        .into_iter()
+        .filter(|p| p.annotation_scope() == scope)
+        .collect();
+
+    // `@settings` is `Universal` - no declaration path has that scope, so
+    // only the unscoped form applies.
+    let candidate_sets: Vec<Vec<String>> = if paths.is_empty() {
+        vec![vec![shape.key(None, Some(key))]]
+    } else {
+        paths.iter().map(|p| shape.candidates(*p, key)).collect()
+    };
+
+    let mut forbidding = None;
+    for candidates in candidate_sets {
+        // First key with an opinion wins, exactly as enforcement resolves.
+        let verdict = candidates.iter().find_map(|candidate| {
+            match effective.get_path(candidate) {
+                Some(SettingsValue::Bool(allowed)) => Some((*allowed, candidate.clone())),
+                _ => None,
+            }
+        });
+        match verdict {
+            Some((false, candidate)) => forbidding = Some(candidate),
+            // Allowed, or no key at all: allowed by default.
+            _ => return None,
+        }
+    }
+    forbidding
 }
 
 /// Completion context
@@ -1042,10 +1255,174 @@ mod tests {
 
         let completions = get_completions(source, &uri, position);
         let mode = completions.iter().find(|c| c.label == "mode").expect("mode should be offered");
-        assert_eq!(mode.insert_text.as_deref(), Some("mode = replace"));
+        // `mode`'s single legal keyword is still inserted finished rather
+        // than as a one-item choice list - it just falls out of
+        // `Keyword(["replace"])` now instead of being special-cased. The
+        // trailing `$0` is the final cursor stop every entry now ends with.
+        assert_eq!(mode.insert_text.as_deref(), Some("mode = replace$0"));
         assert_eq!(mode.insert_text_format, Some(lsp_types::InsertTextFormat::SNIPPET));
         assert_eq!(mode.kind, Some(CompletionItemKind::PROPERTY));
         assert!(mode.detail.is_some());
+    }
+
+    #[test]
+    fn framing_is_marked_forbidden_in_a_default_package() {
+        // The built-in default forbids `@framing`, so the editor used to
+        // suggest an annotation that produces a hard build error the
+        // moment it is accepted.
+        let source = "@\nprotocol Thing {\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let position = Position::new(0, 1);
+
+        let completions = get_completions(source, &uri, position);
+        let framing = completions
+            .iter()
+            .find(|c| c.label == "framing")
+            .expect("framing should still be offered, just marked");
+        assert!(
+            framing.detail.as_deref().unwrap_or_default().contains("forbidden here by"),
+            "got: {:?}",
+            framing.detail
+        );
+        assert_eq!(framing.tags, Some(vec![lsp_types::CompletionItemTag::DEPRECATED]));
+    }
+
+    #[test]
+    fn framing_is_unmarked_once_the_schema_allows_it() {
+        let source = "@\nprotocol Thing {\n}\n\n\
+                      settings {\n    annotations.framing.allowed = true\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let position = Position::new(0, 1);
+
+        let completions = get_completions(source, &uri, position);
+        let framing = completions.iter().find(|c| c.label == "framing").expect("offered");
+        assert_eq!(framing.tags, None, "got: {:?}", framing.detail);
+    }
+
+    #[test]
+    fn an_ordinary_annotation_is_not_marked() {
+        let source = "protocol Thing {\n    @\n    function f();\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let position = Position::new(1, 5);
+
+        let completions = get_completions(source, &uri, position);
+        let idempotent = completions
+            .iter()
+            .find(|c| c.label == "idempotent")
+            .expect("idempotent should be offered");
+        assert_eq!(idempotent.tags, None);
+    }
+
+    #[test]
+    fn a_decl_scoped_key_is_offered_once_a_decl_path_is_typed() {
+        // `enforcement` honours `struct.field.validators.allowed`, but the
+        // editor offered nothing here and the list went empty - the
+        // unscoped patterns all start with a group name, so typing
+        // `struct.` matched none of them.
+        let source = "settings {\n    struct.field.";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let position = Position::new(1, source.lines().last().unwrap().chars().count() as u32);
+
+        let completions = get_completions(source, &uri, position);
+        let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+        assert!(labels.contains(&"validators.allowed"), "{labels:?}");
+        assert!(labels.contains(&"annotations.<name>.allowed"), "{labels:?}");
+        // `diagnostics` is project-wide only, so it must not be offered
+        // under a declaration path.
+        assert!(!labels.iter().any(|l| l.starts_with("diagnostics")), "{labels:?}");
+    }
+
+    #[test]
+    fn the_top_level_listing_is_not_buried_by_the_scoped_forms() {
+        // Six decl paths crossed with every scopable key would swamp the
+        // common case, so the scoped forms appear only once a path is
+        // typed.
+        let source = "settings {\n    ";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let position = Position::new(1, 4);
+
+        let completions = get_completions(source, &uri, position);
+        let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+        assert!(
+            !labels.iter().any(|l| l.starts_with("struct.")),
+            "scoped forms should not be offered unprompted: {labels:?}"
+        );
+        assert!(labels.contains(&"validators.allowed"), "{labels:?}");
+    }
+
+    #[test]
+    fn the_diagnostics_level_key_inserts_a_usable_entry() {
+        // Triple-broken before: it inserted the literal text `<code>` with
+        // no tab-stop, unquoted (so it did not parse), and `= true` where
+        // one of five level strings is required.
+        let source = "settings {\n    d";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let position = Position::new(1, 5);
+
+        let completions = get_completions(source, &uri, position);
+        let level = completions
+            .iter()
+            .find(|c| c.label == "diagnostics.<code>.level")
+            .expect("the diagnostics level key should be offered");
+        assert_eq!(
+            level.insert_text.as_deref(),
+            Some(
+                "diagnostics.\"${1:namespace::code}\".level = \
+                 \"${2|allow,hint,info,warn,error|}\"$0"
+            )
+        );
+    }
+
+    #[test]
+    fn the_diagnostics_level_key_survives_typing_past_its_group() {
+        // `matching_remaining` treated only the literal `<name>` as a
+        // wildcard, so this entry was filtered out the moment anything was
+        // typed after `diagnostics.` - exactly when it is most wanted.
+        let source = "settings {\n    diagnostics.\"validation::deprecated-type-usage\".";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let position = Position::new(1, source.lines().last().unwrap().chars().count() as u32);
+
+        let completions = get_completions(source, &uri, position);
+        let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+        assert!(labels.contains(&"level"), "{labels:?}");
+    }
+
+    #[test]
+    fn a_bool_key_and_a_level_key_do_not_insert_the_same_value() {
+        // The editor assumed every settings key took a boolean. The value
+        // half now comes from each key's own `ValueType`.
+        let bool_key = settings_insert_text(&["allowed"], &ValueType::Bool);
+        assert_eq!(bool_key, "allowed = ${1:true}$0");
+
+        let level = comline_core::settings::catalog::block_summary()
+            .iter()
+            .find(|d| d.key_pattern == "diagnostics.<code>.level")
+            .expect("the registry lists it");
+        assert!(
+            settings_insert_text(&["level"], &level.value).contains("allow,hint"),
+            "a level key offers the level set, not a boolean"
+        );
+    }
+
+    #[test]
+    fn framings_choice_list_comes_from_core_not_a_local_copy() {
+        // This used to be a hardcoded `jsonrpc,datagram` here. Core is the
+        // authority on the set, so the two cannot drift.
+        let info = annotations::for_scope(AnnotationScope::Leading)
+            .find(|i| i.key == "framing")
+            .expect("framing is a protocol annotation");
+        let snippet = annotation_insert_text(info).expect("framing takes a value");
+        for spelling in config_value::spellings(&info.value) {
+            assert!(snippet.contains(spelling), "{spelling} missing from {snippet}");
+        }
+    }
+
+    #[test]
+    fn a_marker_annotation_inserts_no_value_half() {
+        let info = annotations::for_scope(AnnotationScope::Function)
+            .find(|i| i.key == "idempotent")
+            .expect("idempotent is a function annotation");
+        assert_eq!(annotation_insert_text(info), None, "a marker takes no `= value`");
     }
 
     #[test]

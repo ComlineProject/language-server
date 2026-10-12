@@ -8,6 +8,7 @@ use comline_core::diagnostics::Severity;
 use comline_core::schema::idl::grammar::Document;
 use comline_core::schema::ir::compiler::interpreter::incremental::IncrementalInterpreter;
 use comline_core::schema::ir::compiler::settings::enforcement::check_settings_enforcement;
+use comline_core::schema::ir::compiler::settings::resolution::check_settings_conflicts;
 use comline_core::schema::ir::compiler::settings::severity::resolve_diagnostic_overrides;
 use comline_core::schema::ir::compiler::Compile;
 use comline_core::schema::ir::frozen::unit::FrozenUnit;
@@ -57,7 +58,7 @@ fn lsp_tags(code_id: &str) -> Option<Vec<DiagnosticTag>> {
 /// `comline build` runs. Call only on a document that parsed cleanly.
 pub fn validation_diagnostics(source: &str, document: &Document) -> Vec<Diagnostic> {
     let uri = Url::parse("file:///schema.ids").expect("static URL");
-    validation_diagnostics_with(source, document, vec![], &SettingsDict::default(), &uri)
+    validation_diagnostics_with(source, document, vec![], &crate::analysis::source::base_settings(), &uri)
 }
 
 /// [`validation_diagnostics`], with `extra` imports appended to the file's
@@ -74,6 +75,16 @@ fn validation_diagnostics_with(
     package_settings: &SettingsDict,
     uri: &Url,
 ) -> Vec<Diagnostic> {
+    // The `settings` block's own checks - duplicate and conflicting keys,
+    // a bad `mode` value, an unrecognised key, a wrongly-typed value. The
+    // compile path runs these; this path called plain `from_declarations`,
+    // which skips them, so none of them had ever appeared in the editor.
+    // They are reported here rather than by switching to
+    // `check_and_from_declarations`, whose import and alias checks would
+    // duplicate `analysis::import_check`'s own.
+    let settings_errors =
+        check_settings_conflicts(&document.0).err().unwrap_or_default();
+
     let mut units = IncrementalInterpreter::from_declarations(document.0.clone());
     units.extend(extra);
 
@@ -97,6 +108,21 @@ fn validation_diagnostics_with(
             .unwrap_or_default(),
     );
 
+    // Where both passes have an opinion on the same written value, keep
+    // enforcement's. The two legitimately overlap: the block-level check
+    // above sees every value eagerly, while enforcement only sees the keys
+    // it actually consults - but reports those against the declaration
+    // affected as well as the entry itself, which is the more useful of
+    // the two. Same code at the same origin means the same mistake, so
+    // only the ones enforcement said nothing about are added.
+    let already: Vec<_> =
+        errors.iter().map(|e| (e.code.id, e.span)).collect();
+    errors.extend(
+        settings_errors
+            .into_iter()
+            .filter(|e| !already.contains(&(e.code.id, e.span))),
+    );
+
     if errors.is_empty() {
         return vec![];
     }
@@ -112,11 +138,18 @@ fn validation_diagnostics_with(
             let effective_severity = error.effective_severity();
             let lsp_code = Some(NumberOrString::String(code.id.to_string()));
 
-            let message = if error.context.is_empty() {
+            // `help` carries the actionable half - a "did you mean" for a
+            // misspelled settings key, say. The other conversion in this
+            // module already appended it; this one dropped it, so the
+            // suggestion never reached the editor.
+            let mut message = if error.context.is_empty() {
                 error.message
             } else {
                 format!("{} — {}", error.message, error.context)
             };
+            if let Some(help) = &error.help {
+                message = format!("{message} — {help}");
+            }
 
             // No secondary span: today's single-diagnostic shape, unchanged.
             let Some((sec_span, sec_label)) = &error.secondary else {
@@ -525,6 +558,42 @@ struct User {
     fn messages(source: &str) -> Vec<String> {
         let r = parser::parse(source).unwrap();
         all_diagnostics(source, &r.errors, r.document.as_ref()).into_iter().map(|d| d.message).collect()
+    }
+
+    #[test]
+    fn an_unrecognised_settings_key_is_reported_in_the_editor() {
+        // The editor ran none of the `settings` block's own checks, so a
+        // typo here produced no diagnostic at all - the key just silently
+        // did nothing.
+        let found = messages(
+            "struct Message {\n    body: str\n}\n\n\
+             settings {\n    annotations.framing.alowed = true\n}\n",
+        );
+        assert!(
+            found.iter().any(|m| m.contains("annotations.framing.allowed")),
+            "expected a suggestion: {found:?}"
+        );
+    }
+
+    #[test]
+    fn a_conflicting_settings_key_is_reported_in_the_editor() {
+        // `settings::conflict` had never surfaced in the editor either.
+        let found = messages(
+            "struct Message {\n    body: str\n}\n\n\
+             settings {\n    validators.allowed = true\n    validators.allowed = false\n}\n",
+        );
+        assert!(!found.is_empty(), "a conflicting key should be reported");
+    }
+
+    #[test]
+    fn an_open_namespace_settings_key_is_still_not_reported() {
+        // The flip side: `settings` stays open outside the groups core
+        // owns, so an unrecognised *top-level* key must stay quiet.
+        let found = messages(
+            "struct Message {\n    body: str\n}\n\n\
+             settings {\n    forbid_indexing = true\n}\n",
+        );
+        assert!(found.is_empty(), "an open-namespace key must not be flagged: {found:?}");
     }
 
     #[test]
