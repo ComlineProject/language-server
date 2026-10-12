@@ -51,6 +51,17 @@ fn lsp_severity(severity: Severity) -> DiagnosticSeverity {
     }
 }
 
+/// Where the `HINT` half of a two-site diagnostic sends the reader. The
+/// wording used to name the settings entry unconditionally - true of the
+/// only two-site diagnostic there was when it was written, and wrong the
+/// moment a duplicate declaration became another.
+fn hint_pointer(code_id: &str) -> &'static str {
+    match code_id {
+        DUPLICATE_DECLARATION | DUPLICATE_BLOCK => "see the error at the duplicate",
+        _ => "see the error at the settings entry",
+    }
+}
+
 /// The LSP tags a diagnostic's own code implies, if any - `DEPRECATED`
 /// makes VS Code strike through the affected range, the standard editor
 /// presentation for "this still works, but don't use it" (same as
@@ -240,7 +251,7 @@ fn validation_diagnostics_with(
                 code: lsp_code,
                 code_description: None,
                 source: Some("comline".to_string()),
-                message: format!("{sec_label} — see the error at the settings entry"),
+                message: format!("{sec_label} — {}", hint_pointer(code.id)),
                 related_information: Some(vec![DiagnosticRelatedInformation {
                     location: Location { uri: uri.clone(), range },
                     message,
@@ -914,6 +925,11 @@ mod duplicate_declaration_tests {
             error.range,
         );
         assert_eq!(error.code, Some(NumberOrString::String(DUPLICATE_DECLARATION.to_string())));
+
+        // The hint sends you to the duplicate, not to a settings entry -
+        // that wording was true of the only two-site diagnostic there was
+        // when it was written.
+        assert!(hint.message.ends_with("see the error at the duplicate"), "{}", hint.message);
     }
 
     /// A `settings` preset shares no namespace with a declaration, so the
