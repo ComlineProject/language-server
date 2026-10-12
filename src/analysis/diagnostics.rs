@@ -12,11 +12,12 @@ use comline_core::schema::ir::compiler::settings::resolution::check_settings_con
 use comline_core::schema::ir::compiler::settings::severity::resolve_diagnostic_overrides;
 use comline_core::schema::ir::compiler::Compile;
 use comline_core::schema::ir::frozen::unit::FrozenUnit;
+use comline_core::package::layout;
 use comline_core::schema::ir::validation;
 use comline_core::settings::{SettingsDict, SettingsSpans};
 use lsp_types::{
     Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, DiagnosticTag, Location,
-    NumberOrString, Url,
+    NumberOrString, Range, Url,
 };
 
 /// The `code` of a missing-import diagnostic - what the quick fix in
@@ -29,6 +30,10 @@ pub const UNRESOLVED_IMPORT: &str = "import::unresolved";
 
 /// The `code` of a dependency import that can't be checked.
 pub const UNVERIFIED_IMPORT: &str = "import::unverified";
+
+/// The `code` of a schema file whose own name can't be used - an IDL
+/// keyword, or a name a target language's module system has spoken for.
+pub const RESERVED_SCHEMA_NAME: &str = "schema::reserved-name";
 
 /// The `code` of a name declared twice in one schema - a struct and an
 /// error, two errors, two validators. Both the quick fixes in
@@ -301,10 +306,41 @@ pub fn project_diagnostics(project: &Project, doc: usize) -> Vec<Diagnostic> {
         here.uri,
         &here.namespace,
     );
+    diagnostics.extend(reserved_name_diagnostic(here));
     diagnostics.extend(check.missing.iter().map(|m| missing_import_diagnostic(here.source, m)));
     diagnostics.extend(check.unresolved.iter().map(|u| unresolved_import_diagnostic(here.source, u)));
     diagnostics.extend(check.unverified.iter().map(|u| unverified_import_diagnostic(here.source, u)));
     diagnostics
+}
+
+/// A file whose own name core refuses to compile.
+///
+/// Core enforces this on the build path, which the language server does not
+/// run, so without this the editor would stay silent about a file that
+/// cannot build at all - the one disagreement with `comline build` worth
+/// going out of the way to avoid. The whole file is what's wrong, so it's
+/// reported at the top rather than at some span inside it.
+fn reserved_name_diagnostic(here: &crate::analysis::project::ProjectDoc) -> Option<Diagnostic> {
+    // A dependency's own schemas are not this package's to rename, and
+    // nothing here is editing them.
+    if here.dependency.is_some() {
+        return None;
+    }
+    let (segment, reason) = layout::reserved_in_namespace(&here.namespace)?;
+    Some(Diagnostic {
+        range: Range::default(),
+        severity: Some(DiagnosticSeverity::ERROR),
+        code: Some(NumberOrString::String(RESERVED_SCHEMA_NAME.to_string())),
+        code_description: None,
+        source: Some("comline".to_string()),
+        message: format!(
+            "this schema uses the reserved name '{segment}' - {}",
+            reason.help(),
+        ),
+        related_information: None,
+        tags: None,
+        data: None,
+    })
 }
 
 /// Worded like core's own error, so the editor and `comline check` say the
@@ -991,5 +1027,54 @@ mod duplicate_declaration_tests {
         let found = project_diagnostics(&project, doc);
         let error = found.iter().find(|d| d.severity == Some(DiagnosticSeverity::ERROR)).unwrap();
         assert!(error.message.contains("'chat::Test'"), "{}", error.message);
+    }
+}
+
+/// Core refuses a schema whose own filename is an IDL keyword or a name a
+/// target language's module system has spoken for. That check lives on the
+/// build path, which this server doesn't run, so it is mirrored here -
+/// otherwise the editor stays quiet about a file that cannot build at all.
+#[cfg(test)]
+mod reserved_schema_name_tests {
+    use super::*;
+    use crate::analysis::source::SourceFile;
+
+    fn diagnostics_for(path: &str) -> Vec<Diagnostic> {
+        let uri = Url::parse(path).unwrap();
+        let project = Project::with_active(&uri, "struct Thing {\n    id: u64\n}\n", &[] as &[SourceFile]);
+        let doc = project.index_of(&uri).unwrap();
+        project_diagnostics(&project, doc)
+    }
+
+    fn reserved(path: &str) -> Option<Diagnostic> {
+        diagnostics_for(path)
+            .into_iter()
+            .find(|d| d.code == Some(NumberOrString::String(RESERVED_SCHEMA_NAME.to_string())))
+    }
+
+    #[test]
+    fn a_target_module_name_is_flagged_at_the_top_of_the_file() {
+        let d = reserved("file:///pkg/src/main.ids").expect("main.ids is reserved");
+        assert_eq!(d.severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(d.range, Range::default(), "the file's own name is what's wrong");
+        assert!(d.message.contains("'main'"), "{}", d.message);
+        assert!(d.message.contains("module name in generated code"), "{}", d.message);
+    }
+
+    #[test]
+    fn a_keyword_gets_the_other_explanation() {
+        let d = reserved("file:///pkg/src/self.ids").expect("self.ids is reserved");
+        assert!(d.message.contains("keyword of the schema language"), "{}", d.message);
+    }
+
+    /// A directory segment is as much a module name as the filename is.
+    #[test]
+    fn a_reserved_directory_segment_is_flagged() {
+        assert!(reserved("file:///pkg/src/main/foo.ids").is_some());
+    }
+
+    #[test]
+    fn an_ordinary_name_is_not_flagged() {
+        assert!(reserved("file:///pkg/src/greeting.ids").is_none());
     }
 }
