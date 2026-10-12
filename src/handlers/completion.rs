@@ -14,6 +14,7 @@ use comline_core::schema::idl::annotations::{self, AnnotationScope};
 use comline_core::schema::idl::vocabulary::{self, KeywordKind};
 use comline_core::config_value::{self, ValueType};
 use comline_core::settings::keys::{self, NameKind};
+use crate::analysis::symbols::Namespace;
 use lsp_types::{CompletionItem, CompletionItemKind, Position, SymbolKind, Url};
 use std::collections::BTreeSet;
 
@@ -135,7 +136,7 @@ fn get_import_completions<S: ProjectSource>(
 ) -> Vec<CompletionItem> {
     let siblings = Project::new(other_files.iter());
     let mut in_scope: BTreeSet<String> = symbol_table
-        .map(|t| t.all_symbols().into_iter().map(|s| s.name.clone()).collect())
+        .map(|t| t.all_symbols().iter().map(|s| s.name.clone()).collect())
         .unwrap_or_default();
     // (file, declared name) already imported, under whatever name.
     let mut imported: BTreeSet<(usize, String)> = BTreeSet::new();
@@ -217,11 +218,11 @@ fn origin(doc: &ProjectDoc) -> String {
 
 /// Every struct, enum and type alias `doc` declares.
 fn type_names<'d>(doc: &'d ProjectDoc) -> impl Iterator<Item = String> + 'd {
-    doc.symbols.all_symbols().into_iter().filter(|s| is_type_kind(s.kind)).map(|s| s.name.clone())
+    doc.symbols.all_symbols().iter().filter(|s| is_type_kind(s.kind)).map(|s| s.name.clone())
 }
 
 fn type_item(doc: &ProjectDoc, real: &str, label: String, detail: String) -> CompletionItem {
-    let kind = match doc.symbols.get(real).map(|s| s.kind) {
+    let kind = match doc.symbols.get_in(real, Namespace::Declaration).map(|s| s.kind) {
         Some(SymbolKind::ENUM) => CompletionItemKind::ENUM,
         Some(SymbolKind::TYPE_PARAMETER) => CompletionItemKind::CLASS,
         _ => CompletionItemKind::STRUCT,

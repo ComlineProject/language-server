@@ -2,7 +2,7 @@
 
 use crate::analysis::project::Project;
 use crate::analysis::source::ProjectSource;
-use crate::util::{position_to_offset, word_range_at};
+use crate::util::position_to_offset;
 use lsp_types::{Location, Position, Url};
 
 /// Find all references to a symbol at a position, considering only this file.
@@ -30,12 +30,10 @@ pub fn find_references_with_project<S: ProjectSource>(
     let Some(offset) = position_to_offset(source, position) else {
         return vec![];
     };
-    let Some((start, end)) = word_range_at(source, offset) else {
-        return vec![];
-    };
-
     let project = Project::with_active(uri, source, other_files);
-    let Some(target) = project.index_of(uri).and_then(|i| project.resolve(i, &source[start..end])) else {
+    let Some(target) =
+        project.index_of(uri).and_then(|i| project.target_at_cursor(i, source, offset))
+    else {
         return vec![];
     };
 

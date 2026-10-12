@@ -134,8 +134,17 @@ pub fn get_hover_info_with_project<S: ProjectSource>(
 
     let lookup = HoverSizeLookup { local: &document, others: &other_docs };
 
-    // Check if it's a symbol in this file
-    if let Some(symbol) = symbol_table.get(&word) {
+    // A symbol in this file. The cursor sitting on a declaration's own
+    // name resolves by position; anything else is a reference, resolved in
+    // whatever namespace its position allows.
+    //
+    // By name alone, a file declaring `struct Test` beside a
+    // `settings Test` answered both with whichever the symbol table had
+    // kept - so hovering the struct showed the settings block.
+    let own = symbol_table
+        .at_offset(offset)
+        .or_else(|| symbol_table.get_in(&word, symbols::namespace_at(source, offset)));
+    if let Some(symbol) = own {
         return Some(create_symbol_hover(symbol, &document, &lookup));
     }
 
@@ -155,7 +164,11 @@ pub fn get_hover_info_with_project<S: ProjectSource>(
             // Look up `real_name`, not `word` — they differ when `word`
             // is an `as` alias, which `sibling`'s own symbol table never
             // heard of (see `ResolvedSymbol::real_name`'s doc).
-            if let Some(symbol) = other_table.get(&resolved.real_name) {
+            // A `use` only ever brings in a declaration - there is no
+            // import that names a settings preset.
+            if let Some(symbol) =
+                other_table.get_in(&resolved.real_name, symbols::Namespace::Declaration)
+            {
                 return Some(create_symbol_hover(symbol, other_document, &lookup));
             }
         }
@@ -165,7 +178,7 @@ pub fn get_hover_info_with_project<S: ProjectSource>(
     // so append a note: the match isn't one any `use` here actually reaches.
     for ((other_uri, other_source, other_document), (_, dependency)) in other_docs.iter().zip(&origins) {
         let other_table = symbols::build_symbol_table(other_document, other_uri, other_source);
-        if let Some(symbol) = other_table.get(&word) {
+        if let Some(symbol) = other_table.get_in(&word, symbols::Namespace::Declaration) {
             let mut hover = create_symbol_hover(symbol, other_document, &lookup);
             let place = match dependency {
                 Some(name) => format!("`{}` ({})", file_label(other_uri), stdlib::owner(name)),
@@ -1053,6 +1066,7 @@ fn find_settings_declaration<'a>(document: &'a comline_core::schema::idl::gramma
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::offset_to_position;
     
     #[test]
     fn test_hover_on_struct() {
@@ -1346,6 +1360,53 @@ struct User {
 
         let hover = get_hover_info(source, &uri, position);
         assert!(hover.is_some());
+    }
+
+    /// A schema declaring a struct and a settings preset under one name.
+    /// Core allows this - a settings block generates no type - so the
+    /// editor has to tell them apart.
+    const SHARED_NAME: &str = "struct Test {\n    a: str\n}\n\n\
+                               settings Test {\n    validators.allowed = true\n}\n";
+
+    #[test]
+    fn hover_on_a_declaration_shows_that_declaration_not_a_namesake() {
+        // The reported bug: hovering `struct Test` showed the tooltip for
+        // `settings Test`, because the symbol table was keyed by name and
+        // the settings block was declared last.
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let offset = SHARED_NAME.find("struct Test").unwrap() + "struct ".len();
+        let position = offset_to_position(SHARED_NAME, offset);
+
+        let hover = get_hover_info(SHARED_NAME, &uri, position).expect("hover should resolve");
+        let text = hover_text(hover);
+        assert!(text.contains("struct"), "got: {text}");
+        assert!(!text.contains("validators.allowed"), "settings block's tooltip: {text}");
+    }
+
+    #[test]
+    fn hover_on_a_settings_preset_still_shows_the_settings_block() {
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let offset = SHARED_NAME.find("settings Test").unwrap() + "settings ".len();
+        let position = offset_to_position(SHARED_NAME, offset);
+
+        let hover = get_hover_info(SHARED_NAME, &uri, position).expect("hover should resolve");
+        let text = hover_text(hover);
+        assert!(text.contains("validators.allowed"), "got: {text}");
+    }
+
+    #[test]
+    fn a_type_reference_resolves_to_the_declaration_not_the_preset() {
+        let source = "struct Test {\n    a: str\n}\n\n\
+                      settings Test {\n    validators.allowed = true\n}\n\n\
+                      struct Holder {\n    t: Test\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let offset = source.find("t: Test").unwrap() + "t: ".len();
+        let position = offset_to_position(source, offset);
+
+        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let text = hover_text(hover);
+        assert!(text.contains("struct"), "got: {text}");
+        assert!(!text.contains("validators.allowed"), "got: {text}");
     }
 
     fn hover_text(hover: Hover) -> String {

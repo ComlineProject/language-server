@@ -3,53 +3,109 @@
 use comline_core::schema::idl::grammar::{Declaration, Document};
 use std::collections::HashMap;
 use crate::util::{byte_range_to_lsp_range, word_occurrences};
-use lsp_types::{Location, Range, SymbolKind, Url};
+use lsp_types::{Location, SymbolKind, Url};
+
+/// Which namespace a declared name lives in.
+///
+/// Core keeps one namespace for everything that generates a type or is
+/// referenced by name - struct, enum, protocol, const, validator, type
+/// alias and error - so a collision among those is a build error. A
+/// `settings` block generates nothing and is named only by
+/// `@settings = Name`, so it gets its own: `settings Test` beside a
+/// `struct Test` is legal, and the editor has to tell the two apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Namespace {
+    Declaration,
+    SettingsPreset,
+}
 
 #[derive(Debug, Clone)]
 pub struct Symbol {
     pub name: String,
     pub kind: SymbolKind,
+    /// Which namespace this name lives in. Two symbols may share a name
+    /// across namespaces, so a by-name lookup needs this to pick one.
+    pub namespace: Namespace,
     pub location: Location,
+    /// Byte range of the declaration's own name - the same span
+    /// `location.range` describes, kept so a cursor offset can be tested
+    /// directly instead of converting back from line/character.
+    pub name_span: (usize, usize),
     /// For structs/protocols: list of field/function names
     pub children: Vec<String>,
 }
 
+/// Every declared name in one document, in declaration order.
+///
+/// Stored as a list and indexed by name, rather than keyed by name. It was
+/// a `HashMap<String, Symbol>` whose `insert` overwrote, so a file
+/// declaring `struct Test`, `error Test` and `settings Test` kept only the
+/// last: hover on any of the three showed the settings block, and the
+/// outline listed a single entry sitting at the first declaration's
+/// position while carrying the last one's kind and location.
 pub struct SymbolTable {
-    symbols: HashMap<String, Symbol>,
-    /// Track all symbols in order of appearance
-    ordered_symbols: Vec<String>,
+    symbols: Vec<Symbol>,
+    /// Name -> indices into `symbols`, in declaration order.
+    by_name: HashMap<String, Vec<usize>>,
 }
 
 impl SymbolTable {
     pub fn new() -> Self {
-        Self {
-            symbols: HashMap::new(),
-            ordered_symbols: Vec::new(),
-        }
+        Self { symbols: Vec::new(), by_name: HashMap::new() }
     }
 
-    pub fn insert(&mut self, name: String, symbol: Symbol) {
-        if !self.symbols.contains_key(&name) {
-            self.ordered_symbols.push(name.clone());
-        }
-        self.symbols.insert(name, symbol);
+    pub fn insert(&mut self, symbol: Symbol) {
+        self.by_name.entry(symbol.name.clone()).or_default().push(self.symbols.len());
+        self.symbols.push(symbol);
     }
 
-    pub fn get(&self, name: &str) -> Option<&Symbol> {
-        self.symbols.get(name)
+    /// The declaration whose own name sits under `offset`.
+    ///
+    /// How a cursor on a declaration resolves: by position, with no name
+    /// lookup to be ambiguous about. Correct even for a collision core has
+    /// not rejected, and for one it has - the editor still has to describe
+    /// a file it is mid-edit on.
+    pub fn at_offset(&self, offset: usize) -> Option<&Symbol> {
+        self.index_at_offset(offset).map(|i| &self.symbols[i])
     }
-    
-    pub fn all_symbols(&self) -> Vec<&Symbol> {
-        self.ordered_symbols
+
+    /// As [`SymbolTable::at_offset`], as an index.
+    pub fn index_at_offset(&self, offset: usize) -> Option<usize> {
+        self.symbols
             .iter()
-            .filter_map(|name| self.symbols.get(name))
-            .collect()
+            .position(|s| offset >= s.name_span.0 && offset <= s.name_span.1)
     }
-    
+
+    /// What `name` refers to in `namespace` - how a *reference* resolves,
+    /// the namespace coming from what the reference's position allows.
+    pub fn get_in(&self, name: &str, namespace: Namespace) -> Option<&Symbol> {
+        self.index_in(name, namespace).map(|i| &self.symbols[i])
+    }
+
+    /// As [`SymbolTable::get_in`], as an index - what a cross-document
+    /// reference stores, so it names one symbol and not just a string.
+    pub fn index_in(&self, name: &str, namespace: Namespace) -> Option<usize> {
+        self.by_name
+            .get(name)?
+            .iter()
+            .copied()
+            .find(|&i| self.symbols[i].namespace == namespace)
+    }
+
+    pub fn by_index(&self, index: usize) -> Option<&Symbol> {
+        self.symbols.get(index)
+    }
+
+    /// Every symbol, declaration order preserved - including same-named
+    /// ones, which the outline previously collapsed into one.
+    pub fn all_symbols(&self) -> &[Symbol] {
+        &self.symbols
+    }
+
     pub fn len(&self) -> usize {
         self.symbols.len()
     }
-    
+
     pub fn is_empty(&self) -> bool {
         self.symbols.is_empty()
     }
@@ -61,186 +117,149 @@ impl Default for SymbolTable {
     }
 }
 
+/// Which namespace a name written at `offset` is a reference in.
+///
+/// Exactly one form names a settings preset - the value of an `@settings`
+/// annotation (`@settings = Strict`). Every other position where a name
+/// appears is the declaration namespace: a field's type, a function's
+/// argument or return, a `! Name` throws, a `use` line, a validator call.
+///
+/// Scanned off the source rather than the AST because the grammar's
+/// `Identifier` carries only its text, with no span to match an offset
+/// against - the same reason `declaration_name_span` locates a name within
+/// its declaration's span.
+pub fn namespace_at(source: &str, offset: usize) -> Namespace {
+    let Some((start, _)) = crate::util::word_range_at(source, offset) else {
+        return Namespace::Declaration;
+    };
+
+    let before = source[..start].trim_end();
+    let Some(before) = before.strip_suffix('=') else {
+        return Namespace::Declaration;
+    };
+
+    let before = before.trim_end();
+    if before.ends_with("@settings") {
+        Namespace::SettingsPreset
+    } else {
+        Namespace::Declaration
+    }
+}
+
 /// Build symbol table from parsed AST
 pub fn build_symbol_table(document: &Document, uri: &Url, source: &str) -> SymbolTable {
     let mut table = SymbolTable::new();
-    
+
     // Walk through all declarations (each is `Spanned<Declaration>` — deref to match)
     for declaration in &document.0 {
-        match &**declaration {
-            Declaration::Struct(s) => {
-                let name = s.name();
-                let children: Vec<String> = s.fields().iter().map(|f| f.name()).collect();
-                
-                let range = declaration_name_range(source, declaration.span, "struct", &name);
-                
-                table.insert(
-                    name.clone(),
-                    Symbol {
-                        name: name.clone(),
-                        kind: SymbolKind::STRUCT,
-                        location: Location {
-                            uri: uri.clone(),
-                            range,
-                        },
-                        children,
-                    },
-                );
-            }
-            Declaration::Enum(e) => {
-                let name = e.name();
-                let children: Vec<String> = e.variants().iter().map(|v| v.identifier().text.clone()).collect();
-                
-                let range = declaration_name_range(source, declaration.span, "enum", &name);
-                
-                table.insert(
-                    name.clone(),
-                    Symbol {
-                        name: name.clone(),
-                        kind: SymbolKind::ENUM,
-                        location: Location {
-                            uri: uri.clone(),
-                            range,
-                        },
-                        children,
-                    },
-                );
-            }
-            Declaration::Protocol(p) => {
-                let name = p.name();
-                let children: Vec<String> = p.functions().iter().map(|f| f.name()).collect();
-                
-                let range = declaration_name_range(source, declaration.span, "protocol", &name);
-                
-                table.insert(
-                    name.clone(),
-                    Symbol {
-                        name: name.clone(),
-                        kind: SymbolKind::INTERFACE,
-                        location: Location {
-                            uri: uri.clone(),
-                            range,
-                        },
-                        children,
-                    },
-                );
-            }
-            Declaration::Const(c) => {
-                let name = c.name();
-                let range = declaration_name_range(source, declaration.span, "const", &name);
-                
-                table.insert(
-                    name.clone(),
-                    Symbol {
-                        name: name.clone(),
-                        kind: SymbolKind::CONSTANT,
-                        location: Location {
-                            uri: uri.clone(),
-                            range,
-                        },
-                        children: vec![],
-                    },
-                );
-            }
-            Declaration::TypeAlias(t) => {
-                let name = t.name();
-                let range = declaration_name_range(source, declaration.span, "type", &name);
-
+        // Per declaration: its keyword (to find its own name in the
+        // source), the LSP kind to report, which namespace the name lives
+        // in, and its member names. Several of the kind choices are
+        // stand-ins, noted where they are made.
+        let (keyword, name, kind, namespace, children): (_, _, _, _, Vec<String>) =
+            match &**declaration {
+                Declaration::Struct(s) => (
+                    "struct",
+                    s.name(),
+                    SymbolKind::STRUCT,
+                    Namespace::Declaration,
+                    s.fields().iter().map(|f| f.name()).collect(),
+                ),
+                Declaration::Enum(e) => (
+                    "enum",
+                    e.name(),
+                    SymbolKind::ENUM,
+                    Namespace::Declaration,
+                    e.variants().iter().map(|v| v.identifier().text.clone()).collect(),
+                ),
+                Declaration::Protocol(p) => (
+                    "protocol",
+                    p.name(),
+                    SymbolKind::INTERFACE,
+                    Namespace::Declaration,
+                    p.functions().iter().map(|f| f.name()).collect(),
+                ),
+                Declaration::Const(c) => {
+                    ("const", c.name(), SymbolKind::CONSTANT, Namespace::Declaration, vec![])
+                }
                 // `TYPE_PARAMETER` is the closest LSP-standard fit for a
                 // transparent type alias - LSP 3.17's `SymbolKind` has no
                 // dedicated "type alias" entry, and other LSPs (e.g.
                 // rust-analyzer, for Rust's own `type`) use this same kind.
-                table.insert(
-                    name.clone(),
-                    Symbol {
-                        name: name.clone(),
-                        kind: SymbolKind::TYPE_PARAMETER,
-                        location: Location {
-                            uri: uri.clone(),
-                            range,
-                        },
-                        children: vec![],
-                    },
-                );
-            }
-            Declaration::Error(e) => {
-                let name = e.name();
-                let children: Vec<String> = e.fields().iter().map(|f| f.name()).collect();
-                let range = declaration_name_range(source, declaration.span, "error", &name);
-
+                Declaration::TypeAlias(t) => {
+                    ("type", t.name(), SymbolKind::TYPE_PARAMETER, Namespace::Declaration, vec![])
+                }
                 // `EVENT` is the closest LSP-standard fit: a named, raised/
                 // caught thing, same spirit as `TYPE_PARAMETER` standing in
                 // for a type alias above - LSP 3.17 has no dedicated
                 // "error"/"exception" kind.
-                table.insert(
-                    name.clone(),
-                    Symbol {
-                        name: name.clone(),
-                        kind: SymbolKind::EVENT,
-                        location: Location {
-                            uri: uri.clone(),
-                            range,
-                        },
-                        children,
-                    },
-                );
-            }
-            Declaration::Validator(v) => {
-                let name = v.name();
-                let children: Vec<String> = v.properties().iter().map(|p| p.name()).collect();
-                let range = declaration_name_range(source, declaration.span, "validator", &name);
-
+                Declaration::Error(e) => (
+                    "error",
+                    e.name(),
+                    SymbolKind::EVENT,
+                    Namespace::Declaration,
+                    e.fields().iter().map(|f| f.name()).collect(),
+                ),
                 // `FUNCTION`: a validator is referenced like one is called
                 // (`StringBounds(min=3, max=10)`), parameters and all.
-                table.insert(
-                    name.clone(),
-                    Symbol {
-                        name: name.clone(),
-                        kind: SymbolKind::FUNCTION,
-                        location: Location {
-                            uri: uri.clone(),
-                            range,
-                        },
-                        children,
-                    },
-                );
-            }
-            Declaration::Settings(s) => {
-                // An unnamed settings block applies implicitly to its own
-                // file - not a named symbol for the outline/go-to-symbol.
-                let Some(name) = s.name() else { continue };
-                let children: Vec<String> = s.entries().iter().map(|e| e.key()).collect();
-                let range = declaration_name_range(source, declaration.span, "settings", &name);
+                Declaration::Validator(v) => (
+                    "validator",
+                    v.name(),
+                    SymbolKind::FUNCTION,
+                    Namespace::Declaration,
+                    v.properties().iter().map(|p| p.name()).collect(),
+                ),
+                Declaration::Settings(s) => {
+                    // An unnamed settings block applies implicitly to its
+                    // own file - not a named symbol for the outline/
+                    // go-to-symbol.
+                    let Some(name) = s.name() else { continue };
+                    // `OBJECT`: a named object of key/value entries. Its own
+                    // namespace - a settings preset generates no type, so it
+                    // may share a name with any declaration.
+                    (
+                        "settings",
+                        name,
+                        SymbolKind::OBJECT,
+                        Namespace::SettingsPreset,
+                        s.entries().iter().map(|e| e.key()).collect(),
+                    )
+                }
+                Declaration::Import(_) | Declaration::Use(_) => {
+                    // Not a declaration that can be referred to by name.
+                    continue;
+                }
+            };
 
-                // `OBJECT`: a named object of key/value entries.
-                table.insert(
-                    name.clone(),
-                    Symbol {
-                        name: name.clone(),
-                        kind: SymbolKind::OBJECT,
-                        location: Location {
-                            uri: uri.clone(),
-                            range,
-                        },
-                        children,
-                    },
-                );
-            }
-            Declaration::Import(_) | Declaration::Use(_) => {
-                // Not a declaration that can be referred to by name.
-            }
-        }
+        let name_span = declaration_name_span(source, declaration.span, keyword, &name);
+        table.insert(Symbol {
+            name,
+            kind,
+            namespace,
+            location: Location {
+                uri: uri.clone(),
+                range: byte_range_to_lsp_range(source, name_span.0, name_span.1),
+            },
+            name_span,
+            children,
+        });
     }
-    
+
     table
 }
 
-/// The range of a declaration's own name: the first whole-word `name`
+/// The byte range of a declaration's own name: the first whole-word `name`
 /// inside the declaration's span that directly follows its `keyword`
 /// (`struct User`) - not just the first `User` anywhere in the file, which
 /// could be inside `UserProfile`, a `use` line, or a docstring. Rename
-/// edits this range, so it has to be exact.
-fn declaration_name_range(source: &str, span: (usize, usize), keyword: &str, name: &str) -> Range {
+/// edits this range and a cursor is matched against it, so it has to be
+/// exact.
+fn declaration_name_span(
+    source: &str,
+    span: (usize, usize),
+    keyword: &str,
+    name: &str,
+) -> (usize, usize) {
     let (start, end) = (span.0.min(source.len()), span.1.min(source.len()));
     let text = &source[start..end];
 
@@ -253,7 +272,7 @@ fn declaration_name_range(source: &str, span: (usize, usize), keyword: &str, nam
         .map(|i| start + i)
         .unwrap_or(start);
 
-    byte_range_to_lsp_range(source, offset, offset + name.len())
+    (offset, offset + name.len())
 }
 
 #[cfg(test)]
@@ -281,16 +300,16 @@ enum Role {
         let table = build_symbol_table(&result.document.unwrap(), &uri, source);
         
         assert_eq!(table.len(), 2);
-        assert!(table.get("User").is_some());
-        assert!(table.get("Role").is_some());
+        assert!(table.get_in("User", Namespace::Declaration).is_some());
+        assert!(table.get_in("Role", Namespace::Declaration).is_some());
         
-        let user_symbol = table.get("User").unwrap();
+        let user_symbol = table.get_in("User", Namespace::Declaration).unwrap();
         assert_eq!(user_symbol.kind, SymbolKind::STRUCT);
         assert_eq!(user_symbol.children.len(), 2);
         assert!(user_symbol.children.contains(&"name".to_string()));
         assert!(user_symbol.children.contains(&"age".to_string()));
         
-        let role_symbol = table.get("Role").unwrap();
+        let role_symbol = table.get_in("Role", Namespace::Declaration).unwrap();
         assert_eq!(role_symbol.kind, SymbolKind::ENUM);
         assert_eq!(role_symbol.children.len(), 2);
     }
@@ -304,7 +323,7 @@ enum Role {
         let table = build_symbol_table(&result.document.unwrap(), &uri, source);
 
         assert_eq!(table.len(), 1);
-        let alias = table.get("UserId").unwrap();
+        let alias = table.get_in("UserId", Namespace::Declaration).unwrap();
         assert_eq!(alias.kind, SymbolKind::TYPE_PARAMETER);
         assert!(alias.children.is_empty());
     }
@@ -323,9 +342,69 @@ protocol UserService {
         let table = build_symbol_table(&result.document.unwrap(), &uri, source);
         
         assert_eq!(table.len(), 1);
-        let protocol = table.get("UserService").unwrap();
+        let protocol = table.get_in("UserService", Namespace::Declaration).unwrap();
         assert_eq!(protocol.kind, SymbolKind::INTERFACE);
         assert_eq!(protocol.children.len(), 2);
+    }
+
+    #[test]
+    fn same_named_units_in_different_namespaces_are_all_kept() {
+        // The bug this table was rewritten for: keyed by name, these three
+        // collapsed to whichever came last, so hover on the struct showed
+        // the settings block and the outline listed one entry.
+        let source = "struct Test {\n    a: str\n}\n\n\
+                      settings Test {\n    validators.allowed = true\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let result = parser::parse(source).unwrap();
+
+        let table = build_symbol_table(&result.document.unwrap(), &uri, source);
+
+        assert_eq!(table.len(), 2, "both declarations are kept");
+        assert_eq!(
+            table.get_in("Test", Namespace::Declaration).unwrap().kind,
+            SymbolKind::STRUCT
+        );
+        assert_eq!(
+            table.get_in("Test", Namespace::SettingsPreset).unwrap().kind,
+            SymbolKind::OBJECT
+        );
+    }
+
+    #[test]
+    fn a_cursor_on_a_declarations_name_resolves_to_that_declaration() {
+        let source = "struct Test {\n    a: str\n}\n\n\
+                      settings Test {\n    validators.allowed = true\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let result = parser::parse(source).unwrap();
+        let table = build_symbol_table(&result.document.unwrap(), &uri, source);
+
+        // Each `Test` resolves to the declaration it is part of, by
+        // position - no name lookup to be ambiguous about.
+        let struct_name = source.find("struct Test").unwrap() + "struct ".len();
+        assert_eq!(table.at_offset(struct_name).unwrap().kind, SymbolKind::STRUCT);
+
+        let settings_name = source.find("settings Test").unwrap() + "settings ".len();
+        assert_eq!(table.at_offset(settings_name).unwrap().kind, SymbolKind::OBJECT);
+
+        // Inside the struct body is not any declaration's own name.
+        let body = source.find("a: str").unwrap();
+        assert!(table.at_offset(body).is_none());
+    }
+
+    #[test]
+    fn only_a_settings_annotation_value_is_a_settings_preset_reference() {
+        let cases = [
+            ("@settings = Test", Namespace::SettingsPreset),
+            // Every other position a name appears in.
+            ("f: Test", Namespace::Declaration),
+            ("function f() ! Test;", Namespace::Declaration),
+            ("use types::Test", Namespace::Declaration),
+            ("@deprecated = Test", Namespace::Declaration),
+        ];
+        for (source, expected) in cases {
+            let offset = source.rfind("Test").unwrap();
+            assert_eq!(namespace_at(source, offset), expected, "{source}");
+        }
     }
 
     #[test]
@@ -337,7 +416,7 @@ protocol UserService {
         let result = parser::parse(source).unwrap();
 
         let table = build_symbol_table(&result.document.unwrap(), &uri, source);
-        let range = table.get("User").unwrap().location.range;
+        let range = table.get_in("User", Namespace::Declaration).unwrap().location.range;
 
         assert_eq!(range.start, lsp_types::Position::new(7, 7));
         assert_eq!(range.end, lsp_types::Position::new(7, 11));

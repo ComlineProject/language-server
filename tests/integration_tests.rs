@@ -60,10 +60,12 @@ fn test_parser_basic() {
 
 #[test]
 fn test_symbol_table() {
-    use comline_language_server::analysis::symbols::SymbolTable;
-    
-    let mut table = SymbolTable::new();
-    
-    // Symbol insertion and retrieval will be tested once implemented
-    assert!(table.get("NonExistent").is_none());
+    use comline_language_server::analysis::symbols::{Namespace, SymbolTable};
+
+    let table = SymbolTable::new();
+
+    assert!(table.get_in("NonExistent", Namespace::Declaration).is_none());
+    assert!(table.get_in("NonExistent", Namespace::SettingsPreset).is_none());
+    assert!(table.at_offset(0).is_none());
+    assert!(table.is_empty());
 }

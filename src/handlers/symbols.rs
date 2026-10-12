@@ -165,6 +165,24 @@ mod tests {
     use super::*;
     
     #[test]
+    fn same_named_units_each_get_their_own_outline_entry() {
+        // The symbol table kept one entry per name, so these two collapsed
+        // into a single item - placed at the struct's position but
+        // reported with the settings block's kind.
+        let source = "struct Test {\n    a: str\n}\n\n\
+                      settings Test {\n    validators.allowed = true\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+
+        let symbols = get_document_symbols(source, &uri);
+        let named: Vec<_> = symbols.iter().filter(|s| s.name == "Test").collect();
+
+        assert_eq!(named.len(), 2, "both declarations are listed");
+        let kinds: Vec<_> = named.iter().map(|s| s.kind).collect();
+        assert!(kinds.contains(&SymbolKind::STRUCT), "{kinds:?}");
+        assert!(kinds.contains(&SymbolKind::OBJECT), "{kinds:?}");
+    }
+
+    #[test]
     fn test_get_document_symbols() {
         let source = r#"
 struct User {
