@@ -676,17 +676,19 @@ fn create_settings_entry_hover<S: ProjectSource>(
         .find(|f| f.dependency().is_none() && source::is_manifest(f.uri()))
         .map(|f| match source::resolve_cross_package_settings(f.text(), other_files) {
             Some(Ok(dict)) => dict,
-            Some(Err(_)) => Default::default(),
+            Some(Err(_)) => source::base_settings(),
             None => source::declared_settings(f.text()),
         })
-        .unwrap_or_default();
+        .unwrap_or_else(source::base_settings);
     let schema_units = IncrementalInterpreter::from_declarations(document.0.clone());
     let schema = schema_settings(&schema_units);
     let schema_effective = effective_schema_settings(&package_settings, &schema);
     let effective = effective_declaration_settings(&schema_effective, &schema, settings.name().as_deref());
 
+    // `{value}`, not `{value:?}`: the latter printed `Bool(false)` where
+    // the file said `false`.
     let effective_line = match effective.get_path(&key) {
-        Some(value) => format!("effective: `{value:?}`"),
+        Some(value) => format!("effective: `{value}`"),
         None => "effective: not set — allowed by default".to_string(),
     };
     let effective_line = match settings.name() {

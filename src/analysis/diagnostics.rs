@@ -58,7 +58,7 @@ fn lsp_tags(code_id: &str) -> Option<Vec<DiagnosticTag>> {
 /// `comline build` runs. Call only on a document that parsed cleanly.
 pub fn validation_diagnostics(source: &str, document: &Document) -> Vec<Diagnostic> {
     let uri = Url::parse("file:///schema.ids").expect("static URL");
-    validation_diagnostics_with(source, document, vec![], &SettingsDict::default(), &uri)
+    validation_diagnostics_with(source, document, vec![], &crate::analysis::source::base_settings(), &uri)
 }
 
 /// [`validation_diagnostics`], with `extra` imports appended to the file's

@@ -30,7 +30,7 @@ lsp-types = "0.94"
 rust-sitter = "0.4.5"
 tracing = "0.1"
 anyhow = "1.0"
-comline-core = { git = "https://github.com/ComlineProject/core", rev = "da85c43da30f9b4a8f6bd9c48baecf8eee6b9c1e" }
+comline-core = { git = "https://github.com/ComlineProject/core", rev = "021fdfcc3e0de8ac2864a838a630048e21038aa3" }
 
 # `server`-only.
 tower-lsp = { version = "0.20.0", optional = true }

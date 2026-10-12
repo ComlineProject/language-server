@@ -135,6 +135,18 @@ pub fn declared_dependencies(manifest: &str) -> Vec<DeclaredDependency> {
 /// (by design - see its own doc comment), so this has to recognize and
 /// skip a reference up front rather than let that panic happen. See
 /// [`resolve_cross_package_settings`] for resolving one for real.
+/// The settings every package has underneath its own, whether or not a
+/// manifest is in view: Comline's built-in defaults.
+///
+/// The editor used to fall back to an *empty* dict when it could not see a
+/// manifest, which made it disagree with every build. `@framing` is the
+/// visible case - it is forbidden by the built-in default, so hover
+/// called it "allowed by default" and completion offered it without
+/// comment, and accepting that suggestion produced a hard build error.
+pub fn base_settings() -> comline_core::settings::SettingsDict {
+    comline_core::settings::defaults::built_in()
+}
+
 pub fn declared_settings(manifest: &str) -> comline_core::settings::SettingsDict {
     use comline_core::package::config::idl::grammar::{Key, Value};
     use comline_core::package::config::ir::context::ProjectContext;
