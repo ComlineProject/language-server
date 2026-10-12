@@ -31,6 +31,10 @@ pub struct Symbol {
     /// `location.range` describes, kept so a cursor offset can be tested
     /// directly instead of converting back from line/character.
     pub name_span: (usize, usize),
+    /// Byte range of the whole declaration - docstring, annotations, body
+    /// and all. What core's own diagnostics span, and what a "delete this
+    /// one" quick fix has to remove.
+    pub decl_span: (usize, usize),
     /// For structs/protocols: list of field/function names
     pub children: Vec<String>,
 }
@@ -94,6 +98,39 @@ impl SymbolTable {
 
     pub fn by_index(&self, index: usize) -> Option<&Symbol> {
         self.symbols.get(index)
+    }
+
+    /// The name range of the declaration core spanned as `decl_span`.
+    ///
+    /// Core spans a declaration whole - it has no choice, since
+    /// `grammar::Identifier` carries no span of its own - which makes a
+    /// duplicate-declaration error underline two entire blocks. The editor
+    /// does have the name ranges, so it narrows core's span back down to
+    /// the thing that is actually wrong.
+    pub fn name_span_of_decl(&self, decl_span: (usize, usize)) -> Option<(usize, usize)> {
+        self.symbols.iter().find(|s| s.decl_span == decl_span).map(|s| s.name_span)
+    }
+
+    /// Every group of two or more symbols sharing a name *and* a namespace -
+    /// a collision core rejects (or, for two settings presets, one it
+    /// reports separately). Declaration order is preserved within a group,
+    /// so the first entry is the one that holds the name.
+    pub fn duplicate_groups(&self) -> Vec<Vec<usize>> {
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for indices in self.by_name.values() {
+            for namespace in [Namespace::Declaration, Namespace::SettingsPreset] {
+                let group: Vec<usize> = indices
+                    .iter()
+                    .copied()
+                    .filter(|&i| self.symbols[i].namespace == namespace)
+                    .collect();
+                if group.len() > 1 {
+                    groups.push(group);
+                }
+            }
+        }
+        groups.sort();
+        groups
     }
 
     /// Every symbol, declaration order preserved - including same-named
@@ -241,6 +278,7 @@ pub fn build_symbol_table(document: &Document, uri: &Url, source: &str) -> Symbo
                 range: byte_range_to_lsp_range(source, name_span.0, name_span.1),
             },
             name_span,
+            decl_span: declaration.span,
             children,
         });
     }
