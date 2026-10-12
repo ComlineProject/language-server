@@ -153,8 +153,14 @@ pub fn declared_settings(manifest: &str) -> comline_core::settings::SettingsDict
     use comline_core::package::config::ir::frozen;
     use comline_core::package::config::ir::interpreter::interpret::interpret_context;
 
+    // Every fallback here is the built-in base, not an empty dict. A
+    // manifest that is mid-edit, unreadable, or outright invalid tells us
+    // nothing about the package's settings - but it does not remove the
+    // floor every package has underneath its own. Falling back to empty
+    // made the editor claim `@framing` was allowed by default in exactly
+    // the situations where it could not tell.
     let Some(congregation) = parser::parse_idp(manifest).ok().and_then(|r| r.document) else {
-        return Default::default();
+        return base_settings();
     };
 
     let is_cross_package_reference = congregation.assignments.iter().any(|a| {
@@ -163,14 +169,34 @@ pub fn declared_settings(manifest: &str) -> comline_core::settings::SettingsDict
             && matches!(&a.value, Value::Namespaced(_))
     });
     if is_cross_package_reference {
-        return Default::default();
+        return base_settings();
     }
 
     let context = ProjectContext::with_config(congregation);
     let Ok(units) = interpret_context(&context, None) else {
-        return Default::default();
+        return base_settings();
     };
     frozen::settings(&units).cloned().unwrap_or_default()
+}
+
+/// Why this manifest could not be interpreted, if it could not be.
+///
+/// `.idp` interpretation used to `panic!` on every one of these, which
+/// killed the server outright (core#88) — so there was never an error here
+/// to report, and a manifest that a build rejects produced no editor
+/// feedback at all. It returns an error now, so the manifest's own
+/// diagnostics can say so.
+///
+/// `None` for a manifest that is merely incomplete: a parse failure is
+/// already reported by the parse pass, and reporting it twice is worse
+/// than once.
+pub fn manifest_error(manifest: &str) -> Option<String> {
+    use comline_core::package::config::ir::context::ProjectContext;
+    use comline_core::package::config::ir::interpreter::interpret::interpret_context;
+
+    let congregation = parser::parse_idp(manifest).ok().and_then(|r| r.document)?;
+    let context = ProjectContext::with_config(congregation);
+    interpret_context(&context, None).err().map(|e| e.to_string())
 }
 
 /// `settings = <dependency>::settings::<name>` resolved live, against
@@ -321,19 +347,42 @@ mod tests {
     }
 
     #[test]
-    fn declared_settings_is_empty_mid_edit() {
-        assert!(declared_settings("congregation app\nsettings = {").is_empty());
+    fn declared_settings_is_the_built_in_base_mid_edit() {
+        // Not empty: a half-typed manifest tells us nothing about the
+        // package's own settings, but the built-in floor still applies, and
+        // claiming otherwise made the editor disagree with every build.
+        assert_eq!(declared_settings("congregation app\nsettings = {"), base_settings());
     }
 
     #[test]
-    fn declared_settings_does_not_panic_on_a_cross_package_reference() {
-        // Core's own freezing code *panics* on a `settings` value it can't
-        // resolve with no override available (by design, for every other
-        // malformed shape too) - this must recognize and skip a reference
-        // before ever reaching that path, not rely on catching a panic.
+    fn declared_settings_skips_a_cross_package_reference() {
+        // A reference needs dependency resolution, which this cannot do,
+        // so it is recognised and skipped rather than interpreted. Core
+        // used to *panic* on reaching that path; as of core#88 it returns
+        // an error, but skipping it up front is still the right move - the
+        // resolved value is `resolve_cross_package_settings`'s job.
         let manifest = "congregation app\nspecification_version = 1\n\
             settings = shared::settings::Strict\n";
-        assert!(declared_settings(manifest).is_empty());
+        assert_eq!(declared_settings(manifest), base_settings());
+    }
+
+    #[test]
+    fn manifest_error_names_what_a_build_would_reject() {
+        // Silent in the editor before: this was a panic in core, so the
+        // server died rather than reporting anything.
+        let manifest = "congregation app\nspecification_version = 1\n\
+            dependencies = {\n    std = {}\n}\n";
+        let err = manifest_error(manifest).expect("a reserved dependency name is an error");
+        assert!(err.contains("std"), "got: {err}");
+        assert!(err.contains("reserved"), "got: {err}");
+    }
+
+    #[test]
+    fn manifest_error_is_quiet_for_a_valid_or_incomplete_manifest() {
+        assert_eq!(manifest_error("congregation app\nspecification_version = 1\n"), None);
+        // Incomplete: the parse pass already reports this, so reporting it
+        // here too would double up.
+        assert_eq!(manifest_error("congregation app\nsettings = {"), None);
     }
 
     fn consumer_manifest() -> String {

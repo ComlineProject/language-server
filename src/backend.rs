@@ -774,6 +774,30 @@ impl Backend {
                         lsp_diagnostics.extend(dependencies::manifest_diagnostics(&package_dir, &document.text));
                     }
 
+                    // Anything else a build would reject: a non-numeric
+                    // `specification_version`, a non-dictionary
+                    // `code_generation`, an unrecognised top-level key, a
+                    // malformed settings value. All of these were panics
+                    // in core, which killed this process outright, so
+                    // there was never an error here to report - a manifest
+                    // a build refuses produced no editor feedback at all.
+                    //
+                    // Skipped when something above already said it:
+                    // `manifest_diagnostics` covers the dependency block
+                    // in more detail, and anchors its range at the entry
+                    // rather than at the top of the file.
+                    if let Some(message) = crate::analysis::source::manifest_error(&document.text) {
+                        if !lsp_diagnostics.iter().any(|d| d.message == message) {
+                            lsp_diagnostics.push(Diagnostic {
+                                range: byte_range_to_lsp_range(&document.text, 0, 0),
+                                severity: Some(DiagnosticSeverity::ERROR),
+                                source: Some("comline".to_string()),
+                                message,
+                                ..Default::default()
+                            });
+                        }
+                    }
+
                     // A cross-package `settings = dep::settings::Name` that
                     // didn't resolve (undeclared dependency, missing block,
                     // ambiguous block, malformed shape) - `project_diagnostics`
