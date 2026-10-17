@@ -746,6 +746,54 @@ struct User {
         );
     }
 
+    /// The three throws diagnostics core#93 added. This module forwards core's
+    /// diagnostics generically rather than naming each one, so nothing here
+    /// had to change for them to reach the editor — which is exactly why it is
+    /// worth pinning: a future change to that forwarding would silently drop
+    /// them, with no other test noticing.
+    #[test]
+    fn a_bad_throws_clause_reaches_the_editor() {
+        for (source, code, needle) in [
+            (
+                "protocol P {\n    function get(u64) -> str ! Nope;\n}\n",
+                "validation::unresolved-throw",
+                "no error named 'Nope'",
+            ),
+            (
+                "struct Thing {\n    id: u64\n}\nprotocol P {\n    function get(u64) -> str ! Thing;\n}\n",
+                "validation::throw-not-an-error",
+                "'Thing' is a struct",
+            ),
+            (
+                "error Denied {\n    message = \"no\"\n}\nprotocol P {\n    function get(u64) -> str ! Denied, Denied;\n}\n",
+                "validation::duplicate-throw",
+                "more than once",
+            ),
+        ] {
+            let d = diags(source);
+            let found = d
+                .iter()
+                .find(|x| x.code == Some(NumberOrString::String(code.to_string())))
+                .unwrap_or_else(|| panic!("expected {code}, got {d:?}"));
+            assert_eq!(found.severity, Some(DiagnosticSeverity::ERROR), "{found:?}");
+            assert!(found.message.contains(needle), "{found:?}");
+            // The help core attaches is the actionable half; this module's
+            // other conversion once dropped it, so check it survives.
+            assert!(found.message.contains(" — "), "no context/help: {found:?}");
+            // Spanned at the function, not the whole file.
+            assert!(found.range.end.line > 0 || found.range.end.character > 0, "{found:?}");
+        }
+    }
+
+    /// `! A, B` is valid now, so it must not be reported as anything.
+    #[test]
+    fn several_declared_throws_are_clean() {
+        let source = "error NotFound {\n    message = \"gone\"\n}\n\
+                      error Denied {\n    message = \"no\"\n}\n\
+                      protocol P {\n    function get(u64) -> str ! Denied, NotFound;\n}\n";
+        assert!(diags(source).is_empty(), "{:?}", diags(source));
+    }
+
     #[test]
     fn deprecated_struct_usage_is_a_warning_with_a_deprecated_tag() {
         // The first diagnostic in this codebase that isn't `Severity::Error`
