@@ -424,19 +424,35 @@ fn missing_import_diagnostic(source: &str, missing: &MissingImport) -> Diagnosti
 /// diagnostic: a dangling bracket makes the parser's own recovery produce
 /// unreliable (often whole-file-spanning) noise for everything after it,
 /// the same way `rustc` treats an unclosed delimiter as the dominant error.
+///
+/// A `->` with no type after it is named next. The parser's own entry for
+/// it is a bare error node over the `->` (or the whole file, when the `->`
+/// ends a block), so each such entry is dropped in favour of the named
+/// diagnostic rather than shown alongside it.
 pub fn generate_diagnostics(source: &str, errors: &[rust_sitter::errors::ParseError]) -> Vec<Diagnostic> {
-    if !errors.is_empty() {
-        if let Some(diagnostic) = comline_core::diagnostics::find_unclosed_bracket(source) {
-            return vec![parse_diagnostic(source, &diagnostic, None)];
-        }
+    if errors.is_empty() {
+        return Vec::new();
     }
+    if let Some(diagnostic) = comline_core::diagnostics::find_unclosed_bracket(source) {
+        return vec![parse_diagnostic(source, &diagnostic, None)];
+    }
+
+    let missing_returns = comline_core::diagnostics::find_missing_return_types(source);
+    let covers_a_missing_return = |error: &rust_sitter::errors::ParseError| {
+        missing_returns
+            .iter()
+            .filter_map(|d| d.span)
+            .any(|(start, end)| error.start <= start && end <= error.end)
+    };
 
     errors
         .iter()
+        .filter(|error| !covers_a_missing_return(error))
         .map(|error| {
             let diagnostic = comline_core::diagnostics::from_parse_errors(std::slice::from_ref(error));
             parse_diagnostic(source, &diagnostic, Some((error.start, error.end)))
         })
+        .chain(missing_returns.iter().map(|d| parse_diagnostic(source, d, None)))
         .collect()
 }
 
@@ -602,6 +618,35 @@ struct User {
         let result = parser::parse(source).unwrap();
         let diagnostics = generate_diagnostics(source, &result.errors);
         assert_eq!(diagnostics[0].message, "unclosed `{` — add a matching `}` to close this block");
+    }
+
+    #[test]
+    fn an_arrow_with_no_type_names_the_missing_return_type() {
+        // `-> ! E;` gives the parser nothing to name - just an empty error
+        // node over the `->`. The editor gets one diagnostic, on the `->`,
+        // saying what is missing instead of "unrecognized or incomplete".
+        let source = "protocol P {\n    function greet(a: u8) -> ! E;\n}\n";
+        let result = parser::parse(source).unwrap();
+        let diagnostics = generate_diagnostics(source, &result.errors);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(
+            diagnostics[0].message.starts_with("missing return type after `->`"),
+            "{}",
+            diagnostics[0].message
+        );
+        assert_eq!(diagnostics[0].range.start, lsp_types::Position::new(1, 26));
+        assert_eq!(diagnostics[0].range.end, lsp_types::Position::new(1, 28));
+    }
+
+    #[test]
+    fn an_arrow_ending_a_block_replaces_the_whole_file_error() {
+        // With the `->` right before the `}`, the parser's error spans the
+        // whole file - that one is the same mistake, so it goes too.
+        let source = "protocol P {\n    function greet(a: u8) ->\n}\n";
+        let result = parser::parse(source).unwrap();
+        let diagnostics = generate_diagnostics(source, &result.errors);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(diagnostics[0].message.starts_with("missing return type after `->`"));
     }
 
     #[test]
