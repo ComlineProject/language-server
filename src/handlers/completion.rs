@@ -77,7 +77,7 @@ pub fn get_completions_with_project<S: ProjectSource>(
             // much whitespace or partial typing separates the cursor from
             // that `:`/`->`/`(`.
             completions.extend(get_primitive_type_completions());
-            completions.extend(get_type_completions(symbol_table.as_ref()));
+            completions.extend(get_type_completions(symbol_table.as_ref(), source));
             completions.extend(get_import_completions(source, uri, other_files, symbol_table.as_ref()));
         }
         CompletionContext::TopLevel => {
@@ -101,6 +101,13 @@ pub fn get_completions_with_project<S: ProjectSource>(
             completions
                 .extend(get_annotation_completions(scope, &effective_settings(source, offset, other_files)));
         }
+        CompletionContext::ValidatorFor => {
+            completions.push(for_keyword_completion());
+        }
+        CompletionContext::AfterValidatorTarget => {
+            // A `,` and another target, or the body's `{`: punctuation,
+            // nothing to complete.
+        }
         CompletionContext::DeclarationName => {
             // Naming something new — the identifier right after `struct`/
             // `enum`/.../`function`, or an enum's own variant name. It's
@@ -122,7 +129,7 @@ pub fn get_completions_with_project<S: ProjectSource>(
             // nothing.
             completions.extend(get_keyword_completions());
             completions.extend(get_primitive_type_completions());
-            completions.extend(get_type_completions(symbol_table.as_ref()));
+            completions.extend(get_type_completions(symbol_table.as_ref(), source));
             completions.extend(get_import_completions(source, uri, other_files, symbol_table.as_ref()));
         }
     }
@@ -410,6 +417,11 @@ fn determine_context(source: &str, offset: usize) -> CompletionContext {
         }
     }
 
+    // A validator's header, `validator NAME for TYPE, TYPE {`.
+    if let Some(context) = validator_header_context(&toks) {
+        return context;
+    }
+
     // Right after a bare `@` — the start of an annotation key. Which keys
     // make sense depends on what `@key=value` is about to attach to, which
     // the grammar ties to the *enclosing* block, not anything about `@`
@@ -531,6 +543,27 @@ fn validator_list_context(toks: &[(Tok, usize)]) -> Option<CompletionContext> {
     None
 }
 
+/// In a validator's header, `validator NAME for TYPE, TYPE {`, after its
+/// name: only `for` can come next, then a target type after `for` and after
+/// each `,`. `None` anywhere else, including the name itself.
+fn validator_header_context(toks: &[(Tok, usize)]) -> Option<CompletionContext> {
+    // The last `validator`, unless a block opened or closed since.
+    let start = toks.iter().rposition(|(t, _)| {
+        matches!(t, Tok::Word("validator") | Tok::Punct('{') | Tok::Punct('}') | Tok::Punct(';'))
+    })?;
+    if !matches!(toks[start].0, Tok::Word("validator")) {
+        return None;
+    }
+    match &toks[start + 1..] {
+        [(Tok::Word(_), _)] => Some(CompletionContext::ValidatorFor),
+        [(Tok::Word(_), _), (Tok::Word("for"), _), rest @ ..] => match rest.last() {
+            None | Some((Tok::Punct(','), _)) => Some(CompletionContext::TypePosition),
+            Some(_) => Some(CompletionContext::AfterValidatorTarget),
+        },
+        _ => None,
+    }
+}
+
 /// Whether the cursor sits inside a `(` that hasn't been closed yet, per a
 /// backward-matching scan over `toks`.
 fn in_unclosed_paren(toks: &[(Tok, usize)]) -> bool {
@@ -615,6 +648,19 @@ fn optional_keyword_completion() -> CompletionItem {
     }
 }
 
+/// `for`, after a validator's name. Inserted with its space, and the
+/// suggestions reopen on the target types.
+fn for_keyword_completion() -> CompletionItem {
+    CompletionItem {
+        label: "for".to_string(),
+        kind: Some(CompletionItemKind::KEYWORD),
+        detail: vocabulary::keyword("for").map(|k| k.description.to_string()),
+        insert_text: Some("for ".to_string()),
+        command: Some(use_path::trigger_suggest()),
+        ..Default::default()
+    }
+}
+
 fn function_keyword_completion() -> CompletionItem {
     CompletionItem {
         label: "function".to_string(),
@@ -640,7 +686,8 @@ fn keyword_snippet(text: &str) -> Option<&'static str> {
         "type" => Some("type $1 = $0"),
         "error" => Some("error $1 {\n\tmessage = \"$2\"\n\t$0\n}"),
         "settings" => Some("settings $1 {\n\t$0\n}"),
-        "validator" => Some("validator $1 {\n\t$0\n}"),
+        // `for` is required: a validator names the type(s) it checks.
+        "validator" => Some("validator $1 for $2 {\n\t$0\n}"),
         _ => None,
     }
 }
@@ -665,6 +712,36 @@ fn get_keyword_completions() -> Vec<CompletionItem> {
         .collect()
 }
 
+/// The types `source` declares at top level, found by scanning its tokens:
+/// for a document that doesn't parse, which while typing is most of the
+/// time. The struct, enum and alias names are still there, and they're what
+/// a field, argument or validator target refers to.
+fn declared_types_by_scan(source: &str) -> Vec<CompletionItem> {
+    let cleaned = strip_comments_and_strings(source);
+    let toks = tokenize_prefix(&cleaned, cleaned.len());
+    let mut depth = 0usize;
+    let mut items = Vec::new();
+    for pair in toks.windows(2) {
+        match (&pair[0].0, &pair[1].0) {
+            (Tok::Punct('{'), _) => depth += 1,
+            (Tok::Punct('}'), _) => depth = depth.saturating_sub(1),
+            (Tok::Word(keyword), Tok::Word(name)) if depth == 0 => {
+                let kind = match *keyword {
+                    "struct" => CompletionItemKind::STRUCT,
+                    "enum" => CompletionItemKind::ENUM,
+                    "type" => CompletionItemKind::CLASS,
+                    _ => continue,
+                };
+                if !items.iter().any(|i: &CompletionItem| i.label == *name) {
+                    items.push(CompletionItem { label: name.to_string(), kind: Some(kind), ..Default::default() });
+                }
+            }
+            _ => {}
+        }
+    }
+    items
+}
+
 /// Primitive type completions, sourced from `vocabulary::PRIMITIVES` —
 /// this used to hand-list `i8/i16/i32/i64`, which were never real Comline
 /// syntax (signed integers are `s`-prefixed).
@@ -685,9 +762,9 @@ fn get_primitive_type_completions() -> Vec<CompletionItem> {
 /// in a type position). `None` when the document doesn't currently parse —
 /// no custom names are available yet, but callers still have the
 /// primitive list.
-fn get_type_completions(symbol_table: Option<&symbols::SymbolTable>) -> Vec<CompletionItem> {
+fn get_type_completions(symbol_table: Option<&symbols::SymbolTable>, source: &str) -> Vec<CompletionItem> {
     let Some(symbol_table) = symbol_table else {
-        return Vec::new();
+        return declared_types_by_scan(source);
     };
     symbol_table
         .all_symbols()
@@ -1090,6 +1167,11 @@ enum CompletionContext {
     /// Typing an arbitrary new name: right after a declaration keyword, or
     /// an enum variant. Nothing to suggest.
     DeclarationName,
+    /// After a validator's name, where only `for` can come.
+    ValidatorFor,
+    /// After one of a validator's target types: a `,` or the body's `{`
+    /// comes next. Nothing to suggest.
+    AfterValidatorTarget,
     /// Inside a `settings { ... }` block (named or unnamed), before an
     /// entry's dotted key.
     SettingsBody,
@@ -1131,6 +1213,83 @@ mod tests {
         assert!(completions.iter().any(|c| c.label == "error"));
         assert!(completions.iter().any(|c| c.label == "settings"));
         assert!(completions.iter().any(|c| c.label == "validator"));
+    }
+
+    /// Completion labels at the end of `source`.
+    fn labels_at_end(source: &str) -> Vec<String> {
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let line = source.lines().count().saturating_sub(1) as u32;
+        let column = source.rsplit('\n').next().unwrap_or("").len() as u32;
+        let line = if source.ends_with('\n') { line + 1 } else { line };
+        get_completions(source, &uri, Position::new(line, column)).into_iter().map(|c| c.label).collect()
+    }
+
+    #[test]
+    fn after_a_validators_name_only_for_is_offered() {
+        // Offered every top-level keyword, none of which can go there.
+        assert_eq!(labels_at_end("validator Positive "), ["for"]);
+        assert_eq!(labels_at_end("type N = u8\n\nvalidator Positive f"), ["for"]);
+    }
+
+    #[test]
+    fn accepting_for_reopens_the_suggestions_on_the_types() {
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let item = get_completions("validator Positive ", &uri, Position::new(0, 19)).remove(0);
+        assert_eq!(item.insert_text.as_deref(), Some("for "));
+        assert_eq!(item.command.map(|c| c.command).as_deref(), Some("editor.action.triggerSuggest"));
+    }
+
+    #[test]
+    fn after_for_and_each_comma_the_types_are_offered() {
+        for source in [
+            "type FixedNum = u8\n\nvalidator Positive for ",
+            "type FixedNum = u8\n\nvalidator Positive for u8, ",
+            "type FixedNum = u8\n\nvalidator Positive for u8, s",
+        ] {
+            let labels = labels_at_end(source);
+            assert!(labels.iter().any(|l| l == "u8"), "{source:?}: {labels:?}");
+            assert!(labels.iter().any(|l| l == "string"), "{source:?}: {labels:?}");
+            assert!(labels.iter().any(|l| l == "FixedNum"), "{source:?}: {labels:?}");
+            for keyword in ["const", "struct", "validator", "for"] {
+                assert!(!labels.iter().any(|l| l == keyword), "{source:?} offered {keyword}: {labels:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_document_mid_edit_still_offers_its_own_types() {
+        // The trailing field doesn't parse, so there's no symbol table; the
+        // declarations are found by scanning instead. A name inside a block
+        // isn't a declaration.
+        let labels = labels_at_end("type Id = u64\nenum Mode { Fast }\nstruct S {\n    struct_like: u8\n    a: ");
+        assert!(labels.iter().any(|l| l == "Id"), "{labels:?}");
+        assert!(labels.iter().any(|l| l == "Mode"), "{labels:?}");
+        assert!(labels.iter().any(|l| l == "S"), "{labels:?}");
+        assert!(!labels.iter().any(|l| l == "Fast"), "{labels:?}");
+    }
+
+    #[test]
+    fn after_a_target_type_nothing_is_offered() {
+        // A `,` or the body's `{` comes next.
+        assert!(labels_at_end("validator Positive for u8 ").is_empty());
+    }
+
+    #[test]
+    fn a_validators_body_and_what_follows_it_are_unaffected() {
+        // A property's type, after `:`.
+        let labels = labels_at_end("validator Range for u8 {\n    max: ");
+        assert!(labels.iter().any(|l| l == "u8"), "{labels:?}");
+        // A new declaration after a finished validator.
+        let labels = labels_at_end("validator Range for u8 {\n}\n\n");
+        assert!(labels.iter().any(|l| l == "struct"), "{labels:?}");
+    }
+
+    #[test]
+    fn the_validator_snippet_writes_for() {
+        // Without it, the inserted validator fails the build: it must name
+        // the type it checks.
+        let validator = get_keyword_completions().into_iter().find(|c| c.label == "validator").unwrap();
+        assert_eq!(validator.insert_text.as_deref(), Some("validator $1 for $2 {\n\t$0\n}"));
     }
 
     #[test]
