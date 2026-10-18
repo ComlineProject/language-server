@@ -14,6 +14,7 @@ use comline_core::schema::ir::compiler::settings::severity::resolve_diagnostic_o
 use comline_core::schema::ir::compiler::import_resolver::{declared_alias_target, declared_validator_targets};
 use comline_core::schema::ir::compiler::Compile;
 use comline_core::schema::ir::frozen::unit::FrozenUnit;
+use comline_core::schema::ir::frozen::types::TypeRef;
 use comline_core::package::layout;
 use comline_core::schema::ir::validation;
 use comline_core::settings::{SettingsDict, SettingsSpans};
@@ -117,12 +118,12 @@ impl ProjectImports<'_, '_> {
 }
 
 impl validation::ImportLookup for ProjectImports<'_, '_> {
-    fn validator_targets(&self, name: &str) -> Option<Vec<String>> {
+    fn validator_targets(&self, name: &str) -> Option<Vec<TypeRef>> {
         let (doc, real_name) = self.declaration(name)?;
         declared_validator_targets(&self.project.docs[doc].document.0, &real_name)
     }
 
-    fn alias_target(&self, name: &str) -> Option<String> {
+    fn alias_target(&self, name: &str) -> Option<TypeRef> {
         let (doc, real_name) = self.declaration(name)?;
         declared_alias_target(&self.project.docs[doc].document.0, &real_name)
     }
