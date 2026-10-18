@@ -421,6 +421,12 @@ fn determine_context(source: &str, offset: usize) -> CompletionContext {
             Some(EnclosingBlock::Protocol) => {
                 return CompletionContext::AnnotationKey(AnnotationScope::Function)
             }
+            // Top level: a struct's, error's or protocol's leading position,
+            // or a `type` alias's - the same position, told apart by the
+            // declaration already written below, when there is one.
+            None if declaration_after(&cleaned, offset) == Some("type") => {
+                return CompletionContext::AnnotationKey(AnnotationScope::TypeAlias)
+            }
             None => return CompletionContext::AnnotationKey(AnnotationScope::Leading),
             // An enum variant, a settings entry, or some other block don't
             // take annotations — fall through to the same handling
@@ -1025,6 +1031,20 @@ enum CompletionContext {
     Unknown,
 }
 
+/// The keyword of the declaration an annotation at `offset` attaches to:
+/// the first word after the rest of this line and any further `@...`
+/// lines. `None` at the end of the file. `cleaned` has comments (and so
+/// docstrings) already blanked out.
+fn declaration_after(cleaned: &str, offset: usize) -> Option<&str> {
+    let rest = &cleaned[offset..];
+    let after_line = rest.find('\n').map_or("", |i| &rest[i + 1..]);
+    let line = after_line
+        .lines()
+        .map(str::trim_start)
+        .find(|l| !l.is_empty() && !l.starts_with('@'))?;
+    line.split(|c: char| !c.is_alphanumeric() && c != '_').next()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1416,6 +1436,30 @@ mod tests {
         for spelling in config_value::spellings(&info.value) {
             assert!(snippet.contains(spelling), "{spelling} missing from {snippet}");
         }
+    }
+
+    /// Completion labels at the end of `line` (0-based) of `source`.
+    fn labels_at_end_of(source: &str, line: u32) -> Vec<String> {
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let text = source.lines().nth(line as usize).unwrap();
+        let position = Position::new(line, text.chars().count() as u32);
+        get_completions(source, &uri, position).into_iter().map(|c| c.label).collect()
+    }
+
+    #[test]
+    fn above_a_type_alias_validators_and_deprecated_are_offered() {
+        let source = "@\n@deprecated\ntype Name = string\n";
+        let labels = labels_at_end_of(source, 0);
+        assert!(labels.iter().any(|l| l.contains("validators")), "{labels:?}");
+        assert!(labels.iter().any(|l| l.contains("deprecated")), "{labels:?}");
+        assert!(!labels.iter().any(|l| l.contains("framing")), "{labels:?}");
+    }
+
+    #[test]
+    fn above_a_struct_validators_are_not_offered() {
+        let labels = labels_at_end_of("@\nstruct S {\n}\n", 0);
+        assert!(!labels.iter().any(|l| l.contains("validators")), "{labels:?}");
+        assert!(labels.iter().any(|l| l.contains("framing")), "{labels:?}");
     }
 
     #[test]
