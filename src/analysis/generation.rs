@@ -182,7 +182,7 @@ mod tests {
     #[test]
     fn a_feature_a_declared_language_ignores_is_a_note() {
         let schema = "validator NonEmpty for string {\n    validate {\n        \
-                      assert(value.length > 0, \"{value.name} is empty\")\n    }\n}\n\n\
+                      assert(value.length > 0, f\"{value.name} is empty\")\n    }\n}\n\n\
                       @validators = [NonEmpty]\ntype Name = string\n";
         let found = diagnostics("        typescript#5.0 = {}\n        rust#1.70.0 = {}\n", schema);
         assert_eq!(found.len(), 1, "{found:?}");

@@ -1,7 +1,8 @@
 // Code actions handler - provides quick fixes and refactorings
 
 use crate::analysis::diagnostics::{
-    DUPLICATE_BLOCK, DUPLICATE_DECLARATION, MISSING_IMPORT, UNRESOLVED_IMPORT,
+    DUPLICATE_BLOCK, DUPLICATE_DECLARATION, MESSAGE_NOT_INTERPOLATED, MISSING_IMPORT,
+    UNRESOLVED_IMPORT,
 };
 use crate::analysis::import_check;
 use crate::analysis::imports::add_use_edit;
@@ -9,7 +10,7 @@ use crate::analysis::project::Project;
 use crate::analysis::source::ProjectSource;
 use crate::analysis::symbols::{Namespace, Symbol};
 use crate::handlers::rename;
-use crate::util::byte_range_to_lsp_range;
+use crate::util::{byte_range_to_lsp_range, position_to_offset};
 use lsp_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams, Command, Diagnostic,
     NumberOrString, Range, SymbolKind, TextEdit, Url, WorkspaceEdit,
@@ -90,6 +91,7 @@ pub fn get_code_actions_with_project<S: ProjectSource>(
     }
 
     actions.extend(duplicate_name_actions(source, uri, params, &project, doc, other_files));
+    actions.extend(f_string_actions(source, uri, params));
 
     // Several uses of the same name in range: one fix per candidate is enough.
     actions.dedup_by(|a, b| match (a, b) {
@@ -260,6 +262,39 @@ fn delete_range(source: &str, span: (usize, usize)) -> (usize, usize) {
         }
     }
     (start, end)
+}
+
+/// "Make it an f-string" for a message with `{...}` that won't interpolate,
+/// since only `f"..."` does. The diagnostic's range is the message itself,
+/// so the fix is an `f` at its opening quote.
+fn f_string_actions(source: &str, uri: &Url, params: &CodeActionParams) -> Vec<CodeActionOrCommand> {
+    let code = Some(NumberOrString::String(MESSAGE_NOT_INTERPOLATED.to_string()));
+    params
+        .context
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == code && overlaps(d.range, params.range))
+        .filter(|d| {
+            position_to_offset(source, d.range.start).is_some_and(|at| source[at..].starts_with('"'))
+        })
+        .map(|d| {
+            CodeActionOrCommand::CodeAction(CodeAction {
+                title: "Make it an f-string".to_string(),
+                kind: Some(CodeActionKind::QUICKFIX),
+                diagnostics: Some(vec![d.clone()]),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(HashMap::from([(
+                        uri.clone(),
+                        vec![TextEdit { range: Range::new(d.range.start, d.range.start), new_text: "f".into() }],
+                    )])),
+                    document_changes: None,
+                    change_annotations: None,
+                }),
+                is_preferred: Some(true),
+                ..Default::default()
+            })
+        })
+        .collect()
 }
 
 /// The client's own copies of the diagnostic (with `code`, at `range`) a fix
@@ -613,5 +648,22 @@ mod duplicate_name_tests {
                 "Delete settings `Strict`",
             ]
         );
+    }
+
+    #[test]
+    fn a_plain_message_with_placeholders_gets_an_f_string_fix() {
+        let source = "validator NonEmpty for string {\n    validate {\n        assert(value.length > 0, \"{value.name} is empty\")\n    }\n}\n";
+        let r = crate::parser::parse(source).unwrap();
+        let diagnostics =
+            crate::analysis::diagnostics::all_diagnostics(source, &r.errors, r.document.as_ref());
+        let mut at = at(2, 40);
+        at.context.diagnostics = diagnostics;
+        let fix = only(source, &at, "f-string");
+        assert_eq!(fix.is_preferred, Some(true));
+        let edit = &fix.edit.unwrap().changes.unwrap()[&uri()][0];
+        assert_eq!((edit.new_text.as_str(), edit.range.start, edit.range.end), ("f", Position::new(2, 33), Position::new(2, 33)));
+
+        at.range = Range::new(Position::new(0, 0), Position::new(0, 0));
+        assert!(titles(source, &at).iter().all(|t| !t.contains("f-string")));
     }
 }

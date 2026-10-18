@@ -3,8 +3,8 @@
 //! playground's editor.
 //!
 //! A small line-oriented lexer: enough to colour keywords, primitive / user
-//! types, namespace segments, strings, `//` comments, `@annotations` and
-//! numbers without a full AST walk. Token positions are in characters (==
+//! types, namespace segments, strings (an f-string's `{placeholders}` apart),
+//! `//` comments, `@annotations` and numbers without a full AST walk. Token positions are in characters (==
 //! UTF-16 units for ASCII schemas, which is the common case).
 
 use comline_core::schema::idl::vocabulary;
@@ -19,11 +19,12 @@ const COMMENT: u32 = 3;
 const NUMBER: u32 = 4;
 const DECORATOR: u32 = 5;
 const NAMESPACE: u32 = 6;
+const VARIABLE: u32 = 7;
 
 /// The token-type names, in legend order. `backend.rs` turns these into
 /// `SemanticTokenType`s.
 pub const LEGEND_TYPES: &[&str] =
-    &["keyword", "type", "string", "comment", "number", "decorator", "namespace"];
+    &["keyword", "type", "string", "comment", "number", "decorator", "namespace", "variable"];
 
 pub fn get_semantic_tokens(source: &str, _uri: &Url) -> Option<SemanticTokensResult> {
     let mut data: Vec<SemanticToken> = Vec::new();
@@ -101,6 +102,11 @@ fn lex_line(line: &str, in_block_comment: &mut bool) -> Vec<(u32, u32, u32)> {
                     break;
                 }
             }
+            continue;
+        }
+
+        if c == 'f' && chars.get(i + 1) == Some(&'"') {
+            i = lex_f_string(&chars, i, &mut out);
             continue;
         }
 
@@ -190,6 +196,41 @@ fn lex_line(line: &str, in_block_comment: &mut bool) -> Vec<(u32, u32, u32)> {
     out
 }
 
+/// An f-string from its `f` at `start`: the text as `STRING` (the `f`
+/// included, `{{`/`}}` escapes too), each `{path}` as a `VARIABLE` between
+/// uncoloured braces. Returns the index just past the closing quote.
+fn lex_f_string(chars: &[char], start: usize, out: &mut Vec<(u32, u32, u32)>) -> usize {
+    let mut text_from = start;
+    let mut j = start + 2;
+    let flush = |out: &mut Vec<(u32, u32, u32)>, from: usize, to: usize| {
+        if to > from {
+            out.push((from as u32, (to - from) as u32, STRING));
+        }
+    };
+    while j < chars.len() && chars[j] != '"' {
+        match chars[j] {
+            '\\' => j += 2,
+            '{' | '}' if chars.get(j + 1) == Some(&chars[j]) => j += 2,
+            '{' => {
+                flush(out, text_from, j);
+                let mut k = j + 1;
+                while k < chars.len() && chars[k] != '}' && chars[k] != '"' {
+                    k += 1;
+                }
+                if k > j + 1 {
+                    out.push(((j + 1) as u32, (k - j - 1) as u32, VARIABLE));
+                }
+                j = if chars.get(k) == Some(&'}') { k + 1 } else { k };
+                text_from = j;
+            }
+            _ => j += 1,
+        }
+    }
+    let end = (j + 1).min(chars.len());
+    flush(out, text_from, end);
+    end
+}
+
 /// The index of the `*` that starts a `*/` at or after `from`, if the rest
 /// of this line's chars contain one.
 fn block_comment_end(chars: &[char], from: usize) -> Option<usize> {
@@ -206,6 +247,36 @@ mod tests {
             panic!()
         };
         t.data.iter().map(|x| x.token_type).collect()
+    }
+
+    fn tokens_on(src: &str) -> Vec<(u32, u32, u32)> {
+        lex_line(src, &mut false)
+    }
+
+    #[test]
+    fn an_f_string_is_a_string_with_its_placeholders_apart() {
+        // f"{value.name} is {{empty}}" — the `f` belongs to the string.
+        let line = r#"assert(x, f"{value.name} is {{empty}}")"#;
+        let at = |s: &str| line.find(s).unwrap() as u32;
+        let toks: Vec<_> = tokens_on(line).into_iter().filter(|t| t.0 >= at("f\"")).collect();
+        assert_eq!(
+            toks,
+            vec![
+                (at("f\""), 2, STRING),
+                (at("value"), 10, VARIABLE),
+                (at(" is"), 14, STRING),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_plain_string_has_no_placeholders() {
+        assert_eq!(tokens_on(r#""{value.name}""#), vec![(0, 14, STRING)]);
+    }
+
+    #[test]
+    fn an_identifier_ending_in_f_is_not_an_f_string() {
+        assert_eq!(tokens_on(r#"elf"x""#), vec![(3, 3, STRING)]);
     }
 
     #[test]
