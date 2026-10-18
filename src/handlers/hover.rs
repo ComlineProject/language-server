@@ -514,7 +514,18 @@ fn create_symbol_hover(symbol: &symbols::Symbol, document: &Document, lookup: &H
             if let Some(t) = find_type_alias_declaration(document, &symbol.name) {
                 let target = t.target_type();
                 let target_text = format_type(target);
-                let signature = format!("type {} = {}", symbol.name, target_text);
+                // Its annotations above it, as written - an alias's
+                // `@validators` run wherever it's used, so they belong in
+                // what it is.
+                let annotations: String = t
+                    .annotations()
+                    .iter()
+                    .map(|a| match a.value() {
+                        Some(value) => format!("@{} = {value}\n", a.key()),
+                        None => format!("@{}\n", a.key()),
+                    })
+                    .collect();
+                let signature = format!("{annotations}type {} = {}", symbol.name, target_text);
                 let resolved_text =
                     format_type(&fully_resolve_alias_chain(target, lookup.local, lookup.others));
 
@@ -1529,6 +1540,20 @@ protocol Chat {
         let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
         let text = hover_text(hover);
         assert!(text.contains("type UserId") && text.contains("u64"), "got: {text}");
+    }
+
+    #[test]
+    fn hover_on_a_type_alias_shows_its_validators() {
+        let source = "@validators = [Bounds(max = 8)]\ntype Handle = string\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let position = Position::new(1, 7);
+
+        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let text = hover_text(hover);
+        assert!(
+            text.contains("@validators = [Bounds(max = 8)]\ntype Handle = string"),
+            "got: {text}"
+        );
     }
 
     #[test]
