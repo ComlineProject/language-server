@@ -53,6 +53,10 @@ pub const DUPLICATE_DECLARATION: &str = "validation::duplicate-declaration";
 /// two-site report.
 pub const DUPLICATE_BLOCK: &str = "settings::duplicate-block";
 
+/// A message with `{...}` in a plain string, where only an f-string
+/// interpolates. The quick fix inserts the `f`.
+pub const MESSAGE_NOT_INTERPOLATED: &str = "validation::message-not-interpolated";
+
 /// `comline_core::diagnostics::Severity` -> the matching LSP tier - direct
 /// 1:1, no surprises (the two enums were designed to line up exactly).
 /// Diagnostics core spans over a whole declaration, which the editor shows
@@ -87,6 +91,7 @@ fn lsp_severity(severity: Severity) -> DiagnosticSeverity {
 fn hint_pointer(code_id: &str) -> &'static str {
     match code_id {
         DUPLICATE_DECLARATION | DUPLICATE_BLOCK => "see the error at the duplicate",
+        "validation::validator-checks-nothing" => "see the warning at its `validate` block",
         _ => "see the error at the settings entry",
     }
 }
@@ -652,6 +657,28 @@ struct User {
     }
 
     #[test]
+    fn an_empty_validate_block_warns_at_the_block() {
+        let source = "validator Positive for u8 {\n    validate {\n    }\n}\n";
+        let d = diags(source);
+        let warning = d.iter().find(|x| x.severity == Some(DiagnosticSeverity::WARNING)).expect("the warning");
+        assert!(warning.message.contains("no `assert`"), "{d:?}");
+        assert!(covered(source, warning).starts_with("validate {"), "{d:?}");
+        let hint = d.iter().find(|x| x.severity == Some(DiagnosticSeverity::HINT)).expect("the hint");
+        assert_eq!(covered(source, hint), "Positive");
+        assert!(hint.message.contains("`validate` block"), "{d:?}");
+    }
+
+    #[test]
+    fn a_placeholder_in_a_plain_message_warns_at_the_message() {
+        let source = "validator NonEmpty for string {\n    validate {\n        assert(value.length > 0, \"{value.name} is empty\")\n    }\n}\n";
+        let d = diags(source);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].code, Some(NumberOrString::String(MESSAGE_NOT_INTERPOLATED.into())));
+        assert_eq!(covered(source, &d[0]), "\"{value.name} is empty\"");
+        assert!(diags(&source.replace(", \"{", ", f\"{")).is_empty());
+    }
+
+    #[test]
     fn an_unused_validator_property_warns_at_the_property() {
         let source = "validator Bounds for u32 {\n    min: u32 = 0\n    max: u32 = 9\n    validate {\n        assert(value >= params.min, \"low\")\n    }\n}\n";
         let d = diags(source);
@@ -1033,7 +1060,7 @@ struct User {
     #[test]
     fn an_imported_validators_arguments_are_checked() {
         let rules = ("file:///pkg/src/rules.ids", "validator AtLeast for u32 {\n    min: u32\n    validate {\n        \
-                      assert(value >= params.min, \"{value.name}\")\n    }\n}\n");
+                      assert(value >= params.min, f\"{value.name}\")\n    }\n}\n");
         let messages = |call: &str| -> Vec<String> {
             let api = format!("use rules::AtLeast\n\nstruct S {{\n    @validators = [{call}]\n    n: u32\n}}\n");
             project_messages(&[("file:///pkg/src/api.ids", &api), rules]).into_iter().map(|m| m.0).collect()
@@ -1057,7 +1084,7 @@ struct User {
         const RULES: (&str, &str) = (
             "file:///pkg/src/rules.ids",
             "type Count = u32\ntype Name = string\n\n\
-             validator NonEmpty for string {\n    validate {\n        assert(value.length > 0, \"{value.name} is empty\")\n    }\n}\n",
+             validator NonEmpty for string {\n    validate {\n        assert(value.length > 0, f\"{value.name} is empty\")\n    }\n}\n",
         );
         let bad = project_messages(&[
             ("file:///pkg/src/api.ids", "use rules::{Count, NonEmpty}\n\nstruct S {\n    @validators = [NonEmpty()]\n    n: Count\n}\n"),
@@ -1082,7 +1109,7 @@ struct User {
 
     const BOUNDS: (&str, &str) = (
         "file:///pkg/src/rules.ids",
-        "validator Bounds for string {\n    validate {\n        assert(value.length > 0, \"{value.name} is empty\")\n    }\n}\n\
+        "validator Bounds for string {\n    validate {\n        assert(value.length > 0, f\"{value.name} is empty\")\n    }\n}\n\
          type Name = string\n",
     );
 
@@ -1156,7 +1183,7 @@ struct User {
         let messages: Vec<String> = project_messages(&[
             (
                 "file:///pkg/src/api.ids",
-                "validator Positive for u32 {\n    validate {\n        assert(value > 0, \"{value.name}\")\n    }\n}\n\
+                "validator Positive for u32 {\n    validate {\n        assert(value > 0, f\"{value.name}\")\n    }\n}\n\
                  struct S {\n    @validators = [Positive()]\n    n: Name\n}\n",
             ),
             BOUNDS,
