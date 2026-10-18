@@ -318,7 +318,7 @@ fn edit(range: Range, new_text: &str) -> CompletionTextEdit {
     CompletionTextEdit::Edit(TextEdit { range, new_text: new_text.to_string() })
 }
 
-fn trigger_suggest() -> Command {
+pub(super) fn trigger_suggest() -> Command {
     Command { title: "Suggest".to_string(), command: "editor.action.triggerSuggest".to_string(), arguments: None }
 }
 
