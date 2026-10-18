@@ -484,8 +484,8 @@ pub(crate) fn named_type_sites(doc: &ProjectDoc) -> Vec<(String, usize)> {
     sites.into_iter().map(|(offset, name)| (name, offset)).collect()
 }
 
-/// Every validator a file names in a `@validators = [...]` list, with the
-/// byte offset of each occurrence - on a field (of a struct or an error) or
+/// Every validator a file names in a `@validators = [...]` list, called or
+/// bare, with the byte offset of each occurrence - on a field (of a struct or an error) or
 /// a `type` alias, the places core accepts the list.
 pub(crate) fn validator_sites(doc: &ProjectDoc) -> Vec<(String, usize)> {
     let mut spans: Vec<((usize, usize), Vec<&Annotation>)> = Vec::new();
@@ -514,10 +514,10 @@ pub(crate) fn validator_sites(doc: &ProjectDoc) -> Vec<(String, usize)> {
         let text = &doc.source[start..end];
         for name in names {
             for i in word_occurrences(text, name) {
-                // A call in the list: `[Name(` or `, Name(`.
-                let called = text[i + name.len()..].trim_start().starts_with('(');
+                // An entry in the list: `[Name(`, `, Name]`, a bare `Name,`.
+                let entry = text[i + name.len()..].trim_start().starts_with(['(', ',', ']']);
                 let listed = text[..i].trim_end().ends_with(['[', ',']);
-                if called && listed {
+                if entry && listed {
                     sites.insert((start + i, name.to_string()));
                 }
             }
@@ -564,7 +564,7 @@ mod tests {
     fn validator_sites_are_the_calls_in_a_validators_list() {
         let all = files(&[(
             "file:///a.ids",
-            "@validators = [Len(max = 3), Pos()]\ntype T = string\n\nstruct S {\n    @validators = [ Len() ]\n    Len: string\n}\n",
+            "@validators = [Len(max = 3), Pos]\ntype T = string\n\nstruct S {\n    @validators = [ Len() ]\n    Len: string\n}\n",
         )]);
         let project = Project::new(all.iter());
         let sites = validator_sites(&project.docs[0]);
