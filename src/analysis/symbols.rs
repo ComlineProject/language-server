@@ -390,7 +390,7 @@ protocol UserService {
         // The bug this table was rewritten for: keyed by name, these three
         // collapsed to whichever came last, so hover on the struct showed
         // the settings block and the outline listed one entry.
-        let source = "struct Test {\n    a: str\n}\n\n\
+        let source = "struct Test {\n    a: string\n}\n\n\
                       settings Test {\n    validators.allowed = true\n}\n";
         let uri = Url::parse("file:///test.ids").unwrap();
         let result = parser::parse(source).unwrap();
@@ -410,7 +410,7 @@ protocol UserService {
 
     #[test]
     fn a_cursor_on_a_declarations_name_resolves_to_that_declaration() {
-        let source = "struct Test {\n    a: str\n}\n\n\
+        let source = "struct Test {\n    a: string\n}\n\n\
                       settings Test {\n    validators.allowed = true\n}\n";
         let uri = Url::parse("file:///test.ids").unwrap();
         let result = parser::parse(source).unwrap();
@@ -425,7 +425,7 @@ protocol UserService {
         assert_eq!(table.at_offset(settings_name).unwrap().kind, SymbolKind::OBJECT);
 
         // Inside the struct body is not any declaration's own name.
-        let body = source.find("a: str").unwrap();
+        let body = source.find("a: string").unwrap();
         assert!(table.at_offset(body).is_none());
     }
 

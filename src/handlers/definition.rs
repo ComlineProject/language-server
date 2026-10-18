@@ -71,7 +71,7 @@ mod tests {
         // Keyed by name, a `Target` could not tell the two apart, so this
         // jumped to whichever the symbol table had kept - the settings
         // block, since it is declared last.
-        let source = "struct Test {\n    a: str\n}\n\n\
+        let source = "struct Test {\n    a: string\n}\n\n\
                       settings Test {\n    validators.allowed = true\n}\n\n\
                       struct Holder {\n    t: Test\n}\n";
         let uri = Url::parse("file:///test.ids").unwrap();
@@ -417,7 +417,7 @@ struct User {
 
     #[test]
     fn test_goto_definition_validator() {
-        let source = "validator StringBounds {\n    min: u32\n    max: u32\n}\n\nstruct S {\n    @validators = [StringBounds(min=3, max=10)]\n    name: string\n}\n";
+        let source = "validator StringBounds for string {\n    min: u32\n    max: u32\n}\n\nstruct S {\n    @validators = [StringBounds(min=3, max=10)]\n    name: string\n}\n";
         let uri = Url::parse("file:///test.ids").unwrap();
         let offset = source.rfind("StringBounds").unwrap();
         let position = crate::util::offset_to_position(source, offset);

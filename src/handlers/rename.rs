@@ -111,7 +111,7 @@ mod tests {
     fn renaming_a_struct_leaves_a_same_named_settings_preset_alone() {
         // `renameable_at` resolved by name, so renaming either of these
         // followed whichever symbol the table had kept.
-        let source = "struct Test {\n    a: str\n}\n\n\
+        let source = "struct Test {\n    a: string\n}\n\n\
                       settings Test {\n    validators.allowed = true\n}\n\n\
                       struct Holder {\n    t: Test\n}\n";
         let uri = Url::parse("file:///test.ids").unwrap();

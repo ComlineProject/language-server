@@ -1568,7 +1568,7 @@ mod tests {
 
     #[test]
     fn strip_comments_and_strings_preserves_length_and_newlines() {
-        let source = "struct M {\n    a: str // note\n    b: str\n}\n";
+        let source = "struct M {\n    a: string // note\n    b: string\n}\n";
         let cleaned = strip_comments_and_strings(source);
         assert_eq!(cleaned.chars().count(), source.chars().count());
         assert_eq!(

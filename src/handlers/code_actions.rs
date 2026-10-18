@@ -395,7 +395,7 @@ mod duplicate_name_tests {
     use crate::analysis::source::SourceFile;
     use lsp_types::{CodeActionContext, Position, TextDocumentIdentifier};
 
-    const THREE_TESTS: &str = "struct Test {\n    a: str\n}\n\n\
+    const THREE_TESTS: &str = "struct Test {\n    a: string\n}\n\n\
                                error Test {\n    message = \"\"\n}\n\n\
                                /// Restricting some stuff\n\
                                settings Test {\n    validators.allowed = true\n}\n";
@@ -508,9 +508,9 @@ mod duplicate_name_tests {
     /// would be a poor fix, so the obvious one is skipped when taken.
     #[test]
     fn the_suggested_name_steps_around_what_is_taken() {
-        let source = "struct Test {\n    a: str\n}\n\n\
+        let source = "struct Test {\n    a: string\n}\n\n\
                       error Test {\n    message = \"\"\n}\n\n\
-                      struct TestError {\n    b: str\n}\n";
+                      struct TestError {\n    b: string\n}\n";
         assert!(titles(source, &at(4, 7)).contains(&"Rename error `Test` to `TestError2`".to_string()));
     }
 
@@ -541,7 +541,7 @@ mod duplicate_name_tests {
         after.replace_range(start..end, "");
         assert_eq!(
             after,
-            "struct Test {\n    a: str\n}\n\n\
+            "struct Test {\n    a: string\n}\n\n\
              /// Restricting some stuff\n\
              settings Test {\n    validators.allowed = true\n}\n",
             "one blank line left between the survivors",

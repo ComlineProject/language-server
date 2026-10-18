@@ -1213,7 +1213,7 @@ struct User {
 
     #[test]
     fn hover_on_validators_annotation_shows_its_description() {
-        let source = "struct X {\n    @validators = [Foo()]\n    name: str\n}\n";
+        let source = "struct X {\n    @validators = [Foo()]\n    name: string\n}\n";
         let uri = Url::parse("file:///test.ids").unwrap();
         let position = Position::new(1, 7);
 
@@ -1309,7 +1309,7 @@ struct User {
 
     #[test]
     fn test_hover_on_a_field_shows_its_annotations() {
-        let source = "struct Message {\n    @timeout_ms=1000\n    body: str\n}\n";
+        let source = "struct Message {\n    @timeout_ms=1000\n    body: string\n}\n";
         let uri = Url::parse("file:///test.ids").unwrap();
         // Hover over "body" (the field name) on line 2.
         let position = Position::new(2, 6);
@@ -1321,14 +1321,14 @@ struct User {
 
     #[test]
     fn test_hover_on_a_field_in_an_error_shows_its_own_info() {
-        let source = "error Rejected {\n    message = \"no\"\n    reason: str\n}\n";
+        let source = "error Rejected {\n    message = \"no\"\n    reason: string\n}\n";
         let uri = Url::parse("file:///test.ids").unwrap();
         // Hover over "reason" (the field name) on line 2.
         let position = Position::new(2, 6);
 
         let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
         let text = hover_text(hover);
-        assert!(text.contains("reason: str"), "got: {text}");
+        assert!(text.contains("reason: string"), "got: {text}");
         assert!(text.contains("of `Rejected`"), "got: {text}");
     }
 
@@ -1365,7 +1365,7 @@ struct User {
     /// A schema declaring a struct and a settings preset under one name.
     /// Core allows this - a settings block generates no type - so the
     /// editor has to tell them apart.
-    const SHARED_NAME: &str = "struct Test {\n    a: str\n}\n\n\
+    const SHARED_NAME: &str = "struct Test {\n    a: string\n}\n\n\
                                settings Test {\n    validators.allowed = true\n}\n";
 
     #[test]
@@ -1396,7 +1396,7 @@ struct User {
 
     #[test]
     fn a_type_reference_resolves_to_the_declaration_not_the_preset() {
-        let source = "struct Test {\n    a: str\n}\n\n\
+        let source = "struct Test {\n    a: string\n}\n\n\
                       settings Test {\n    validators.allowed = true\n}\n\n\
                       struct Holder {\n    t: Test\n}\n";
         let uri = Url::parse("file:///test.ids").unwrap();
@@ -1854,7 +1854,7 @@ protocol Chat {
 
     #[test]
     fn hover_on_a_validator_reference_shows_its_parameters() {
-        let source = "validator StringBounds {\n    min: u32\n    max: u32\n}\n\nstruct S {\n    @validators = [StringBounds(min=3, max=10)]\n    name: string\n}\n";
+        let source = "validator StringBounds for string {\n    min: u32\n    max: u32\n}\n\nstruct S {\n    @validators = [StringBounds(min=3, max=10)]\n    name: string\n}\n";
         let uri = Url::parse("file:///test.ids").unwrap();
         let offset = source.rfind("StringBounds").unwrap();
         let position = crate::util::offset_to_position(source, offset);

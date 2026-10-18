@@ -327,7 +327,7 @@ mod tests {
 
     #[test]
     fn field_named_message_does_not_highlight_as_keyword() {
-        let src = "struct S {\n    message: str\n}\n";
+        let src = "struct S {\n    message: string\n}\n";
         let ty = types_on(src);
         // `struct` (KEYWORD), `S` (TYPE), `str` (TYPE) — three tokens, none
         // of them `message` itself: it's a field name here (followed by
