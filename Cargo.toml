@@ -33,14 +33,14 @@ anyhow = "1.0"
 # `Command::arguments` is `Vec<serde_json::Value>` — the interactive-rename
 # quick fix below hands the client a URI and a position through it.
 serde_json = "1.0"
-comline-core = { git = "https://github.com/ComlineProject/core", rev = "098301516576d200aa11f3fc12aaeac695b4a43d" }
+comline-core = { git = "https://github.com/ComlineProject/core", rev = "c01b756ae3183cb88fec5c4b7fb0d4bd34f1d66a" }
 # What each generator supports, feature by feature (`comline_codegen::features`)
 # - for warning at a use a declared language can't generate. Only the
 # generators' `SUPPORT` tables are read; nothing is generated. Pinned to the
 # same commits as the CLI, so a build has one `comline-codegen`.
-comline-codegen = { git = "https://github.com/ComlineProject/generation", rev = "269ec60590db1c6599499e82b53c41e56bcf2b32" }
-comline-codegen-rust = { git = "https://github.com/ComlineProject/comline-rust", rev = "9fe85575008e35c0f5c58c62da472db9b0703832" }
-comline-codegen-typescript = { git = "https://github.com/ComlineProject/comline-typescript", rev = "9a50cc3d4c42acf34d3ee7e001259ce4ab39f22f" }
+comline-codegen = { git = "https://github.com/ComlineProject/generation", rev = "caa22a31ffb21ea9e888a9c52c69781965abb00a" }
+comline-codegen-rust = { git = "https://github.com/ComlineProject/comline-rust", rev = "a7bb69b87d549b1938e9aacecc80dd3e1ee04caa" }
+comline-codegen-typescript = { git = "https://github.com/ComlineProject/comline-typescript", rev = "b96f2cac4d90a7dd81818c73d71e2832c694dd78" }
 
 # `server`-only.
 tower-lsp = { version = "0.20.0", optional = true }
