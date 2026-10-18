@@ -330,6 +330,25 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_validator_import_gets_an_add_use_fix() {
+        let api = "@validators = [StringBounds()]\ntype FixedNum = string\n";
+        let api_uri = Url::parse("file:///pkg/src/api.ids").unwrap();
+        let mut files = vec![crate::analysis::source::SourceFile::local(api_uri.clone(), api.to_string())];
+        files.extend(crate::analysis::stdlib::files(&crate::analysis::stdlib::root()));
+
+        let cursor = Range::new(Position::new(0, 18), Position::new(0, 18));
+        let actions = get_code_actions_with_project(api, &api_uri, &params(&api_uri, cursor), &files);
+        assert_eq!(
+            titles_and_edits(actions),
+            vec![(
+                "Add `use std::validators::StringBounds`".to_string(),
+                "use std::validators::StringBounds\n\n".to_string(),
+                0
+            )]
+        );
+    }
+
+    #[test]
     fn no_fix_away_from_the_missing_name() {
         let chat = "struct S {\n    m: Message\n    n: bool\n}\n";
         let chat_uri = Url::parse("file:///pkg/src/chat.ids").unwrap();

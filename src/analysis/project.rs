@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use comline_core::schema::idl::grammar::{Declaration, Document, Type};
+use comline_core::schema::idl::grammar::{Annotation, AnnotationValue, Declaration, Document, Type};
 use comline_core::schema::idl::module_docs::module_docs;
 use lsp_types::{Location, Url};
 
@@ -484,6 +484,49 @@ pub(crate) fn named_type_sites(doc: &ProjectDoc) -> Vec<(String, usize)> {
     sites.into_iter().map(|(offset, name)| (name, offset)).collect()
 }
 
+/// Every validator a file names in a `@validators = [...]` list, with the
+/// byte offset of each occurrence - on a field (of a struct or an error) or
+/// a `type` alias, the places core accepts the list.
+pub(crate) fn validator_sites(doc: &ProjectDoc) -> Vec<(String, usize)> {
+    let mut spans: Vec<((usize, usize), Vec<&Annotation>)> = Vec::new();
+    for decl in &doc.document.0 {
+        match &**decl {
+            Declaration::Struct(s) => spans.extend(s.fields().iter().map(|f| (f.span, f.annotations()))),
+            Declaration::Error(e) => spans.extend(e.fields().iter().map(|f| (f.span, f.annotations()))),
+            Declaration::TypeAlias(t) => spans.push((decl.span, t.annotations())),
+            _ => {}
+        }
+    }
+
+    let mut sites = BTreeSet::new();
+    for (span, annotations) in spans {
+        let names: BTreeSet<&str> = annotations
+            .iter()
+            .filter(|a| a.key.text == "validators")
+            .filter_map(|a| match &a.assignment.as_ref()?.value {
+                AnnotationValue::List(list) => Some(list.items.iter().map(|call| call.name.text.as_str())),
+                AnnotationValue::Scalar(_) => None,
+            })
+            .flatten()
+            .collect();
+
+        let (start, end) = (span.0.min(doc.source.len()), span.1.min(doc.source.len()));
+        let text = &doc.source[start..end];
+        for name in names {
+            for i in word_occurrences(text, name) {
+                // A call in the list: `[Name(` or `, Name(`.
+                let called = text[i + name.len()..].trim_start().starts_with('(');
+                let listed = text[..i].trim_end().ends_with(['[', ',']);
+                if called && listed {
+                    sites.insert((start + i, name.to_string()));
+                }
+            }
+        }
+    }
+
+    sites.into_iter().map(|(offset, name)| (name, offset)).collect()
+}
+
 /// Like [`collect_named`], but the full text as written (`types::User`).
 fn collect_named_text(ty: &Type, names: &mut BTreeSet<String>) {
     match ty {
@@ -515,6 +558,27 @@ mod tests {
             .collect();
         out.sort();
         out
+    }
+
+    #[test]
+    fn validator_sites_are_the_calls_in_a_validators_list() {
+        let all = files(&[(
+            "file:///a.ids",
+            "@validators = [Len(max = 3), Pos()]\ntype T = string\n\nstruct S {\n    @validators = [ Len() ]\n    Len: string\n}\n",
+        )]);
+        let project = Project::new(all.iter());
+        let sites = validator_sites(&project.docs[0]);
+        let source = &all[0].1;
+        let at = |n: usize| source.match_indices("Len").nth(n).unwrap().0;
+        assert_eq!(
+            sites,
+            vec![
+                ("Len".to_string(), at(0)),
+                ("Pos".to_string(), source.find("Pos").unwrap()),
+                ("Len".to_string(), at(1)),
+            ],
+            "not the field named `Len`"
+        );
     }
 
     #[test]

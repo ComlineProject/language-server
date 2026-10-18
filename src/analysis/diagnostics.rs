@@ -987,9 +987,9 @@ struct User {
          type Name = string\n",
     );
 
-    /// A validator declared in another file but never imported is unknown -
-    /// and only that. Finding it project-wide anyway once also checked its
-    /// `for` against the alias, an error about a declaration not in scope.
+    /// A validator declared in another file but never imported is a missing
+    /// `use` - and only that. Finding it project-wide anyway once also checked
+    /// its `for` against the alias, an error about a declaration not in scope.
     #[test]
     fn a_validator_the_file_never_imports_is_unknown_and_nothing_more() {
         let messages: Vec<String> = project_messages(&[
@@ -999,8 +999,10 @@ struct User {
         .into_iter()
         .map(|m| m.0)
         .collect();
-        assert_eq!(messages.len(), 1, "{messages:?}");
-        assert!(messages[0].starts_with("Unknown validator 'Bounds'"), "{messages:?}");
+        assert_eq!(
+            messages,
+            ["`Bounds` is declared in `rules.ids` but not imported here — add `use rules::Bounds`"]
+        );
 
         // Imported, it's found - and then its target is what's wrong.
         let messages: Vec<String> = project_messages(&[
@@ -1032,8 +1034,11 @@ struct User {
         };
 
         let unimported = in_package("@validators = [StringBounds()]\ntype FixedNum = u8[2]\n");
-        assert_eq!(unimported.len(), 1, "{unimported:?}");
-        assert!(unimported[0].starts_with("Unknown validator 'StringBounds'"), "{unimported:?}");
+        assert_eq!(
+            unimported,
+            ["`StringBounds` is declared in `validators.ids` but not imported here — \
+              add `use std::validators::StringBounds`"]
+        );
 
         let imported = in_package(
             "use std::validators::StringBounds\n\n@validators = [StringBounds()]\ntype FixedNum = u8[2]\n",
