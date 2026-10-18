@@ -14,7 +14,8 @@
 
 use crate::parser;
 use crate::util::{in_comment_or_string, position_to_offset};
-use comline_core::package::config::idl::grammar::{Key, Value};
+use comline_core::package::config::idl::grammar::{Assignment, Key, Value};
+use rust_sitter::Spanned;
 use comline_core::settings::catalog;
 use lsp_types::{Hover, HoverContents, MarkedString, Position};
 
@@ -25,6 +26,10 @@ pub fn get_idp_hover_info(source: &str, position: Position) -> Option<Hover> {
     }
 
     let congregation = parser::parse_idp(source).ok()?.document?;
+
+    if let Some(hover) = language_hover(&congregation.assignments, offset) {
+        return Some(hover);
+    }
 
     let top = congregation.assignments.iter().find(|a| {
         matches!(&a.value.key, Key::Identifier(id) if id.value == "settings")
@@ -49,6 +54,35 @@ pub fn get_idp_hover_info(source: &str, position: Position) -> Option<Hover> {
     } else {
         entry_hover(&path, &current.value.value)
     })
+}
+
+/// Cursor on an entry of `code_generation.languages` (`rust#1.70.0 = {...}`):
+/// what that language's generator supports, from its own `SUPPORT` table.
+/// `None` elsewhere, or for a language this build has no generator for.
+fn language_hover(assignments: &[Spanned<Assignment>], offset: usize) -> Option<Hover> {
+    let generation = dictionary(containing(assignments, offset, Some("code_generation"))?)?;
+    let languages = dictionary(containing(generation, offset, Some("languages"))?)?;
+    let entry = containing(languages, offset, None)?;
+    let key = key_text(&entry.key);
+    let (language, version) = key.split_once('#')?;
+    let summary = crate::analysis::generation::summary(language, version)?;
+    Some(Hover { contents: HoverContents::Array(vec![MarkedString::from_markdown(summary)]), range: None })
+}
+
+/// The assignment in `assignments` the cursor is in - named `key`, if given.
+fn containing<'a>(assignments: &'a [Spanned<Assignment>], offset: usize, key: Option<&str>) -> Option<&'a Assignment> {
+    assignments
+        .iter()
+        .find(|a| offset >= a.span.0 && offset < a.span.1 && key.is_none_or(|k| key_text(&a.value.key) == k))
+        .map(|a| &a.value)
+}
+
+/// The entries of `assignment`'s value, when it's a `{ ... }`.
+fn dictionary(assignment: &Assignment) -> Option<&[Spanned<Assignment>]> {
+    match &assignment.value {
+        Value::Dictionary(d) => Some(&d.assignments),
+        _ => None,
+    }
 }
 
 fn key_text(key: &Key) -> String {
@@ -124,6 +158,21 @@ fn group_hover(path: &[String]) -> Hover {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn hovering_a_declared_language_shows_what_its_generator_supports() {
+        let source = "congregation app\nspecification_version = 1\n\ncode_generation = {\n    languages = {\n        rust#1.70.0 = {}\n    }\n}\n";
+        let hover = get_idp_hover_info(source, Position::new(5, 10)).expect("a hover on `rust#1.70.0`");
+        let HoverContents::Array(parts) = hover.contents else { panic!("an array") };
+        let MarkedString::String(text) = &parts[0] else { panic!("markdown") };
+        assert!(text.contains("**`rust#1.70.0`** supports"), "{text}");
+        assert!(text.contains("- unions: "), "{text}");
+
+        // A language this build can't generate: nothing to say.
+        let other = source.replace("rust#1.70.0", "python#3.11.0");
+        assert!(get_idp_hover_info(&other, Position::new(5, 10)).is_none());
+    }
+
     use super::*;
     use crate::util::offset_to_position;
 

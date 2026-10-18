@@ -121,6 +121,46 @@ pub fn declared_dependencies(manifest: &str) -> Vec<DeclaredDependency> {
     declared
 }
 
+/// A language `config.idp`'s `code_generation.languages` declares:
+/// `rust#1.70.0` -> `rust`, `1.70.0`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredLanguage {
+    pub language: String,
+    pub version: String,
+}
+
+/// Every language `config.idp`'s text declares, read with core's own
+/// interpreter, as `comline generate` reads them. Empty when the manifest
+/// doesn't parse (mid-edit) or doesn't interpret.
+pub fn declared_languages(manifest: &str) -> Vec<DeclaredLanguage> {
+    use comline_core::package::config::idl::grammar::Key;
+    use comline_core::package::config::ir::context::ProjectContext;
+    use comline_core::package::config::ir::frozen::FrozenUnit;
+    use comline_core::package::config::ir::interpreter::interpret::interpret_context;
+
+    let Some(mut congregation) = parser::parse_idp(manifest).ok().and_then(|r| r.document) else {
+        return vec![];
+    };
+    // `settings` has nothing to do with the languages, and a cross-package
+    // reference there can't be interpreted on its own (see
+    // `declared_settings`), so it's left out.
+    congregation
+        .assignments
+        .retain(|a| !matches!(&a.value.key, Key::Identifier(id) if id.value == "settings"));
+    let Ok(units) = interpret_context(&ProjectContext::with_config(congregation), None) else {
+        return vec![];
+    };
+    units
+        .iter()
+        .filter_map(|u| match u {
+            FrozenUnit::CodeGeneration(details) => details.name.split_once('#').map(|(language, version)| {
+                DeclaredLanguage { language: language.to_string(), version: version.to_string() }
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
 /// The package-level `settings` dict `config.idp`'s text declares - read
 /// with core's own interpreter, so the editor and `comline build` agree
 /// on what's forbidden. Empty when the manifest doesn't parse (mid-edit),

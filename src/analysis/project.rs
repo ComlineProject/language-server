@@ -44,6 +44,8 @@ pub struct Project<'a> {
     /// whole package, not just whatever files happened to be at hand, so an
     /// import nothing here matches really is unresolved.
     pub has_manifest: bool,
+    /// The languages that `config.idp` declares (`code_generation.languages`).
+    pub languages: Vec<source::DeclaredLanguage>,
     /// What that `config.idp` declares.
     pub dependencies: Vec<DeclaredDependency>,
     /// The docs of each dependency's package (std included), by the name it's
@@ -121,7 +123,7 @@ impl<'a> Project<'a> {
             .collect();
 
         Self {
-            docs, unparsed: vec![], has_manifest: false, dependencies: vec![],
+            docs, unparsed: vec![], has_manifest: false, languages: vec![], dependencies: vec![],
             package_docs: BTreeMap::new(), settings: Default::default(), settings_error: None,
         }
     }
@@ -136,7 +138,7 @@ impl<'a> Project<'a> {
         let mut project = Self {
             docs: vec![],
             unparsed: vec![],
-            has_manifest: false,
+            has_manifest: false, languages: vec![],
             dependencies: vec![],
             package_docs: BTreeMap::new(),
             settings: Default::default(),
@@ -155,6 +157,7 @@ impl<'a> Project<'a> {
                     None => {
                         project.has_manifest = true;
                         project.dependencies = source::declared_dependencies(input.text);
+                        project.languages = source::declared_languages(input.text);
                         match source::resolve_cross_package_settings(input.text, &inputs) {
                             Some(Ok(dict)) => project.settings = dict,
                             Some(Err(message)) => project.settings_error = Some(message),
