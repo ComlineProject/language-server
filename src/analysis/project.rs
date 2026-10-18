@@ -181,34 +181,18 @@ impl<'a> Project<'a> {
         self.docs.iter().position(|d| d.uri == uri)
     }
 
-    /// What `name`, written in `docs[doc]`, refers to: what
-    /// [`resolve_in_scope`](Self::resolve_in_scope) finds, else the first
-    /// other file declaring `name` - a fallback, since a miss there is often
-    /// just a `use` being typed, or a sibling that doesn't parse mid-edit.
-    ///
-    /// **Navigation only** (go-to-definition, hover), where finding the
-    /// declaration a missing `use` would bring in is the helpful answer.
-    /// Anything that judges the schema, or edits it, wants
-    /// [`resolve_in_scope`](Self::resolve_in_scope): the fallback answers for
-    /// names the file never imported.
-    pub fn resolve(&self, doc: usize, name: &str, namespace: Namespace) -> Option<Target> {
-        self.resolve_in_scope(doc, name, namespace).or_else(|| {
-            if namespace != Namespace::Declaration {
-                return None;
-            }
-            self.others(doc).find_map(|(i, d)| {
-                d.symbols.index_in(name, namespace).map(|symbol| Target { doc: i, symbol })
-            })
-        })
-    }
-
     /// What `name`, written in `docs[doc]`, refers to, by the file's own
     /// scope - the way `comline build` sees it:
     /// 1. a declaration in that same file;
     /// 2. a sibling that one of that file's own `use`/`import`s brings
     ///    `name` into scope from (`imports::resolve_symbol` - so through an
     ///    `as` alias, the target's real name comes back).
-    pub fn resolve_in_scope(&self, doc: usize, name: &str, namespace: Namespace) -> Option<Target> {
+    ///
+    /// Nothing else: a name the file never imports refers to nothing, even
+    /// where another file declares it - for diagnostics, references and
+    /// rename, and for go-to-definition and hover alike. The missing `use`
+    /// is the diagnostic's to report, and its quick fix's to add.
+    pub fn resolve(&self, doc: usize, name: &str, namespace: Namespace) -> Option<Target> {
         let here = &self.docs[doc];
 
         if let Some(symbol) = here.symbols.index_in(name, namespace) {
@@ -293,7 +277,7 @@ impl<'a> Project<'a> {
                     // symbol and must not be swept up here.
                     // In scope only: a file naming `User` without importing
                     // it doesn't refer to this one, and rename mustn't edit it.
-                    if self.resolve_in_scope(index, &name, Namespace::Declaration).as_ref()
+                    if self.resolve(index, &name, Namespace::Declaration).as_ref()
                         != Some(target)
                     {
                         continue;
@@ -549,10 +533,10 @@ mod tests {
     }
 
     /// A file naming `User` without importing it doesn't refer to another
-    /// file's `User` - so rename leaves it alone - while navigation still
-    /// finds that declaration, the one a `use` would bring in.
+    /// file's `User` - so rename leaves it alone, and navigation doesn't go
+    /// there either.
     #[test]
-    fn a_name_the_file_never_imports_is_no_reference_but_still_navigable() {
+    fn a_name_the_file_never_imports_refers_to_nothing() {
         let all = files(&[
             ("file:///types.ids", "struct User {\n    name: string\n}\n"),
             ("file:///api.ids", "struct S {\n    u: User\n}\n"),
@@ -561,8 +545,7 @@ mod tests {
         let target = project.resolve(0, "User", Namespace::Declaration).unwrap();
         assert_eq!(lines(&project.references(&target)), Vec::<(String, u32, u32)>::new());
 
-        assert_eq!(project.resolve_in_scope(1, "User", Namespace::Declaration), None);
-        assert_eq!(project.resolve(1, "User", Namespace::Declaration), Some(target));
+        assert_eq!(project.resolve(1, "User", Namespace::Declaration), None);
     }
 
     #[test]

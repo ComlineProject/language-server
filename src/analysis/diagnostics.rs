@@ -103,7 +103,7 @@ pub fn validation_diagnostics(source: &str, document: &Document) -> Vec<Diagnost
 /// What core's validation asks about names a file imports - an imported
 /// validator's `for` targets, what an imported `type` alias stands for -
 /// answered from the declaration the file's own scope brings in
-/// ([`Project::resolve_in_scope`]), read with core's own helpers so the
+/// ([`Project::resolve`]), read with core's own helpers so the
 /// editor resolves exactly as `comline build` does.
 struct ProjectImports<'p, 'a> {
     project: &'p Project<'a>,
@@ -118,7 +118,7 @@ impl ProjectImports<'_, '_> {
         let bare = name.rsplit("::").next()?;
         // In scope only, as `comline build` resolves: the project-wide
         // fallback would answer for a validator this file never imported.
-        let target = self.project.resolve_in_scope(self.doc, bare, Namespace::Declaration)?;
+        let target = self.project.resolve(self.doc, bare, Namespace::Declaration)?;
         let real_name = self.project.symbol(&target)?.name.clone();
         Some((target.doc, real_name))
     }

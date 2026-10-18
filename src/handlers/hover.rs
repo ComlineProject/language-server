@@ -4,7 +4,6 @@ use crate::analysis::imports::{self, ProjectFile};
 use crate::analysis::modules::{self, Module};
 use crate::analysis::project::Project;
 use crate::analysis::source::{self, ProjectSource};
-use crate::analysis::stdlib;
 use crate::analysis::symbols;
 use crate::handlers::annotation_hover::AnnotationHover;
 use crate::parser;
@@ -98,12 +97,12 @@ pub fn get_hover_info_with_project<S: ProjectSource>(
 
     // Parse every sibling file once, up front, and keep them all alive for
     // the rest of this call — not just whichever one happens to match the
-    // hovered word. A struct's fields can reference types declared in *any*
-    // other file, so size computation needs the whole set, not just the
+    // hovered word. A struct's fields can reference types declared in other
+    // files, so size computation needs every file in scope, not just the
     // document the matched symbol itself lives in.
-    // Each with the namespace it's seen under and the dependency (if any)
-    // it comes from - a dependency's file can't say either by its path (see
-    // `analysis::source`). The package manifest isn't a schema.
+    // Each with the namespace it's seen under - a dependency's file can't
+    // say by its path (see `analysis::source`). The package manifest isn't
+    // a schema.
     let mut parsed: Vec<(Sibling, Origin)> = other_files
         .iter()
         .filter(|file| !source::is_manifest(file.uri()))
@@ -113,23 +112,34 @@ pub fn get_hover_info_with_project<S: ProjectSource>(
                 .namespace()
                 .map(<[String]>::to_vec)
                 .unwrap_or_else(|| imports::namespace_of(file.uri()));
-            Some(((file.uri(), file.text(), document), (namespace, file.dependency())))
+            Some(((file.uri(), file.text(), document), namespace))
         })
         .collect();
 
-    // Check if a `use`/`import` here actually brings a symbol named `word`
-    // into scope from one specific sibling.
+    // Only the files this one's `use`s reach - and the files *their* `use`s
+    // reach, since a struct's size follows its fields into wherever they are
+    // imported from. A file nothing imports isn't in scope here, so nothing
+    // in it is either: not for the hover, not for a size estimate.
     let own_namespace = imports::namespace_of(uri);
     let own_imports = imports::resolved_imports(&document, &own_namespace);
+    let mut reached = vec![false; parsed.len()];
+    let mut pending = vec![imports::resolved_imports(&document, &own_namespace)];
+    while let Some(uses) = pending.pop() {
+        for (i, ((_, _, sibling), namespace)) in parsed.iter().enumerate() {
+            if !reached[i] && imports_reach(&uses, namespace) {
+                reached[i] = true;
+                pending.push(imports::resolved_imports(sibling, namespace));
+            }
+        }
+    }
+    let mut reached = reached.into_iter();
+    parsed.retain(|_| reached.next().unwrap_or(false));
 
-    // `others` feeds `HoverSizeLookup` too (below) — put `use`-resolved
-    // siblings first (stable, so relative order within each group is
-    // otherwise unchanged) so a name collision with an unimported sibling
-    // resolves to the one actually in scope, while still falling back to
-    // the unimported sibling's estimate over `Unknown`.
-    parsed.sort_by_key(|(_, (namespace, _))| {
-        !own_imports.iter().any(|i| i.resolved.absolute_namespace.starts_with(namespace))
-    });
+    // `others` feeds `HoverSizeLookup` too (below) — put the siblings this
+    // file imports from directly first (stable, so relative order within
+    // each group is otherwise unchanged), so a name collision with a file
+    // only reached through another's `use` resolves to the nearer one.
+    parsed.sort_by_key(|(_, namespace)| !imports_reach(&own_imports, namespace));
     let (other_docs, origins): (Vec<Sibling>, Vec<Origin>) = parsed.into_iter().unzip();
 
     let lookup = HoverSizeLookup { local: &document, others: &other_docs };
@@ -151,7 +161,7 @@ pub fn get_hover_info_with_project<S: ProjectSource>(
     let siblings: Vec<ProjectFile> = other_docs
         .iter()
         .zip(&origins)
-        .map(|((u, s, _), (namespace, _))| ProjectFile { uri: u, source: s, namespace: namespace.clone() })
+        .map(|((u, s, _), namespace)| ProjectFile { uri: u, source: s, namespace: namespace.clone() })
         .collect();
 
     if let Some(resolved) = imports::resolve_symbol(&word, &own_imports, &siblings) {
@@ -174,21 +184,6 @@ pub fn get_hover_info_with_project<S: ProjectSource>(
         }
     }
 
-    // Fallback: flat, project-wide, first-match scan — not `use`-scoped,
-    // so append a note: the match isn't one any `use` here actually reaches.
-    for ((other_uri, other_source, other_document), (_, dependency)) in other_docs.iter().zip(&origins) {
-        let other_table = symbols::build_symbol_table(other_document, other_uri, other_source);
-        if let Some(symbol) = other_table.get_in(&word, symbols::Namespace::Declaration) {
-            let mut hover = create_symbol_hover(symbol, other_document, &lookup);
-            let place = match dependency {
-                Some(name) => format!("`{}` ({})", file_label(other_uri), stdlib::owner(name)),
-                None => format!("`{}`", file_label(other_uri)),
-            };
-            append_note(&mut hover, format!("declared in {place} — no `use` here brings it into scope"));
-            return Some(hover);
-        }
-    }
-
     // Check if it's a type reference
     if let Some(type_info) = find_type_at_position(&document, &word) {
         return Some(create_type_hover(&word, type_info));
@@ -202,36 +197,22 @@ pub fn get_hover_info_with_project<S: ProjectSource>(
     None
 }
 
+/// Whether one of `uses` points into the file seen under `namespace`.
+fn imports_reach(uses: &[imports::ResolvedUse], namespace: &[String]) -> bool {
+    !namespace.is_empty() && uses.iter().any(|u| u.resolved.absolute_namespace.starts_with(namespace))
+}
+
 /// A parsed sibling file: its URI, text and tree.
 type Sibling<'a> = (&'a Url, &'a str, Document);
 
-/// Where a sibling sits: the namespace it's seen under, and the dependency
-/// it comes from (if any).
-type Origin<'a> = (Vec<String>, Option<&'a str>);
-
-/// The last path segment of a file's URI, for a short, readable hover note
-/// (`types.ids`, not the full URI). `url.path()`, not `Url::to_file_path()`
-/// — unavailable on `wasm32-unknown-unknown` (see `imports`'s module doc).
-fn file_label(uri: &Url) -> String {
-    std::path::Path::new(uri.path())
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| uri.to_string())
-}
-
-/// Append one more line to an already-built hover.
-fn append_note(hover: &mut Hover, note: String) {
-    if let HoverContents::Array(contents) = &mut hover.contents {
-        contents.push(MarkedString::from_markdown(note));
-    }
-}
+/// Where a sibling sits: the namespace it's seen under.
+type Origin = Vec<String>;
 
 /// Resolves a bare type name to its declaration across the active document
-/// plus every other project file: local document first, then `others` in
-/// order — `use`-resolved siblings sorted first (see the call site that
-/// builds `others`), so a name collision with an unimported sibling still
-/// resolves to the one actually in scope, but an unimported sibling's own
-/// estimate still beats `Unknown` when nothing else matches. Backs
+/// plus the files its `use`s reach: local document first, then `others` in
+/// order — directly imported siblings first (see the call site that builds
+/// `others`). A name nothing imports stays unresolved, and its size
+/// `Unknown`. Backs
 /// [`size::size_of_type`] / [`size::size_of_struct`] for the size block in
 /// [`create_symbol_hover`].
 struct HoverSizeLookup<'a> {
@@ -1439,7 +1420,7 @@ struct User {
     #[test]
     fn test_hover_on_struct_declared_in_another_file() {
         // `chat.ids` references `Message`, declared only in `types.ids`.
-        let chat_source = r#"
+        let chat_source = r#"use types::Message
 protocol Chat {
     function send(text: string) -> Message;
 }
@@ -1464,16 +1445,63 @@ protocol Chat {
         assert!(text.contains("struct Message"), "got: {text}");
         assert!(text.contains("text"), "got: {text}");
         assert!(text.contains("seq"), "got: {text}");
-        // `chat.ids` has no `use` at all - this is the flat-scan fallback,
-        // not the `use`-scoped tier, so the note should be there.
-        assert!(
-            text.contains("no `use` here brings it into scope"),
-            "got: {text}"
-        );
         // `text: string` is unbounded, so the whole struct's size is too —
         // the direct regression guard for the `other_docs`-retention
         // restructuring that threads a cross-file SizeLookup through.
         assert!(text.contains("variable"), "got: {text}");
+    }
+
+    /// Without a `use`, a name another file declares is unknown here: the
+    /// hover doesn't describe a declaration nothing brings into scope.
+    #[test]
+    fn test_hover_does_not_reach_an_unimported_sibling() {
+        let chat_source = "protocol Chat {\n    function send(text: string) -> Message;\n}\n";
+        let types_source = "struct Message {\n    text: string\n}\n";
+
+        let hover = get_hover_info_with_project(
+            chat_source,
+            &Url::parse("file:///chat.ids").unwrap(),
+            Position::new(1, 37),
+            &[(Url::parse("file:///types.ids").unwrap(), types_source.to_string())],
+        );
+
+        let text = hover.map(hover_text).unwrap_or_default();
+        assert!(!text.contains("struct Message"), "got: {text}");
+    }
+
+    /// A field typed with a name nothing imports has no size to add: the
+    /// struct's is unknown, not the unimported declaration's estimate.
+    #[test]
+    fn a_size_does_not_count_an_unimported_type() {
+        let types = [(Url::parse("file:///types.ids").unwrap(), "struct Message {\n    seq: u64\n}\n".to_string())];
+        let uri = Url::parse("file:///chat.ids").unwrap();
+        let hover_on = |source: &str, line: u32| {
+            get_hover_info_with_project(source, &uri, Position::new(line, 8), &types).map(hover_text).unwrap_or_default()
+        };
+
+        let text = hover_on("struct S {\n    m: Message\n}\n", 0);
+        assert!(text.contains("wire size: unknown"), "got: {text}");
+
+        let text = hover_on("use types::Message\n\nstruct S {\n    m: Message\n}\n", 2);
+        assert!(text.contains("8 bytes"), "got: {text}");
+    }
+
+    /// A std validator nothing imports: no signature, no docs.
+    #[test]
+    fn a_std_validator_hovers_only_once_imported() {
+        let std = crate::analysis::stdlib::files(&crate::analysis::stdlib::root());
+        let uri = Url::parse("file:///pkg/src/none.ids").unwrap();
+        let body = "@validators = [StringBounds()]\ntype FixedNum = u8[2]\n";
+        let hover_on = |source: &str, line: u32| {
+            get_hover_info_with_project(source, &uri, Position::new(line, 18), &std).map(hover_text).unwrap_or_default()
+        };
+
+        let text = hover_on(body, 0);
+        assert!(!text.contains("validator StringBounds"), "got: {text}");
+
+        let imported = format!("use std::validators::StringBounds\n\n{body}");
+        let text = hover_on(&imported, 2);
+        assert!(text.contains("validator StringBounds"), "got: {text}");
     }
 
     #[test]
@@ -1594,10 +1622,6 @@ protocol Chat {
         let text = hover_text(hover);
 
         assert!(text.contains("struct Message"), "got: {text}");
-        assert!(
-            !text.contains("no `use` here brings it into scope"),
-            "a real `use types::Message` should resolve silently, got: {text}"
-        );
     }
 
     #[test]
@@ -1630,7 +1654,6 @@ protocol Chat {
 
         assert!(text.contains("from_b"), "got: {text}");
         assert!(!text.contains("from_a"), "got: {text}");
-        assert!(!text.contains("no `use` here brings it into scope"), "got: {text}");
     }
 
     #[test]
@@ -1653,7 +1676,6 @@ protocol Chat {
         let text = hover_text(hover);
 
         assert!(text.contains("struct Message"), "got: {text}");
-        assert!(!text.contains("no `use` here brings it into scope"), "got: {text}");
     }
 
     #[test]
@@ -1676,7 +1698,6 @@ protocol Chat {
         let text = hover_text(hover);
 
         assert!(text.contains("struct Message"), "got: {text}");
-        assert!(!text.contains("no `use` here brings it into scope"), "got: {text}");
     }
 
     #[test]
@@ -1702,7 +1723,6 @@ protocol Chat {
         // The real declaration is `struct Message`, not `struct Msg` -
         // `types.ids`'s own symbol table never heard of "Msg".
         assert!(text.contains("struct Message"), "got: {text}");
-        assert!(!text.contains("no `use` here brings it into scope"), "got: {text}");
     }
 
     #[test]
@@ -1718,7 +1738,6 @@ protocol Chat {
 
         assert!(text.contains("struct Request"), "got: {text}");
         assert!(text.contains("An HTTP request"), "std's docstring, got: {text}");
-        assert!(!text.contains("no `use` here brings it into scope"), "it is imported, got: {text}");
     }
 
     fn package_with_dependency(active_uri: &str) -> Vec<crate::analysis::source::SourceFile> {
