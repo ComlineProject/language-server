@@ -34,6 +34,13 @@ anyhow = "1.0"
 # quick fix below hands the client a URI and a position through it.
 serde_json = "1.0"
 comline-core = { git = "https://github.com/ComlineProject/core", rev = "098301516576d200aa11f3fc12aaeac695b4a43d" }
+# What each generator supports, feature by feature (`comline_codegen::features`)
+# - for warning at a use a declared language can't generate. Only the
+# generators' `SUPPORT` tables are read; nothing is generated. Pinned to the
+# same commits as the CLI, so a build has one `comline-codegen`.
+comline-codegen = { git = "https://github.com/ComlineProject/generation", rev = "269ec60590db1c6599499e82b53c41e56bcf2b32" }
+comline-codegen-rust = { git = "https://github.com/ComlineProject/comline-rust", rev = "9fe85575008e35c0f5c58c62da472db9b0703832" }
+comline-codegen-typescript = { git = "https://github.com/ComlineProject/comline-typescript", rev = "5d7805f4bd441dd97a91d347939c7823f42af4a9" }
 
 # `server`-only.
 tower-lsp = { version = "0.20.0", optional = true }
