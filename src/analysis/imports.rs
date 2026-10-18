@@ -339,7 +339,7 @@ mod tests {
 
     #[test]
     fn no_use_at_all_resolves_nothing() {
-        let doc = parse_use("struct S { f: str }");
+        let doc = parse_use("struct S { f: string }");
         let imports = resolved_imports(&doc, &["app".to_string()]);
         let siblings = vec![file(&["types"])];
 

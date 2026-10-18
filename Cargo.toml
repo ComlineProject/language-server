@@ -33,7 +33,7 @@ anyhow = "1.0"
 # `Command::arguments` is `Vec<serde_json::Value>` — the interactive-rename
 # quick fix below hands the client a URI and a position through it.
 serde_json = "1.0"
-comline-core = { git = "https://github.com/ComlineProject/core", rev = "c2d61b0c375c280235614e3238eb9bb0a716689d" }
+comline-core = { git = "https://github.com/ComlineProject/core", rev = "1245d12f7fe3a5ae11329621e80d27b6d72eed97" }
 
 # `server`-only.
 tower-lsp = { version = "0.20.0", optional = true }

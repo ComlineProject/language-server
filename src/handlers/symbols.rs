@@ -169,7 +169,7 @@ mod tests {
         // The symbol table kept one entry per name, so these two collapsed
         // into a single item - placed at the struct's position but
         // reported with the settings block's kind.
-        let source = "struct Test {\n    a: str\n}\n\n\
+        let source = "struct Test {\n    a: string\n}\n\n\
                       settings Test {\n    validators.allowed = true\n}\n";
         let uri = Url::parse("file:///test.ids").unwrap();
 
@@ -254,7 +254,7 @@ protocol UserService {
         // These three used to be entirely absent from the symbol table
         // (`analysis::symbols::build_symbol_table` skipped them outright),
         // so they never showed up here either.
-        let source = "error NotFound {\n    message = \"missing\"\n}\n\nvalidator StringBounds {\n    min: u32\n}\n\nsettings AAA {\n    k = true\n}\n";
+        let source = "error NotFound {\n    message = \"missing\"\n}\n\nvalidator StringBounds for string {\n    min: u32\n}\n\nsettings AAA {\n    k = true\n}\n";
         let uri = Url::parse("file:///test.ids").unwrap();
         let symbols = get_document_symbols(source, &uri);
 

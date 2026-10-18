@@ -3,6 +3,7 @@
 
 use crate::analysis::import_check::{self, MissingImport, UnresolvedImport, UnverifiedImport};
 use crate::analysis::project::Project;
+use crate::analysis::symbols::Namespace;
 use crate::util::byte_range_to_lsp_range;
 use comline_core::diagnostics::Severity;
 use comline_core::schema::idl::grammar::Document;
@@ -10,6 +11,7 @@ use comline_core::schema::ir::compiler::interpreter::incremental::IncrementalInt
 use comline_core::schema::ir::compiler::settings::enforcement::check_settings_enforcement;
 use comline_core::schema::ir::compiler::settings::resolution::check_settings_conflicts;
 use comline_core::schema::ir::compiler::settings::severity::resolve_diagnostic_overrides;
+use comline_core::schema::ir::compiler::import_resolver::{declared_alias_target, declared_validator_targets};
 use comline_core::schema::ir::compiler::Compile;
 use comline_core::schema::ir::frozen::unit::FrozenUnit;
 use comline_core::package::layout;
@@ -85,8 +87,45 @@ fn lsp_tags(code_id: &str) -> Option<Vec<DiagnosticTag>> {
 pub fn validation_diagnostics(source: &str, document: &Document) -> Vec<Diagnostic> {
     let uri = Url::parse("file:///schema.ids").expect("static URL");
     validation_diagnostics_with(
-        source, document, vec![], &crate::analysis::source::base_settings(), &uri, &[],
+        source,
+        document,
+        vec![],
+        &crate::analysis::source::base_settings(),
+        &uri,
+        &[],
+        &validation::NoImports,
     )
+}
+
+/// What core's validation asks about names a file imports - an imported
+/// validator's `for` targets, what an imported `type` alias stands for -
+/// answered from the declaration [`Project::resolve`] finds for the name
+/// (the one go-to-definition jumps to), read with core's own helpers so the
+/// editor resolves exactly as `comline build` does.
+struct ProjectImports<'p, 'a> {
+    project: &'p Project<'a>,
+    doc: usize,
+}
+
+impl ProjectImports<'_, '_> {
+    fn declaration(&self, name: &str) -> Option<(usize, String)> {
+        let bare = name.rsplit("::").next()?;
+        let target = self.project.resolve(self.doc, bare, Namespace::Declaration)?;
+        let real_name = self.project.symbol(&target)?.name.clone();
+        Some((target.doc, real_name))
+    }
+}
+
+impl validation::ImportLookup for ProjectImports<'_, '_> {
+    fn validator_targets(&self, name: &str) -> Option<Vec<String>> {
+        let (doc, real_name) = self.declaration(name)?;
+        declared_validator_targets(&self.project.docs[doc].document.0, &real_name)
+    }
+
+    fn alias_target(&self, name: &str) -> Option<String> {
+        let (doc, real_name) = self.declaration(name)?;
+        declared_alias_target(&self.project.docs[doc].document.0, &real_name)
+    }
 }
 
 /// [`validation_diagnostics`], with `extra` imports appended to the file's
@@ -106,6 +145,7 @@ fn validation_diagnostics_with(
     package_settings: &SettingsDict,
     uri: &Url,
     namespace: &[String],
+    imports: &dyn validation::ImportLookup,
 ) -> Vec<Diagnostic> {
     // The `settings` block's own checks - duplicate and conflicting keys,
     // a bad `mode` value, an unrecognised key, a wrongly-typed value. The
@@ -126,7 +166,7 @@ fn validation_diagnostics_with(
         units.insert(0, FrozenUnit::Namespace(namespace.join("::")));
     }
 
-    let mut errors = match validation::validate(&units) {
+    let mut errors = match validation::validate_with(&units, imports) {
         Ok(warnings) => {
             // No real build to fail here, unlike the CLI's compile pass -
             // an "error"-escalated or malformed-level diagnostic just
@@ -305,6 +345,7 @@ pub fn project_diagnostics(project: &Project, doc: usize) -> Vec<Diagnostic> {
         &project.settings,
         here.uri,
         &here.namespace,
+        &ProjectImports { project, doc },
     );
     diagnostics.extend(reserved_name_diagnostic(here));
     diagnostics.extend(check.missing.iter().map(|m| missing_import_diagnostic(here.source, m)));
@@ -651,22 +692,25 @@ struct User {
 
     #[test]
     fn a_known_mistake_surfaces_its_suggestion_in_the_message() {
-        // `string` parses fine as an ordinary (if semantically wrong)
-        // `Type::Named` identifier - it's never actually the text of a
-        // real `UnexpectedToken`, so this constructs one directly, same as
+        // `int` parses fine as an ordinary (if unknown) `Type::Named`
+        // identifier - it's never actually the text of a real
+        // `UnexpectedToken`, so this constructs one directly, same as
         // `comline-core`'s own equivalent test. What this confirms is that
-        // `comline_core::diagnostics`'s "did you mean `str`?" suggestion
-        // now actually reaches the editor, appended to the message -
-        // before this convergence the LSP had no suggestion logic at all.
+        // `comline_core::diagnostics`'s suggestion for it reaches the
+        // editor, appended to the message - before this convergence the LSP
+        // had no suggestion logic at all.
         use rust_sitter::errors::{ParseError, ParseErrorReason};
 
         let error = ParseError {
-            reason: ParseErrorReason::UnexpectedToken("string".to_string()),
+            reason: ParseErrorReason::UnexpectedToken("int".to_string()),
             start: 0,
-            end: 6,
+            end: 3,
         };
-        let diagnostics = generate_diagnostics("string", std::slice::from_ref(&error));
-        assert_eq!(diagnostics[0].message, "unexpected token `string` — did you mean `str`?");
+        let diagnostics = generate_diagnostics("int", std::slice::from_ref(&error));
+        assert_eq!(
+            diagnostics[0].message,
+            "unexpected token `int` — use sized integer types like `u32`, `s32`, `u64`, etc."
+        );
     }
 
     #[test]
@@ -703,7 +747,7 @@ struct User {
         // typo here produced no diagnostic at all - the key just silently
         // did nothing.
         let found = messages(
-            "struct Message {\n    body: str\n}\n\n\
+            "struct Message {\n    body: string\n}\n\n\
              settings {\n    annotations.framing.alowed = true\n}\n",
         );
         assert!(
@@ -716,7 +760,7 @@ struct User {
     fn a_conflicting_settings_key_is_reported_in_the_editor() {
         // `settings::conflict` had never surfaced in the editor either.
         let found = messages(
-            "struct Message {\n    body: str\n}\n\n\
+            "struct Message {\n    body: string\n}\n\n\
              settings {\n    validators.allowed = true\n    validators.allowed = false\n}\n",
         );
         assert!(!found.is_empty(), "a conflicting key should be reported");
@@ -727,7 +771,7 @@ struct User {
         // The flip side: `settings` stays open outside the groups core
         // owns, so an unrecognised *top-level* key must stay quiet.
         let found = messages(
-            "struct Message {\n    body: str\n}\n\n\
+            "struct Message {\n    body: string\n}\n\n\
              settings {\n    forbid_indexing = true\n}\n",
         );
         assert!(found.is_empty(), "an open-namespace key must not be flagged: {found:?}");
@@ -742,7 +786,7 @@ struct User {
         // - confirms `uri`/`related_information`/the `HINT` diagnostic
         // actually reach the editor, not just that `comline-core`'s
         // `Diagnostic.secondary` field is populated correctly.
-        let source = "validator StringBounds {\n    min_chars: u32\n    max_chars: u32\n}\n\nstruct Message {\n    @validators = [StringBounds(min_chars=3, max_chars=10)]\n    message: str\n}\n\nsettings {\n    validators.allowed = Tru\n}\n";
+        let source = "validator StringBounds for string {\n    min_chars: u32\n    max_chars: u32\n}\n\nstruct Message {\n    @validators = [StringBounds(min_chars=3, max_chars=10)]\n    message: string\n}\n\nsettings {\n    validators.allowed = Tru\n}\n";
         let d = diags(source);
 
         let errors: Vec<_> =
@@ -779,7 +823,7 @@ struct User {
         // The sibling case: a correctly-written `= false` forbidding this
         // usage must stay exactly as it was before this change - one error,
         // at the usage site, no secondary `HINT` diagnostic.
-        let source = "validator StringBounds {\n    min_chars: u32\n    max_chars: u32\n}\n\nstruct Message {\n    @validators = [StringBounds(min_chars=3, max_chars=10)]\n    message: str\n}\n\nsettings {\n    validators.allowed = false\n}\n";
+        let source = "validator StringBounds for string {\n    min_chars: u32\n    max_chars: u32\n}\n\nstruct Message {\n    @validators = [StringBounds(min_chars=3, max_chars=10)]\n    message: string\n}\n\nsettings {\n    validators.allowed = false\n}\n";
         let d = diags(source);
         assert_eq!(d.len(), 1, "{d:?}");
         assert_eq!(d[0].severity, Some(DiagnosticSeverity::ERROR));
@@ -800,17 +844,17 @@ struct User {
     fn a_bad_throws_clause_reaches_the_editor() {
         for (source, code, needle) in [
             (
-                "protocol P {\n    function get(u64) -> str ! Nope;\n}\n",
+                "protocol P {\n    function get(u64) -> string ! Nope;\n}\n",
                 "validation::unresolved-throw",
                 "no error named 'Nope'",
             ),
             (
-                "struct Thing {\n    id: u64\n}\nprotocol P {\n    function get(u64) -> str ! Thing;\n}\n",
+                "struct Thing {\n    id: u64\n}\nprotocol P {\n    function get(u64) -> string ! Thing;\n}\n",
                 "validation::throw-not-an-error",
                 "'Thing' is a struct",
             ),
             (
-                "error Denied {\n    message = \"no\"\n}\nprotocol P {\n    function get(u64) -> str ! Denied, Denied;\n}\n",
+                "error Denied {\n    message = \"no\"\n}\nprotocol P {\n    function get(u64) -> string ! Denied, Denied;\n}\n",
                 "validation::duplicate-throw",
                 "more than once",
             ),
@@ -835,7 +879,7 @@ struct User {
     fn several_declared_throws_are_clean() {
         let source = "error NotFound {\n    message = \"gone\"\n}\n\
                       error Denied {\n    message = \"no\"\n}\n\
-                      protocol P {\n    function get(u64) -> str ! Denied, NotFound;\n}\n";
+                      protocol P {\n    function get(u64) -> string ! Denied, NotFound;\n}\n";
         assert!(diags(source).is_empty(), "{:?}", diags(source));
     }
 
@@ -846,7 +890,7 @@ struct User {
         // `DiagnosticTag::DEPRECATED` strikethrough actually reach the LSP
         // diagnostic, not just that `comline-core`'s own `Severity::Warning`
         // is correct in isolation.
-        let source = "@deprecated = \"use NewAuthor instead\"\nstruct Author {\n    name: str\n}\n\nstruct Post {\n    author: Author\n}\n";
+        let source = "@deprecated = \"use NewAuthor instead\"\nstruct Author {\n    name: string\n}\n\nstruct Post {\n    author: Author\n}\n";
         let d = diags(source);
         assert_eq!(d.len(), 1, "{d:?}");
         assert_eq!(d[0].severity, Some(DiagnosticSeverity::WARNING), "{:?}", d[0]);
@@ -862,14 +906,14 @@ struct User {
 
     #[test]
     fn settings_allow_suppresses_the_deprecation_warning_entirely() {
-        let source = "@deprecated\nstruct Author {\n    name: str\n}\n\nstruct Post {\n    author: Author\n}\n\nsettings {\n    diagnostics.\"validation::deprecated-type-usage\".level = \"allow\"\n}\n";
+        let source = "@deprecated\nstruct Author {\n    name: string\n}\n\nstruct Post {\n    author: Author\n}\n\nsettings {\n    diagnostics.\"validation::deprecated-type-usage\".level = \"allow\"\n}\n";
         let d = diags(source);
         assert!(d.is_empty(), "{d:?}");
     }
 
     #[test]
     fn settings_error_escalates_the_deprecation_warning_to_a_real_lsp_error() {
-        let source = "@deprecated\nstruct Author {\n    name: str\n}\n\nstruct Post {\n    author: Author\n}\n\nsettings {\n    diagnostics.\"validation::deprecated-type-usage\".level = \"error\"\n}\n";
+        let source = "@deprecated\nstruct Author {\n    name: string\n}\n\nstruct Post {\n    author: Author\n}\n\nsettings {\n    diagnostics.\"validation::deprecated-type-usage\".level = \"error\"\n}\n";
         let d = diags(source);
         assert_eq!(d.len(), 1, "{d:?}");
         assert_eq!(d[0].severity, Some(DiagnosticSeverity::ERROR), "{:?}", d[0]);
@@ -892,6 +936,37 @@ struct User {
     }
 
     const TYPES: (&str, &str) = ("file:///pkg/src/types.ids", "struct Message {\n    text: string\n}\n");
+
+    /// A validator and an alias from another file: the editor checks the
+    /// field against the validator's `for` the way `comline build` does,
+    /// resolving the alias first - core alone would skip both as imported.
+    #[test]
+    fn an_imported_validator_is_checked_against_the_field_type() {
+        const RULES: (&str, &str) = (
+            "file:///pkg/src/rules.ids",
+            "type Count = u32\ntype Name = string\n\n\
+             validator NonEmpty for string {\n    validate {\n        assert(value.length > 0, \"{value.name} is empty\")\n    }\n}\n",
+        );
+        let bad = project_messages(&[
+            ("file:///pkg/src/api.ids", "use rules::{Count, NonEmpty}\n\nstruct S {\n    @validators = [NonEmpty()]\n    n: Count\n}\n"),
+            RULES,
+        ]);
+        assert_eq!(bad.len(), 1, "{bad:?}");
+        assert_eq!(
+            bad[0].0,
+            "validator 'NonEmpty' applies to `string`, not `Count` (`u32`) — Struct 'S', field 'n'"
+        );
+        assert_eq!(
+            bad[0].1,
+            Some(NumberOrString::String("validation::validator-target-mismatch".to_string()))
+        );
+
+        let ok = project_messages(&[
+            ("file:///pkg/src/api.ids", "use rules::{Name, NonEmpty}\n\nstruct S {\n    @validators = [NonEmpty()]\n    n: Name\n}\n"),
+            RULES,
+        ]);
+        assert!(ok.is_empty(), "{ok:?}");
+    }
 
     #[test]
     fn use_forms_core_cannot_expand_alone_are_not_unknown_types() {
@@ -969,7 +1044,7 @@ struct User {
         let manifest = "congregation pkg\nspecification_version = 1\n\
             settings = {\n    protocol = {\n        annotations = {\n            \
             framing = {\n                allowed = false\n            }\n        }\n    }\n}\n";
-        let chat = "@framing = \"jsonrpc\"\nprotocol Chat {\n    function ping() -> str;\n}\n";
+        let chat = "@framing = \"jsonrpc\"\nprotocol Chat {\n    function ping() -> string;\n}\n";
 
         let found = project_messages(&[(MANIFEST_URI, manifest), ("file:///pkg/src/chat.ids", chat)]);
         assert!(
@@ -983,7 +1058,7 @@ struct User {
         let manifest = "congregation pkg\nspecification_version = 1\n\
             settings = {\n    protocol = {\n        annotations = {\n            \
             framing = {\n                allowed = true\n            }\n        }\n    }\n}\n";
-        let chat = "@framing = \"jsonrpc\"\nprotocol Chat {\n    function ping() -> str;\n}\n";
+        let chat = "@framing = \"jsonrpc\"\nprotocol Chat {\n    function ping() -> string;\n}\n";
 
         let found = project_messages(&[(MANIFEST_URI, manifest), ("file:///pkg/src/chat.ids", chat)]);
         assert!(
@@ -1012,7 +1087,7 @@ mod duplicate_declaration_tests {
 
     /// The screenshot's file: a struct, an error and a settings preset all
     /// called `Test`.
-    const THREE_TESTS: &str = "struct Test {\n    a: str\n}\n\n\
+    const THREE_TESTS: &str = "struct Test {\n    a: string\n}\n\n\
                                error Test {\n    message = \"\"\n}\n\n\
                                /// Restricting some stuff\n\
                                settings Test {\n    validators.allowed = true\n}\n";
