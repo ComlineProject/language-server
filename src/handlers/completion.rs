@@ -1,6 +1,7 @@
 // Completion handler - provides auto-completion suggestions
 
 mod use_path;
+mod validator_body;
 mod validators;
 
 use crate::analysis::import_check::{self, declares_type, file_name, is_type_kind, Target};
@@ -101,6 +102,15 @@ pub fn get_completions_with_project<S: ProjectSource>(
             completions
                 .extend(get_annotation_completions(scope, &effective_settings(source, offset, other_files)));
         }
+        CompletionContext::ValidatorBody(body) => match validator_body::completions(body) {
+            Some(items) => completions.extend(items),
+            // A property's type: as after any other `:`.
+            None => {
+                completions.extend(get_primitive_type_completions());
+                completions.extend(get_type_completions(symbol_table.as_ref(), source));
+                completions.extend(get_import_completions(source, uri, other_files, symbol_table.as_ref()));
+            }
+        },
         CompletionContext::ValidatorFor => {
             completions.push(for_keyword_completion());
         }
@@ -420,6 +430,11 @@ fn determine_context(source: &str, offset: usize) -> CompletionContext {
     // A validator's header, `validator NAME for TYPE, TYPE {`.
     if let Some(context) = validator_header_context(&toks) {
         return context;
+    }
+
+    // Its body: properties and `validate { assert(...) }`.
+    if let Some(body) = validator_body::context(&cleaned, offset, &toks) {
+        return CompletionContext::ValidatorBody(body);
     }
 
     // Right after a bare `@` — the start of an annotation key. Which keys
@@ -1169,6 +1184,8 @@ enum CompletionContext {
     DeclarationName,
     /// After a validator's name, where only `for` can come.
     ValidatorFor,
+    /// Inside a validator's body.
+    ValidatorBody(validator_body::Body),
     /// After one of a validator's target types: a `,` or the body's `{`
     /// comes next. Nothing to suggest.
     AfterValidatorTarget,
@@ -1282,6 +1299,67 @@ mod tests {
         // A new declaration after a finished validator.
         let labels = labels_at_end("validator Range for u8 {\n}\n\n");
         assert!(labels.iter().any(|l| l == "struct"), "{labels:?}");
+    }
+
+    const BODY_HEAD: &str = "type Name = string\n\nvalidator Bounds for u32, Name {\n    min: u32 = 0\n    label: string\n";
+
+    #[test]
+    fn a_validator_body_offers_validate_where_a_member_starts() {
+        // Offered every top-level keyword (`validator` for a `v`).
+        assert_eq!(labels_at_end(&format!("{BODY_HEAD}    v")), ["validate"]);
+        assert_eq!(labels_at_end("validator V for u8 {\n    "), ["validate"]);
+        // A second `validate` block isn't valid.
+        let source = format!("{BODY_HEAD}    validate {{\n    }}\n    ");
+        assert!(labels_at_end(&source).is_empty(), "{:?}", labels_at_end(&source));
+    }
+
+    #[test]
+    fn a_property_takes_a_type_and_nothing_else_is_offered() {
+        let labels = labels_at_end(&format!("{BODY_HEAD}    max: "));
+        assert!(labels.iter().any(|l| l == "u32") && labels.iter().any(|l| l == "Name"), "{labels:?}");
+        // After a property's type, and in its default: nothing.
+        assert!(labels_at_end(&format!("{BODY_HEAD}    max: u32 ")).is_empty());
+        assert!(labels_at_end(&format!("{BODY_HEAD}    max: u32 = ")).is_empty());
+    }
+
+    #[test]
+    fn a_validate_block_offers_assert() {
+        assert_eq!(labels_at_end(&format!("{BODY_HEAD}    validate {{\n        ")), ["assert"]);
+        assert_eq!(labels_at_end(&format!("{BODY_HEAD}    validate {{\n        a")), ["assert"]);
+        let after_one = format!("{BODY_HEAD}    validate {{\n        assert(value > 0, \"x\")\n        ");
+        assert_eq!(labels_at_end(&after_one), ["assert"]);
+    }
+
+    #[test]
+    fn a_condition_offers_its_roots_accessors_and_properties() {
+        let validate = format!("{BODY_HEAD}    validate {{\n        assert(");
+        assert_eq!(labels_at_end(&validate), ["value", "params"]);
+        assert_eq!(labels_at_end(&format!("{validate}value >= ")), ["value", "params"]);
+        // `Name` is an alias of `string`, so `length` may apply.
+        assert_eq!(labels_at_end(&format!("{validate}value.")), ["length", "name"]);
+        assert_eq!(labels_at_end(&format!("{validate}params.")), ["min", "label"]);
+        assert_eq!(labels_at_end(&format!("{validate}value > params.min ")), ["and", "or"]);
+        assert_eq!(labels_at_end(&format!("{validate}value > 1 and ")), ["value", "params"]);
+        // The message is a string.
+        assert!(labels_at_end(&format!("{validate}value > 1, ")).is_empty());
+    }
+
+    #[test]
+    fn length_is_offered_only_when_a_target_can_have_one() {
+        let numbers = "validator Positive for u8, s32 {\n    validate {\n        assert(value.";
+        assert_eq!(labels_at_end(numbers), ["name"]);
+        let text = "validator Short for string {\n    validate {\n        assert(value.";
+        assert_eq!(labels_at_end(text), ["length", "name"]);
+    }
+
+    #[test]
+    fn the_params_item_reopens_on_the_properties() {
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let source = "validator V for u8 {\n    validate {\n        assert(";
+        let items = get_completions(source, &uri, Position::new(2, 15));
+        let params = items.into_iter().find(|c| c.label == "params").unwrap();
+        assert_eq!(params.insert_text.as_deref(), Some("params."));
+        assert!(params.command.is_some());
     }
 
     #[test]

@@ -55,6 +55,22 @@ pub const DUPLICATE_BLOCK: &str = "settings::duplicate-block";
 
 /// `comline_core::diagnostics::Severity` -> the matching LSP tier - direct
 /// 1:1, no surprises (the two enums were designed to line up exactly).
+/// Diagnostics core spans over a whole declaration, which the editor shows
+/// at its name instead: a duplicate, and what's said about a validator as a
+/// whole (its targets, its asserts' references, an empty `validate`).
+fn narrows_to_name(code: &str) -> bool {
+    matches!(
+        code,
+        DUPLICATE_DECLARATION
+            | DUPLICATE_BLOCK
+            | "validation::validator-checks-nothing"
+            | "validation::validator-missing-target"
+            | "validation::validator-accessor-unsupported"
+            | "validation::unknown-validator-property"
+            | "validation::invalid-validator-reference"
+    )
+}
+
 fn lsp_severity(severity: Severity) -> DiagnosticSeverity {
     match severity {
         Severity::Error => DiagnosticSeverity::ERROR,
@@ -237,7 +253,7 @@ fn validation_diagnostics_with(
     // actually needs it - this runs on every keystroke.
     let table = errors
         .iter()
-        .any(|e| matches!(e.code.id, DUPLICATE_DECLARATION | DUPLICATE_BLOCK))
+        .any(|e| narrows_to_name(e.code.id))
         .then(|| crate::analysis::symbols::build_symbol_table(document, uri, source));
     let names = |span: (usize, usize)| -> (usize, usize) {
         table.as_ref().and_then(|t| t.name_span_of_decl(span)).unwrap_or(span)
@@ -246,7 +262,7 @@ fn validation_diagnostics_with(
     errors
         .into_iter()
         .flat_map(|error| {
-            let narrow = matches!(error.code.id, DUPLICATE_DECLARATION | DUPLICATE_BLOCK);
+            let narrow = narrows_to_name(error.code.id);
             let error = if narrow {
                 let span = error.span.map(&names);
                 let secondary =
@@ -617,6 +633,42 @@ struct User {
         );
     }
 
+    /// The text a diagnostic's range covers.
+    fn covered<'s>(source: &'s str, d: &Diagnostic) -> &'s str {
+        let offset = |p: lsp_types::Position| {
+            source.lines().take(p.line as usize).map(|l| l.len() + 1).sum::<usize>() + p.character as usize
+        };
+        &source[offset(d.range.start)..offset(d.range.end)]
+    }
+
+    #[test]
+    fn a_validator_that_checks_nothing_warns_at_its_name() {
+        let source = "validator Positive for u8 {\n    floor: u8 = 0\n}\n";
+        let d = diags(source);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].severity, Some(DiagnosticSeverity::WARNING));
+        assert!(d[0].message.starts_with("validator 'Positive' checks nothing"), "{d:?}");
+        assert_eq!(covered(source, &d[0]), "Positive");
+    }
+
+    #[test]
+    fn an_unused_validator_property_warns_at_the_property() {
+        let source = "validator Bounds for u32 {\n    min: u32 = 0\n    max: u32 = 9\n    validate {\n        assert(value >= params.min, \"low\")\n    }\n}\n";
+        let d = diags(source);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].severity, Some(DiagnosticSeverity::WARNING));
+        assert_eq!(covered(source, &d[0]), "max: u32 = 9");
+    }
+
+    #[test]
+    fn a_bad_reference_in_validate_is_shown_at_the_validators_name() {
+        // It had no span, so the editor put it at the top of the file.
+        let source = "struct S {\n    a: u8\n}\n\nvalidator Short for string {\n    validate {\n        assert(value.length <= params.mx, \"long\")\n    }\n}\n";
+        let d = diags(source);
+        let e = d.iter().find(|x| x.message.contains("params.mx")).expect("the error");
+        assert_eq!(covered(source, e), "Short");
+    }
+
     #[test]
     fn a_well_formed_schema_has_no_diagnostics() {
         let d = diags(
@@ -853,7 +905,7 @@ struct User {
         // The sibling case: a correctly-written `= false` forbidding this
         // usage must stay exactly as it was before this change - one error,
         // at the usage site, no secondary `HINT` diagnostic.
-        let source = "validator StringBounds for string {\n    min_chars: u32\n    max_chars: u32\n}\n\nstruct Message {\n    @validators = [StringBounds(min_chars=3, max_chars=10)]\n    message: string\n}\n\nsettings {\n    validators.allowed = false\n}\n";
+        let source = "validator StringBounds for string {\n    min_chars: u32\n    max_chars: u32\n    validate {\n        assert(value.length >= params.min_chars and value.length <= params.max_chars, \"x\")\n    }\n}\n\nstruct Message {\n    @validators = [StringBounds(min_chars=3, max_chars=10)]\n    message: string\n}\n\nsettings {\n    validators.allowed = false\n}\n";
         let d = diags(source);
         assert_eq!(d.len(), 1, "{d:?}");
         assert_eq!(d[0].severity, Some(DiagnosticSeverity::ERROR));
