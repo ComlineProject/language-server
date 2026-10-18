@@ -1,4 +1,4 @@
-//! Which type names a file's `use`s bring into scope, given the package's
+//! Which type and validator names a file's `use`s bring into scope, given the package's
 //! other files - and which names it uses that are declared in another file
 //! but never imported (a missing `use`).
 //!
@@ -26,7 +26,7 @@ use comline_core::schema::ir::frozen::unit::FrozenUnit;
 use lsp_types::SymbolKind;
 
 use crate::analysis::imports::ResolvedUse;
-use crate::analysis::project::{named_type_sites, Project, ProjectDoc};
+use crate::analysis::project::{named_type_sites, validator_sites, Project, ProjectDoc};
 use crate::analysis::source::DependencyKind;
 use crate::analysis::stdlib;
 use crate::analysis::symbols::Namespace;
@@ -37,8 +37,8 @@ pub struct ImportCheck {
     /// Imports core's per-file lowering can't produce on its own, to append
     /// to the file's units before validation.
     pub scope: Vec<FrozenUnit>,
-    /// Each use of a bare type name that's declared in another project file
-    /// but not brought into scope by any `use` here.
+    /// Each use of a bare type or validator name that's declared in another
+    /// project file but not brought into scope by any `use` here.
     pub missing: Vec<MissingImport>,
     /// Each `use` that doesn't resolve - `comline check` / `build` reject it.
     pub unresolved: Vec<UnresolvedImport>,
@@ -66,12 +66,13 @@ pub struct UnverifiedImport {
     pub reason: String,
 }
 
-/// One occurrence of a type name that needs a `use`.
+/// One occurrence of a type or validator name that needs a `use`.
 pub struct MissingImport {
     pub name: String,
     /// Byte range of this occurrence.
     pub range: (usize, usize),
-    /// Every project file declaring `name` as a type, in project order.
+    /// Every project file declaring `name` as a type (or, for a validator
+    /// name, as a validator), in project order.
     pub candidates: Vec<Candidate>,
     /// The alias a `use` here already imports `name` under, if any - core
     /// binds only the alias (`use types::User as U` makes `U` usable, not
@@ -177,8 +178,16 @@ pub fn check(project: &Project, doc: usize) -> ImportCheck {
         }
     }
 
+    // Validators too: a `use` brings one in the same way, and core calls a
+    // missing one an unknown validator.
+    let validators = validator_sites(here);
+    let named = sites
+        .iter()
+        .map(|site| (site, declares_type as fn(&ProjectDoc, &str) -> bool))
+        .chain(validators.iter().map(|site| (site, declares_validator as fn(&ProjectDoc, &str) -> bool)));
+
     let mut missing = Vec::new();
-    for (name, offset) in &sites {
+    for ((name, offset), declares) in named {
         if name.contains("::")
             || here.symbols.get_in(name, Namespace::Declaration).is_some()
             || covered.contains(name)
@@ -190,12 +199,13 @@ pub fn check(project: &Project, doc: usize) -> ImportCheck {
             .docs
             .iter()
             .enumerate()
-            .filter(|(i, d)| *i != doc && declares_type(d, name))
+            .filter(|(i, d)| *i != doc && declares(d, name))
             .map(|(_, d)| Candidate { namespace: d.namespace.clone(), file: file_name(d) })
             .collect();
 
         if let Some(first) = candidates.first() {
-            // Core would report this as a bare "Unknown type"; the missing
+            // Core would report this as a bare "Unknown type" (or
+            // validator); the missing
             // `use` is reported instead, with where the type actually is.
             scope.push(import(&first.namespace, name, (*offset, offset + name.len())));
             missing.push(MissingImport {
@@ -445,6 +455,11 @@ fn is_importable_kind(kind: SymbolKind) -> bool {
 /// Whether `doc` declares `name` as something usable in a type position.
 pub(crate) fn declares_type(doc: &ProjectDoc, name: &str) -> bool {
     doc.symbols.get_in(name, Namespace::Declaration).is_some_and(|s| is_type_kind(s.kind))
+}
+
+/// Whether `doc` declares a validator named `name`.
+pub(crate) fn declares_validator(doc: &ProjectDoc, name: &str) -> bool {
+    doc.symbols.get_in(name, Namespace::Declaration).is_some_and(|s| s.kind == SymbolKind::FUNCTION)
 }
 
 /// Struct, enum and type alias - not protocols or consts.

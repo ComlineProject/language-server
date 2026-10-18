@@ -252,23 +252,23 @@ struct User {
     }
 
     #[test]
-    fn test_goto_definition_falls_back_to_an_unimported_sibling() {
-        // No `use` at all - the sibling may simply not be imported yet, or
-        // the `use` is mid-edit; still better to jump than to do nothing.
+    fn test_goto_definition_does_not_reach_an_unimported_sibling() {
+        // No `use` at all: `Message` is unknown here, whatever another file
+        // declares - there is nothing to jump to.
         let active_source = "struct S {\n    m: Message\n}\n";
         let types_source = "struct Message {\n    text: string\n}\n";
 
         let active_uri = Url::parse("file:///active.ids").unwrap();
         let types_uri = Url::parse("file:///types.ids").unwrap();
 
-        let location = scalar(find_definition_with_project(
+        let definition = find_definition_with_project(
             active_source,
             &active_uri,
             Position::new(1, 8),
-            &[(types_uri.clone(), types_source.to_string())],
-        ));
+            &[(types_uri, types_source.to_string())],
+        );
 
-        assert_eq!(location.uri, types_uri);
+        assert!(definition.is_none(), "got: {definition:?}");
     }
 
     #[test]

@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use comline_core::schema::idl::grammar::{Declaration, Document, Type};
+use comline_core::schema::idl::grammar::{Annotation, AnnotationValue, Declaration, Document, Type};
 use comline_core::schema::idl::module_docs::module_docs;
 use lsp_types::{Location, Url};
 
@@ -181,34 +181,18 @@ impl<'a> Project<'a> {
         self.docs.iter().position(|d| d.uri == uri)
     }
 
-    /// What `name`, written in `docs[doc]`, refers to: what
-    /// [`resolve_in_scope`](Self::resolve_in_scope) finds, else the first
-    /// other file declaring `name` - a fallback, since a miss there is often
-    /// just a `use` being typed, or a sibling that doesn't parse mid-edit.
-    ///
-    /// **Navigation only** (go-to-definition, hover), where finding the
-    /// declaration a missing `use` would bring in is the helpful answer.
-    /// Anything that judges the schema, or edits it, wants
-    /// [`resolve_in_scope`](Self::resolve_in_scope): the fallback answers for
-    /// names the file never imported.
-    pub fn resolve(&self, doc: usize, name: &str, namespace: Namespace) -> Option<Target> {
-        self.resolve_in_scope(doc, name, namespace).or_else(|| {
-            if namespace != Namespace::Declaration {
-                return None;
-            }
-            self.others(doc).find_map(|(i, d)| {
-                d.symbols.index_in(name, namespace).map(|symbol| Target { doc: i, symbol })
-            })
-        })
-    }
-
     /// What `name`, written in `docs[doc]`, refers to, by the file's own
     /// scope - the way `comline build` sees it:
     /// 1. a declaration in that same file;
     /// 2. a sibling that one of that file's own `use`/`import`s brings
     ///    `name` into scope from (`imports::resolve_symbol` - so through an
     ///    `as` alias, the target's real name comes back).
-    pub fn resolve_in_scope(&self, doc: usize, name: &str, namespace: Namespace) -> Option<Target> {
+    ///
+    /// Nothing else: a name the file never imports refers to nothing, even
+    /// where another file declares it - for diagnostics, references and
+    /// rename, and for go-to-definition and hover alike. The missing `use`
+    /// is the diagnostic's to report, and its quick fix's to add.
+    pub fn resolve(&self, doc: usize, name: &str, namespace: Namespace) -> Option<Target> {
         let here = &self.docs[doc];
 
         if let Some(symbol) = here.symbols.index_in(name, namespace) {
@@ -293,7 +277,7 @@ impl<'a> Project<'a> {
                     // symbol and must not be swept up here.
                     // In scope only: a file naming `User` without importing
                     // it doesn't refer to this one, and rename mustn't edit it.
-                    if self.resolve_in_scope(index, &name, Namespace::Declaration).as_ref()
+                    if self.resolve(index, &name, Namespace::Declaration).as_ref()
                         != Some(target)
                     {
                         continue;
@@ -500,6 +484,49 @@ pub(crate) fn named_type_sites(doc: &ProjectDoc) -> Vec<(String, usize)> {
     sites.into_iter().map(|(offset, name)| (name, offset)).collect()
 }
 
+/// Every validator a file names in a `@validators = [...]` list, called or
+/// bare, with the byte offset of each occurrence - on a field (of a struct or an error) or
+/// a `type` alias, the places core accepts the list.
+pub(crate) fn validator_sites(doc: &ProjectDoc) -> Vec<(String, usize)> {
+    let mut spans: Vec<((usize, usize), Vec<&Annotation>)> = Vec::new();
+    for decl in &doc.document.0 {
+        match &**decl {
+            Declaration::Struct(s) => spans.extend(s.fields().iter().map(|f| (f.span, f.annotations()))),
+            Declaration::Error(e) => spans.extend(e.fields().iter().map(|f| (f.span, f.annotations()))),
+            Declaration::TypeAlias(t) => spans.push((decl.span, t.annotations())),
+            _ => {}
+        }
+    }
+
+    let mut sites = BTreeSet::new();
+    for (span, annotations) in spans {
+        let names: BTreeSet<&str> = annotations
+            .iter()
+            .filter(|a| a.key.text == "validators")
+            .filter_map(|a| match &a.assignment.as_ref()?.value {
+                AnnotationValue::List(list) => Some(list.items.iter().map(|call| call.name.text.as_str())),
+                AnnotationValue::Scalar(_) => None,
+            })
+            .flatten()
+            .collect();
+
+        let (start, end) = (span.0.min(doc.source.len()), span.1.min(doc.source.len()));
+        let text = &doc.source[start..end];
+        for name in names {
+            for i in word_occurrences(text, name) {
+                // An entry in the list: `[Name(`, `, Name]`, a bare `Name,`.
+                let entry = text[i + name.len()..].trim_start().starts_with(['(', ',', ']']);
+                let listed = text[..i].trim_end().ends_with(['[', ',']);
+                if entry && listed {
+                    sites.insert((start + i, name.to_string()));
+                }
+            }
+        }
+    }
+
+    sites.into_iter().map(|(offset, name)| (name, offset)).collect()
+}
+
 /// Like [`collect_named`], but the full text as written (`types::User`).
 fn collect_named_text(ty: &Type, names: &mut BTreeSet<String>) {
     match ty {
@@ -534,6 +561,27 @@ mod tests {
     }
 
     #[test]
+    fn validator_sites_are_the_calls_in_a_validators_list() {
+        let all = files(&[(
+            "file:///a.ids",
+            "@validators = [Len(max = 3), Pos]\ntype T = string\n\nstruct S {\n    @validators = [ Len() ]\n    Len: string\n}\n",
+        )]);
+        let project = Project::new(all.iter());
+        let sites = validator_sites(&project.docs[0]);
+        let source = &all[0].1;
+        let at = |n: usize| source.match_indices("Len").nth(n).unwrap().0;
+        assert_eq!(
+            sites,
+            vec![
+                ("Len".to_string(), at(0)),
+                ("Pos".to_string(), source.find("Pos").unwrap()),
+                ("Len".to_string(), at(1)),
+            ],
+            "not the field named `Len`"
+        );
+    }
+
+    #[test]
     fn every_reference_has_its_own_position() {
         // The old handler found each reference with `source.find(name)` -
         // every one of them landed on the first `User` in the file.
@@ -549,10 +597,10 @@ mod tests {
     }
 
     /// A file naming `User` without importing it doesn't refer to another
-    /// file's `User` - so rename leaves it alone - while navigation still
-    /// finds that declaration, the one a `use` would bring in.
+    /// file's `User` - so rename leaves it alone, and navigation doesn't go
+    /// there either.
     #[test]
-    fn a_name_the_file_never_imports_is_no_reference_but_still_navigable() {
+    fn a_name_the_file_never_imports_refers_to_nothing() {
         let all = files(&[
             ("file:///types.ids", "struct User {\n    name: string\n}\n"),
             ("file:///api.ids", "struct S {\n    u: User\n}\n"),
@@ -561,8 +609,7 @@ mod tests {
         let target = project.resolve(0, "User", Namespace::Declaration).unwrap();
         assert_eq!(lines(&project.references(&target)), Vec::<(String, u32, u32)>::new());
 
-        assert_eq!(project.resolve_in_scope(1, "User", Namespace::Declaration), None);
-        assert_eq!(project.resolve(1, "User", Namespace::Declaration), Some(target));
+        assert_eq!(project.resolve(1, "User", Namespace::Declaration), None);
     }
 
     #[test]
