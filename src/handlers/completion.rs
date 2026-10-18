@@ -1,6 +1,7 @@
 // Completion handler - provides auto-completion suggestions
 
 mod use_path;
+mod validators;
 
 use crate::analysis::import_check::{self, declares_type, file_name, is_type_kind, Target};
 use crate::analysis::imports::{self, add_use_edit, ResolvedUse};
@@ -108,6 +109,12 @@ pub fn get_completions_with_project<S: ProjectSource>(
         }
         CompletionContext::SettingsBody => {
             completions.extend(get_settings_completions(source, offset));
+        }
+        CompletionContext::ValidatorName => {
+            completions.extend(validators::names(source, uri, other_files));
+        }
+        CompletionContext::ValidatorArgument { validator, written } => {
+            completions.extend(validators::arguments(source, uri, other_files, &validator, &written));
         }
         CompletionContext::Unknown => {
             // Context couldn't be narrowed down — offer the same broad
@@ -437,6 +444,12 @@ fn determine_context(source: &str, offset: usize) -> CompletionContext {
         }
     }
 
+    // In a `@validators = [...]` list - before `:` and the parentheses
+    // below, which mean a type everywhere else.
+    if let Some(context) = validator_list_context(&toks) {
+        return context;
+    }
+
     // Right after `:` (a field/argument/const/validator-property type) or
     // `->` (a return type).
     match toks.last() {
@@ -463,6 +476,59 @@ fn determine_context(source: &str, offset: usize) -> CompletionContext {
         Some(EnclosingBlock::Other) => CompletionContext::Unknown,
         None => CompletionContext::TopLevel,
     }
+}
+
+/// What the cursor names inside an unclosed `@validators = [`: an entry's
+/// validator, or, inside that entry's `(`, an argument's name -
+/// [`CompletionContext::DeclarationName`] (nothing to offer) after an
+/// argument's `=`, where its value goes. `None` outside such a list.
+fn validator_list_context(toks: &[(Tok, usize)]) -> Option<CompletionContext> {
+    let mut parens = 0i32;
+    let mut brackets = 0i32;
+    // The unclosed `(` the cursor is in, if any.
+    let mut open_paren = None;
+
+    for i in (0..toks.len()).rev() {
+        match toks[i].0 {
+            Tok::Punct(')') => parens += 1,
+            Tok::Punct('(') if parens > 0 => parens -= 1,
+            // Two unclosed `(`: not a validator call.
+            Tok::Punct('(') if open_paren.is_some() => return None,
+            Tok::Punct('(') => open_paren = Some(i),
+            Tok::Punct(']') => brackets += 1,
+            Tok::Punct('[') if brackets > 0 => brackets -= 1,
+            Tok::Punct('[') => {
+                let listed = i >= 3
+                    && toks[i - 3].0 == Tok::Punct('@')
+                    && toks[i - 2].0 == Tok::Word("validators")
+                    && toks[i - 1].0 == Tok::Punct('=');
+                if !listed {
+                    return None;
+                }
+                let Some(open) = open_paren else {
+                    return Some(CompletionContext::ValidatorName);
+                };
+                let Tok::Word(validator) = toks[open - 1].0 else {
+                    return None;
+                };
+                if matches!(toks.last(), Some((Tok::Punct('='), _))) {
+                    return Some(CompletionContext::DeclarationName);
+                }
+                let written = toks[open + 1..]
+                    .windows(2)
+                    .filter_map(|pair| match (pair[0].0, pair[1].0) {
+                        (Tok::Word(name), Tok::Punct('=')) => Some(name.to_string()),
+                        _ => None,
+                    })
+                    .collect();
+                return Some(CompletionContext::ValidatorArgument { validator: validator.to_string(), written });
+            }
+            // Out of the annotation and into a declaration: no list here.
+            Tok::Punct('{') | Tok::Punct('}') | Tok::Punct(';') => return None,
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Whether the cursor sits inside a `(` that hasn't been closed yet, per a
@@ -1027,6 +1093,11 @@ enum CompletionContext {
     /// Inside a `settings { ... }` block (named or unnamed), before an
     /// entry's dotted key.
     SettingsBody,
+    /// An entry of a `@validators = [...]` list: a validator's name.
+    ValidatorName,
+    /// Inside the parentheses of a `@validators` entry, before an argument's
+    /// name: `validator` as written, and the arguments already given.
+    ValidatorArgument { validator: String, written: Vec<String> },
     /// Context couldn't be narrowed down.
     Unknown,
 }
@@ -1654,6 +1725,76 @@ mod tests {
         // didn't throw off the brace-balance scan that finds this is
         // inside `struct M`'s body, not `error Test`'s.
         assert!(items.iter().any(|i| i.label == "optional"), "{items:?}");
+    }
+
+    #[test]
+    fn a_validators_list_is_its_own_context() {
+        let at_end = |source: &str| determine_context(source, source.len());
+        assert_eq!(at_end("@validators = ["), CompletionContext::ValidatorName);
+        assert_eq!(at_end("@validators = [St"), CompletionContext::ValidatorName);
+        assert_eq!(at_end("struct S {\n    @validators = [A(min = 1), "), CompletionContext::ValidatorName);
+        assert_eq!(
+            at_end("@validators = [A(min = 1, m"),
+            CompletionContext::ValidatorArgument { validator: "A".into(), written: vec!["min".into()] }
+        );
+        // An argument's value: nothing to offer.
+        assert_eq!(at_end("@validators = [A(min = "), CompletionContext::DeclarationName);
+        // Closed: back to whatever follows.
+        assert_eq!(at_end("@validators = [A]\n"), CompletionContext::TopLevel);
+    }
+
+    fn validator_completions(source: &str) -> Vec<CompletionItem> {
+        let uri = Url::parse("file:///pkg/src/api.ids").unwrap();
+        let std = crate::analysis::stdlib::files(&crate::analysis::stdlib::root());
+        let position = crate::util::offset_to_position(source, source.find('|').unwrap());
+        get_completions_with_project(&source.replace('|', ""), &uri, position, &std)
+    }
+
+    #[test]
+    fn a_validators_list_offers_validators_not_keywords() {
+        let items = validator_completions("validator Mine for string {\n}\n\n@validators = [St|]\ntype T = string\n");
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(labels.contains(&"Mine"), "{labels:?}");
+        assert!(labels.contains(&"StringBounds"), "{labels:?}");
+        assert!(!labels.contains(&"struct") && !labels.contains(&"settings"), "{labels:?}");
+
+        // Not imported: it brings its `use` along, after what's in scope.
+        let bounds = items.iter().find(|i| i.label == "StringBounds").unwrap();
+        let edit = &bounds.additional_text_edits.as_ref().expect("adds the use")[0];
+        assert_eq!(edit.new_text, "use std::validators::StringBounds\n\n");
+        assert!(bounds.sort_text.as_deref().unwrap_or_default().starts_with('~'));
+    }
+
+    #[test]
+    fn an_imported_validator_needs_no_use() {
+        let items = validator_completions("use std::validators::StringBounds\n\n@validators = [|]\ntype T = string\n");
+        let bounds = items.iter().find(|i| i.label == "StringBounds").unwrap();
+        assert!(bounds.additional_text_edits.is_none(), "{bounds:?}");
+        assert_eq!(items.iter().filter(|i| i.label == "StringBounds").count(), 1);
+    }
+
+    #[test]
+    fn a_required_property_goes_in_as_a_snippet() {
+        let items = validator_completions("validator AtLeast for u32 {\n    min: u32\n    max: u32 = 9\n}\n\n@validators = [|\ntype T = u32\n");
+        let at_least = items.iter().find(|i| i.label == "AtLeast").unwrap();
+        assert_eq!(at_least.insert_text.as_deref(), Some("AtLeast(min = ${1})"));
+        // All defaulted: bare.
+        let bounds = items.iter().find(|i| i.label == "StringBounds").unwrap();
+        assert_eq!(bounds.insert_text, None);
+    }
+
+    #[test]
+    fn inside_the_parentheses_the_properties_not_written_yet() {
+        let items = validator_completions(
+            "use std::validators::StringBounds\n\n@validators = [StringBounds(min_chars = 1, |)]\ntype T = string\n",
+        );
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["max_chars"]);
+        assert_eq!(items[0].insert_text.as_deref(), Some("max_chars = "));
+
+        // Not imported: nothing in scope to complete.
+        let items = validator_completions("@validators = [StringBounds(|)]\ntype T = string\n");
+        assert!(items.is_empty(), "{items:?}");
     }
 
     #[test]

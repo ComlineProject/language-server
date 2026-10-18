@@ -13,7 +13,9 @@ use comline_core::schema::ir::compiler::interpreter::incremental::IncrementalInt
 use comline_core::schema::ir::compiler::settings::enforcement::check_settings_enforcement;
 use comline_core::schema::ir::compiler::settings::resolution::check_settings_conflicts;
 use comline_core::schema::ir::compiler::settings::severity::resolve_diagnostic_overrides;
-use comline_core::schema::ir::compiler::import_resolver::{declared_alias_target, declared_validator_targets};
+use comline_core::schema::ir::compiler::import_resolver::{
+    declared_alias_target, declared_validator_properties, declared_validator_targets,
+};
 use comline_core::schema::ir::compiler::Compile;
 use comline_core::schema::ir::frozen::unit::FrozenUnit;
 use comline_core::schema::ir::frozen::types::TypeRef;
@@ -101,7 +103,8 @@ pub fn validation_diagnostics(source: &str, document: &Document) -> Vec<Diagnost
 }
 
 /// What core's validation asks about names a file imports - an imported
-/// validator's `for` targets, what an imported `type` alias stands for -
+/// validator's `for` targets and properties, what an imported `type` alias
+/// stands for -
 /// answered from the declaration the file's own scope brings in
 /// ([`Project::resolve`]), read with core's own helpers so the
 /// editor resolves exactly as `comline build` does.
@@ -133,6 +136,11 @@ impl validation::ImportLookup for ProjectImports<'_, '_> {
     fn alias_target(&self, name: &str) -> Option<TypeRef> {
         let (doc, real_name) = self.declaration(name)?;
         declared_alias_target(&self.project.docs[doc].document.0, &real_name)
+    }
+
+    fn validator_properties(&self, name: &str) -> Option<Vec<FrozenUnit>> {
+        let (doc, real_name) = self.declaration(name)?;
+        declared_validator_properties(&self.project.docs[doc].document.0, &real_name)
     }
 
     fn is_stand_in(&self, name: &str) -> bool {
@@ -946,6 +954,25 @@ struct User {
             .into_iter()
             .map(|d| (d.message, d.code, d.range.start.line, d.range.start.character))
             .collect()
+    }
+
+    /// An imported validator's arguments are checked in the editor, against
+    /// the declaration its `use` brings in - as `comline build` does.
+    #[test]
+    fn an_imported_validators_arguments_are_checked() {
+        let rules = ("file:///pkg/src/rules.ids", "validator AtLeast for u32 {\n    min: u32\n    validate {\n        \
+                      assert(value >= params.min, \"{value.name}\")\n    }\n}\n");
+        let messages = |call: &str| -> Vec<String> {
+            let api = format!("use rules::AtLeast\n\nstruct S {{\n    @validators = [{call}]\n    n: u32\n}}\n");
+            project_messages(&[("file:///pkg/src/api.ids", &api), rules]).into_iter().map(|m| m.0).collect()
+        };
+        let only = |call: &str, expected: &str| {
+            let got = messages(call);
+            assert!(got.len() == 1 && got[0].starts_with(expected), "{call}: {got:?}");
+        };
+        only("AtLeast", "validator 'AtLeast' is missing argument 'min'");
+        only("AtLeast(mni = 1)", "validator 'AtLeast' has no argument 'mni' - did you mean 'min'?");
+        assert!(messages("AtLeast(min = 1)").is_empty());
     }
 
     const TYPES: (&str, &str) = ("file:///pkg/src/types.ids", "struct Message {\n    text: string\n}\n");
