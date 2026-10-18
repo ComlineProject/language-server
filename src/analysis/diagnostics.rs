@@ -956,6 +956,17 @@ struct User {
             .collect()
     }
 
+    /// An unknown validator is underlined where it's named, not across the
+    /// whole alias it's on.
+    #[test]
+    fn an_unknown_validator_is_underlined_at_its_name() {
+        let messages = project_messages(&[("file:///pkg/src/api.ids", "@validators = [Pos]\ntype FixedNum = string\n")]);
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        let (message, _, line, character) = &messages[0];
+        assert!(message.starts_with("Unknown validator 'Pos'"), "{message}");
+        assert_eq!((*line, *character), (0, 15));
+    }
+
     /// An imported validator's arguments are checked in the editor, against
     /// the declaration its `use` brings in - as `comline build` does.
     #[test]
