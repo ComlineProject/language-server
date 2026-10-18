@@ -1,6 +1,8 @@
 // Diagnostic generation — parse errors, `comline-core`'s validation pass,
 // and missing imports
 
+use std::collections::BTreeSet;
+
 use crate::analysis::import_check::{self, MissingImport, UnresolvedImport, UnverifiedImport};
 use crate::analysis::project::Project;
 use crate::analysis::symbols::Namespace;
@@ -100,18 +102,23 @@ pub fn validation_diagnostics(source: &str, document: &Document) -> Vec<Diagnost
 
 /// What core's validation asks about names a file imports - an imported
 /// validator's `for` targets, what an imported `type` alias stands for -
-/// answered from the declaration [`Project::resolve`] finds for the name
-/// (the one go-to-definition jumps to), read with core's own helpers so the
+/// answered from the declaration the file's own scope brings in
+/// ([`Project::resolve_in_scope`]), read with core's own helpers so the
 /// editor resolves exactly as `comline build` does.
 struct ProjectImports<'p, 'a> {
     project: &'p Project<'a>,
     doc: usize,
+    /// Names [`import_check`] gave a stand-in import because their `use` is
+    /// missing - reported as such, never judged against a validator.
+    stand_ins: BTreeSet<String>,
 }
 
 impl ProjectImports<'_, '_> {
     fn declaration(&self, name: &str) -> Option<(usize, String)> {
         let bare = name.rsplit("::").next()?;
-        let target = self.project.resolve(self.doc, bare, Namespace::Declaration)?;
+        // In scope only, as `comline build` resolves: the project-wide
+        // fallback would answer for a validator this file never imported.
+        let target = self.project.resolve_in_scope(self.doc, bare, Namespace::Declaration)?;
         let real_name = self.project.symbol(&target)?.name.clone();
         Some((target.doc, real_name))
     }
@@ -126,6 +133,10 @@ impl validation::ImportLookup for ProjectImports<'_, '_> {
     fn alias_target(&self, name: &str) -> Option<TypeRef> {
         let (doc, real_name) = self.declaration(name)?;
         declared_alias_target(&self.project.docs[doc].document.0, &real_name)
+    }
+
+    fn is_stand_in(&self, name: &str) -> bool {
+        self.stand_ins.contains(name)
     }
 }
 
@@ -338,6 +349,7 @@ pub fn all_diagnostics(
 pub fn project_diagnostics(project: &Project, doc: usize) -> Vec<Diagnostic> {
     let here = &project.docs[doc];
     let check = import_check::check(project, doc);
+    let stand_ins = check.missing.iter().map(|m| m.name.clone()).collect();
 
     let mut diagnostics = validation_diagnostics_with(
         here.source,
@@ -346,7 +358,7 @@ pub fn project_diagnostics(project: &Project, doc: usize) -> Vec<Diagnostic> {
         &project.settings,
         here.uri,
         &here.namespace,
-        &ProjectImports { project, doc },
+        &ProjectImports { project, doc, stand_ins },
     );
     diagnostics.extend(reserved_name_diagnostic(here));
     diagnostics.extend(check.missing.iter().map(|m| missing_import_diagnostic(here.source, m)));
@@ -967,6 +979,88 @@ struct User {
             RULES,
         ]);
         assert!(ok.is_empty(), "{ok:?}");
+    }
+
+    const BOUNDS: (&str, &str) = (
+        "file:///pkg/src/rules.ids",
+        "validator Bounds for string {\n    validate {\n        assert(value.length > 0, \"{value.name} is empty\")\n    }\n}\n\
+         type Name = string\n",
+    );
+
+    /// A validator declared in another file but never imported is unknown -
+    /// and only that. Finding it project-wide anyway once also checked its
+    /// `for` against the alias, an error about a declaration not in scope.
+    #[test]
+    fn a_validator_the_file_never_imports_is_unknown_and_nothing_more() {
+        let messages: Vec<String> = project_messages(&[
+            ("file:///pkg/src/api.ids", "@validators = [Bounds()]\ntype FixedNum = u8[2]\n"),
+            BOUNDS,
+        ])
+        .into_iter()
+        .map(|m| m.0)
+        .collect();
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(messages[0].starts_with("Unknown validator 'Bounds'"), "{messages:?}");
+
+        // Imported, it's found - and then its target is what's wrong.
+        let messages: Vec<String> = project_messages(&[
+            ("file:///pkg/src/api.ids", "use rules::Bounds\n\n@validators = [Bounds()]\ntype FixedNum = u8[2]\n"),
+            BOUNDS,
+        ])
+        .into_iter()
+        .map(|m| m.0)
+        .collect();
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(
+            messages[0].starts_with("validator 'Bounds' applies to `string`, not `u8[2]`"),
+            "{messages:?}"
+        );
+    }
+
+    /// The editor's own case: std's `StringBounds` is in the project (std's
+    /// files always are), but a file that doesn't `use` it doesn't have it.
+    #[test]
+    fn std_validators_are_only_in_scope_through_a_use() {
+        let in_package = |text: &str| {
+            let mut files = vec![crate::analysis::source::SourceFile::local(
+                Url::parse("file:///pkg/src/none.ids").unwrap(),
+                text.to_string(),
+            )];
+            files.extend(crate::analysis::stdlib::files(&crate::analysis::stdlib::root()));
+            let project = Project::new(files.iter());
+            project_diagnostics(&project, 0).into_iter().map(|d| d.message).collect::<Vec<_>>()
+        };
+
+        let unimported = in_package("@validators = [StringBounds()]\ntype FixedNum = u8[2]\n");
+        assert_eq!(unimported.len(), 1, "{unimported:?}");
+        assert!(unimported[0].starts_with("Unknown validator 'StringBounds'"), "{unimported:?}");
+
+        let imported = in_package(
+            "use std::validators::StringBounds\n\n@validators = [StringBounds()]\ntype FixedNum = u8[2]\n",
+        );
+        assert_eq!(imported.len(), 1, "{imported:?}");
+        assert!(
+            imported[0].starts_with("validator 'StringBounds' applies to `string`, not `u8[2]`"),
+            "{imported:?}"
+        );
+    }
+
+    /// An alias from another file, never imported, isn't resolved to judge a
+    /// validator on it - the unknown type is the one error.
+    #[test]
+    fn an_alias_the_file_never_imports_is_not_resolved() {
+        let messages: Vec<String> = project_messages(&[
+            (
+                "file:///pkg/src/api.ids",
+                "validator Positive for u32 {\n    validate {\n        assert(value > 0, \"{value.name}\")\n    }\n}\n\
+                 struct S {\n    @validators = [Positive()]\n    n: Name\n}\n",
+            ),
+            BOUNDS,
+        ])
+        .into_iter()
+        .map(|m| m.0)
+        .collect();
+        assert!(messages.iter().all(|m| !m.contains("applies to")), "{messages:?}");
     }
 
     #[test]
