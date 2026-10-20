@@ -320,4 +320,40 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(root);
     }
+
+    /// A dependency whose schemas import its own dependency compiles from
+    /// disk, so what it gives up is still reported.
+    #[test]
+    fn a_dependency_importing_its_own_dependency_is_still_checked() {
+        let root = std::env::temp_dir().join(format!("comline-lsp-deps-transitive-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let manifest = "congregation app\nspecification_version = 1\n\n\
+            dependencies = {\n    billing = {\n        path = \"../billing\"\n    }\n}\n";
+        for (path, text) in [
+            (root.join("app/config.idp"), manifest),
+            (root.join("app/src/models.ids"), "struct Main {\n    id: u64\n}\n"),
+            (root.join("money/config.idp"), "congregation money\nspecification_version = 1\n"),
+            (root.join("money/src/types.ids"), "struct Amount {\n    cents: u64\n}\n"),
+            (
+                root.join("billing/config.idp"),
+                "congregation billing\nspecification_version = 1\n\
+                 settings = { annotations = { unverified = { allowed = true } } }\n\n\
+                 dependencies = {\n    money = {\n        path = \"../money\"\n    }\n}\n",
+            ),
+            (
+                root.join("billing/src/api.ids"),
+                "use money::types::Amount\n\n@handshake = \"none\"\n@unverified = \"the 2009 gateway\"\n\
+                 protocol Billing {\n    function charge(amount: Amount);\n}\n",
+            ),
+        ] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+
+        let found = manifest_diagnostics(&root.join("app"), manifest);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].message.starts_with("protocol `Billing` is unverified"), "{}", found[0].message);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
