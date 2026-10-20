@@ -8,7 +8,7 @@ A Language Server Protocol (LSP) implementation for [Comline](https://github.com
 
 - **Diagnostics** - Real-time syntax errors plus `comline-core`'s validation pass (undefined types, duplicate declarations, ...) — the same checks `comline build` runs. A type from another file of the package used without a `use` gets a specific error with an **"Add `use ...`" quick fix**
 - **Whole-package analysis** - every `.ids` file in a package's `src/` takes part, open or not, kept current through file watching; each package only sees its own files
-- **Dependency packages** - the dependencies `config.idp` declares are indexed (path dependencies, and git pins `comline check` has fetched; the editor never fetches), so imports, hover, go-to-definition and completion work into them under the dependency's name. Unresolved imports are errors, worded like `comline check`'s, with a "did you mean" quick fix; imports of a dependency that isn't fetched yet are marked as not checked, and its `config.idp` entry says why
+- **Dependency packages** - the dependencies `config.idp` declares are indexed (path dependencies, and git pins `comline check` has fetched; the editor never fetches), so imports, hover, go-to-definition and completion work into them under the dependency's name. Unresolved imports are errors, worded like `comline check`'s, with a "did you mean" quick fix; imports of a dependency that isn't fetched yet are marked as not checked, and its `config.idp` entry says why. A dependency whose `@unverified` protocols aren't accepted is an error on its entry, with a quick fix that writes the `accept_unverified` line `comline accept` would
 - **Standard library** - `use std::…` resolves against the std embedded in `comline-core`, like a read-only dependency: hover, go-to-definition (into virtual `comline-std:` documents, whose text clients fetch with the `comline/stdSource` request), completion, and unresolved-import errors worded like `comline check`'s (`std has no schema matching 'std::htp::Request' - did you mean 'std::http'?`)
 - **Module docs** - a schema documents itself with `//!` lines at its top, a package with the same at the top of its `config.idp`. Hover any segment of a path (`std`, `validators` in `use std::validators::StringBounds`, or in a qualified type name) for that module's docs, the modules below it and the types it declares; `use` completion shows the same docs beside each module and declaration. `std` and each of its modules are documented this way
 - **Document Symbols** - Hierarchical outline view of structs, enums, protocols, and constants
@@ -317,7 +317,7 @@ The server advertises the following capabilities:
 - **Workspace Symbol Provider** - Global symbol search
 - **Document Formatting** - Auto-formatting
 - **Rename Provider** - Symbol renaming across files, with prepare-rename
-- **Code Action Provider** - Quick fixes (add a missing `use`, apply an unresolved import's "did you mean")
+- **Code Action Provider** - Quick fixes (add a missing `use`, apply an unresolved import's "did you mean", accept a dependency's `@unverified` protocols in `config.idp`)
 - **Semantic Tokens** - Enhanced highlighting
 - **Workspace Folders** - Multi-root workspaces; `workspace/didChangeWatchedFiles` keeps the index current
 

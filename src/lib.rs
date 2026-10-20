@@ -43,6 +43,8 @@ pub mod handlers {
 }
 
 #[cfg(feature = "server")]
+pub mod acceptance;
+#[cfg(feature = "server")]
 pub mod backend;
 #[cfg(feature = "server")]
 pub mod dependencies;
