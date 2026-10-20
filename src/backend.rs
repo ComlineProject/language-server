@@ -643,14 +643,18 @@ impl LanguageServer for Backend {
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
         let uri = params.text_document.uri.clone();
 
-        if is_idp(&uri) {
-            return Ok(None);
-        }
-
         let document = match self.documents.get(&uri) {
             Some(doc) => doc,
             None => return Ok(None),
         };
+
+        if is_idp(&uri) {
+            let Some(package_dir) = uri.to_file_path().ok().and_then(|p| p.parent().map(PathBuf::from)) else {
+                return Ok(None);
+            };
+            let actions = crate::acceptance::code_actions(&package_dir, &uri, &document.text, &params);
+            return Ok((!actions.is_empty()).then_some(actions));
+        }
 
         use crate::handlers::code_actions;
         let actions = code_actions::get_code_actions_with_project(

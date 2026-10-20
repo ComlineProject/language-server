@@ -15,6 +15,7 @@ use comline_core::package::config::dependency::{DependencyConfig, DependencySour
 use comline_core::package::layout::SCHEMAS_DIR;
 use lsp_types::{Diagnostic, DiagnosticSeverity, Url};
 
+use crate::acceptance;
 use crate::parser;
 use crate::util::{byte_range_to_lsp_range, word_occurrences};
 
@@ -55,7 +56,8 @@ pub fn index(package_dir: &Path, manifest: &str) -> Vec<IndexedDependency> {
 }
 
 /// Diagnostics for `config.idp`'s dependency entries that won't resolve -
-/// the ones `comline check` would stop on, or that it has yet to fetch.
+/// the ones `comline check` would stop on, or that it has yet to fetch -
+/// and for the ones whose `@unverified` protocols aren't accepted.
 pub fn manifest_diagnostics(package_dir: &Path, manifest: &str) -> Vec<Diagnostic> {
     let Some(congregation) = parser::parse_idp(manifest).ok().and_then(|r| r.document) else {
         return vec![];
@@ -73,10 +75,17 @@ pub fn manifest_diagnostics(package_dir: &Path, manifest: &str) -> Vec<Diagnosti
 
     names
         .into_iter()
-        .filter_map(|name| {
+        .flat_map(|name| {
             let dependency = &dependencies[name];
-            let (severity, message) = problem(package_dir, dependency)?;
-            Some(diagnostic(manifest, entry_range(manifest, name), severity, message))
+            let range = entry_range(manifest, name);
+            if let Some((severity, message)) = problem(package_dir, dependency) {
+                return vec![diagnostic(manifest, range, severity, message)];
+            }
+            // On disk and resolvable: what its `@unverified` protocols give
+            // up has to be accepted here.
+            let Some(dir) = dependency.package_dir(package_dir) else { return vec![] };
+            let unaccepted = acceptance::unaccepted(dependency, acceptance::unverified_in(&dir));
+            acceptance::diagnostics(manifest, range, dependency, &unaccepted)
         })
         .collect()
 }
@@ -241,6 +250,73 @@ mod tests {
                 ),
             ]
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+    #[test]
+    fn an_unaccepted_unverified_protocol_is_reported_and_fixed() {
+        use lsp_types::{CodeActionContext, CodeActionOrCommand, CodeActionParams, TextDocumentIdentifier};
+
+        let root = std::env::temp_dir().join(format!("comline-lsp-deps-unverified-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let manifest = "congregation app\nspecification_version = 1\n\n\
+            dependencies = {\n    billing = {\n        path = \"../billing\"\n    }\n}\n";
+        for (path, text) in [
+            (root.join("app/config.idp"), manifest),
+            (root.join("app/src/main.ids"), "struct Main {\n    id: u64\n}\n"),
+            (
+                root.join("billing/config.idp"),
+                "congregation billing\nspecification_version = 1\n\
+                 settings = { annotations = { unverified = { allowed = true } } }\n",
+            ),
+            (
+                root.join("billing/src/api.ids"),
+                "@handshake = \"none\"\n@unverified = \"the 2009 gateway\"\n\
+                 protocol Billing {\n    function charge();\n}\n",
+            ),
+        ] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let app = root.join("app");
+
+        let found = manifest_diagnostics(&app, manifest);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].message,
+            "protocol `Billing` is unverified, giving up schema agreement and encoding agreement: \
+             \"the 2009 gateway\" — `comline check` refuses it until it's accepted"
+        );
+
+        let uri = Url::from_file_path(app.join("config.idp")).unwrap();
+        let params = CodeActionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            range: found[0].range,
+            context: CodeActionContext { diagnostics: found.clone(), only: None, trigger_kind: None },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let actions = acceptance::code_actions(&app, &uri, manifest, &params);
+        let [CodeActionOrCommand::CodeAction(action)] = actions.as_slice() else { panic!("{actions:?}") };
+        assert_eq!(action.title, "Accept that `Billing` gives up schema agreement and encoding agreement");
+        let edit = &action.edit.as_ref().unwrap().changes.as_ref().unwrap()[&uri][0];
+        let offset = |p: lsp_types::Position| {
+            manifest.split_inclusive('\n').take(p.line as usize).map(str::len).sum::<usize>() + p.character as usize
+        };
+        let fixed = format!(
+            "{}{}{}",
+            &manifest[..offset(edit.range.start)],
+            edit.new_text,
+            &manifest[offset(edit.range.end)..]
+        );
+        let accepted = manifest.replace(
+            "path = \"../billing\"\n",
+            "path = \"../billing\"\n        accept_unverified = { Billing = [\"schema_agreement\", \"encoding_agreement\"] }\n",
+        );
+        assert_eq!(fixed, accepted);
+
+        // Accepted for exactly that set: nothing left to say.
+        assert!(manifest_diagnostics(&app, &accepted).is_empty());
 
         let _ = std::fs::remove_dir_all(root);
     }
