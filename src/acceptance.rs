@@ -6,11 +6,11 @@
 //! writes the `accept_unverified` line `comline accept` would.
 //!
 //! What a protocol gives up is worked out by core, so the dependency is
-//! compiled as its own package (its own settings and default handshake).
-//! This crate links core without its `deps` feature, so that compile never
-//! fetches anything; a dependency that doesn't compile on its own (one whose
-//! schemas import its own dependencies, say) gets no diagnostic here, and
-//! `comline check` still has the final say.
+//! compiled as its own package (its own settings and default handshake),
+//! with its own dependencies resolved from disk only: nothing is fetched,
+//! and nothing in a cache is changed. A dependency that doesn't compile that
+//! way (one of its own git dependencies isn't fetched yet, say) gets no
+//! diagnostic here, and `comline check` still has the final say.
 //!
 //! The fix is never marked preferred: accepting is a choice the consumer
 //! writes down, so it shouldn't be applied by a "fix all".
@@ -44,7 +44,7 @@ pub struct Unverified {
 /// Every `@unverified` protocol in the package at `dir`. Empty when it
 /// doesn't compile on its own.
 pub fn unverified_in(dir: &Path) -> Vec<Unverified> {
-    let compiled = panic::catch_unwind(AssertUnwindSafe(|| comline_core::package::build::compile_package(dir)));
+    let compiled = panic::catch_unwind(AssertUnwindSafe(|| comline_core::package::build::compile_package_without_fetching(dir)));
     let Ok(Ok(context)) = compiled else { return vec![] };
     let mut found = Vec::new();
     for schema in &context.schema_contexts {

@@ -18,8 +18,9 @@ default = ["server"]
 # The `tower-lsp` stdio server (the `comline-lsp` binary). With it off, only the
 # analysis library builds — `parser` + `analysis` + `handlers`, over `lsp-types`
 # and `comline-core` — and that compiles for `wasm32-unknown-unknown`. The
-# Comline playground links the crate that way.
-server = ["dep:tower-lsp", "dep:tokio", "dep:tracing-subscriber", "dep:dashmap"]
+# Comline playground links the crate that way. The server also resolves a
+# dependency's own dependencies (core's `deps`), only ever from disk.
+server = ["dep:tower-lsp", "dep:tokio", "dep:tracing-subscriber", "dep:dashmap", "comline-core/deps"]
 
 [dependencies]
 # The analysis layer: pure `lsp-types` (serde only, wasm-safe), the parser, and
@@ -33,14 +34,14 @@ anyhow = "1.0"
 # `Command::arguments` is `Vec<serde_json::Value>` — the interactive-rename
 # quick fix below hands the client a URI and a position through it.
 serde_json = "1.0"
-comline-core = { git = "https://github.com/ComlineProject/core", rev = "9682b6c661439695dacca8bd0f768d499c8c574b" }
+comline-core = { git = "https://github.com/ComlineProject/core", rev = "360da0e5c400f538b925f6b7540360658dc3e63c" }
 # What each generator supports, feature by feature (`comline_codegen::features`)
 # - for warning at a use a declared language can't generate. Only the
 # generators' `SUPPORT` tables are read; nothing is generated. Pinned to the
 # same commits as the CLI, so a build has one `comline-codegen`.
-comline-codegen = { git = "https://github.com/ComlineProject/generation", rev = "a3c3258dcbff35257bf74a5b7fe0da8363c9fa7a" }
-comline-codegen-rust = { git = "https://github.com/ComlineProject/comline-rust", rev = "365bb1ea8ecfdabd3143c71d19f80fee01a8cf24" }
-comline-codegen-typescript = { git = "https://github.com/ComlineProject/comline-typescript", rev = "62f6df9faaf5fa8d49f4d9230546b6f48d167110" }
+comline-codegen = { git = "https://github.com/ComlineProject/generation", rev = "3832a7d527b37c2d3006ceb77922fe4b63ed8ed3" }
+comline-codegen-rust = { git = "https://github.com/ComlineProject/comline-rust", rev = "8c510c403838bad716b931f27ae8fd30533c66ac" }
+comline-codegen-typescript = { git = "https://github.com/ComlineProject/comline-typescript", rev = "55c317e653169daa12ee7c4da8676863f9447256" }
 
 # `server`-only.
 tower-lsp = { version = "0.20.0", optional = true }
