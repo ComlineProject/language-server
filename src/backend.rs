@@ -820,6 +820,21 @@ impl Backend {
                             ..Default::default()
                         });
                     }
+
+                    // The declared languages themselves, as `comline build`
+                    // proves them: a generator for each version, none below
+                    // a dependency's, and past the verified range a warning.
+                    let dependency_languages = uri
+                        .to_file_path()
+                        .ok()
+                        .and_then(|p| p.parent().map(|dir| dependencies::dependency_languages(dir, &document.text)))
+                        .unwrap_or_default();
+                    lsp_diagnostics.extend(crate::analysis::generation::declaration_diagnostics(
+                        &document.text,
+                        &project.languages,
+                        &project.settings,
+                        &dependency_languages,
+                    ));
                 }
 
                 if result.has_errors() {

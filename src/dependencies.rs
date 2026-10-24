@@ -16,6 +16,7 @@ use comline_core::package::layout::SCHEMAS_DIR;
 use lsp_types::{Diagnostic, DiagnosticSeverity, Url};
 
 use crate::acceptance;
+use crate::analysis::source::DeclaredLanguage;
 use crate::parser;
 use crate::util::{byte_range_to_lsp_range, word_occurrences};
 
@@ -123,6 +124,21 @@ fn declared(manifest: &str) -> Vec<DependencyConfig> {
         .and_then(|congregation| DependencyConfig::parse_dependencies(&congregation.assignments).ok())
         .map(|dependencies| dependencies.into_values().collect())
         .unwrap_or_default()
+}
+
+/// Each dependency's declared languages, under its declared name, read from
+/// its own manifest on disk. One that isn't on disk declares nothing yet,
+/// and only direct dependencies are read: `comline build` checks theirs too.
+pub fn dependency_languages(package_dir: &Path, manifest: &str) -> Vec<(String, DeclaredLanguage)> {
+    declared(manifest)
+        .into_iter()
+        .filter_map(|dependency| {
+            let dir = dependency.package_dir(package_dir)?;
+            let text = std::fs::read_to_string(dir.join(MANIFEST)).ok()?;
+            Some((dependency.name, crate::analysis::source::declared_languages(&text)))
+        })
+        .flat_map(|(name, languages)| languages.into_iter().map(move |l| (name.clone(), l)))
+        .collect()
 }
 
 /// The range of a dependency entry's name: the first `name =` after the

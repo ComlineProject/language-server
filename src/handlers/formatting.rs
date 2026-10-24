@@ -125,17 +125,17 @@ mod tests {
     fn test_format_idp() {
         // `.idp` nests with `{}` the same way `.ids` does — same formatter,
         // no `.idp`-specific logic needed.
-        let source = "congregation test\ncode_generation = {\nlanguages = {\nrust#1.70.0 = {}\n}\n}";
+        let source = "congregation test\ncode_generation = {\nlanguages = {\nrust#1.85.0 = {}\n}\n}";
         let formatted = basic_format(source);
 
         assert!(formatted.contains("    languages = {"));
-        assert!(formatted.contains("        rust#1.70.0 = {}"));
+        assert!(formatted.contains("        rust#1.85.0 = {}"));
     }
 
     #[test]
     fn test_format_idp_already_formatted_is_a_no_op() {
         let source =
-            "congregation test\nspecification_version = 1\n\ncode_generation = {\n    languages = {\n        rust#1.70.0 = {}\n    }\n}\n";
+            "congregation test\nspecification_version = 1\n\ncode_generation = {\n    languages = {\n        rust#1.85.0 = {}\n    }\n}\n";
         let edits = format_document(source);
 
         assert!(edits.is_empty() || edits[0].new_text == source);
