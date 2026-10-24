@@ -39,9 +39,9 @@ comline-core = { git = "https://github.com/ComlineProject/core", rev = "a3f9eef5
 # - for warning at a use a declared language can't generate. Only the
 # generators' `SUPPORT` tables are read; nothing is generated. Pinned to the
 # same commits as the CLI, so a build has one `comline-codegen`.
-comline-codegen = { git = "https://github.com/ComlineProject/generation", rev = "bbfadb25cd34f02974c69cc2f102e667a089f684" }
-comline-codegen-rust = { git = "https://github.com/ComlineProject/comline-rust", rev = "577bdb2910db8b3aedb6061f5436816836a08942" }
-comline-codegen-typescript = { git = "https://github.com/ComlineProject/comline-typescript", rev = "c72d14efa93135f892c04c6546f690a8e65b6cc1" }
+comline-codegen = { git = "https://github.com/ComlineProject/generation", rev = "d88f731f8211b80cec6a82272aa61aa5140a0775" }
+comline-codegen-rust = { git = "https://github.com/ComlineProject/comline-rust", rev = "4b21074d56b005ed8500bcc31bcaf8aebec215e2" }
+comline-codegen-typescript = { git = "https://github.com/ComlineProject/comline-typescript", rev = "a8424c623170aa0fec6363513d354d0dba23c060" }
 
 # `server`-only.
 tower-lsp = { version = "0.20.0", optional = true }
