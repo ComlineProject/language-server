@@ -56,7 +56,7 @@ pub fn get_idp_hover_info(source: &str, position: Position) -> Option<Hover> {
     })
 }
 
-/// Cursor on an entry of `code_generation.languages` (`rust#1.70.0 = {...}`):
+/// Cursor on an entry of `code_generation.languages` (`rust#1.85.0 = {...}`):
 /// what that language's generator supports, from its own `SUPPORT` table.
 /// `None` elsewhere, or for a language this build has no generator for.
 fn language_hover(assignments: &[Spanned<Assignment>], offset: usize) -> Option<Hover> {
@@ -161,15 +161,15 @@ mod tests {
 
     #[test]
     fn hovering_a_declared_language_shows_what_its_generator_supports() {
-        let source = "congregation app\nspecification_version = 1\n\ncode_generation = {\n    languages = {\n        rust#1.70.0 = {}\n    }\n}\n";
-        let hover = get_idp_hover_info(source, Position::new(5, 10)).expect("a hover on `rust#1.70.0`");
+        let source = "congregation app\nspecification_version = 1\n\ncode_generation = {\n    languages = {\n        rust#1.85.0 = {}\n    }\n}\n";
+        let hover = get_idp_hover_info(source, Position::new(5, 10)).expect("a hover on `rust#1.85.0`");
         let HoverContents::Array(parts) = hover.contents else { panic!("an array") };
         let MarkedString::String(text) = &parts[0] else { panic!("markdown") };
-        assert!(text.contains("**`rust#1.70.0`** supports"), "{text}");
+        assert!(text.contains("**`rust#1.85.0`** supports"), "{text}");
         assert!(text.contains("- unions: "), "{text}");
 
         // A language this build can't generate: nothing to say.
-        let other = source.replace("rust#1.70.0", "python#3.11.0");
+        let other = source.replace("rust#1.85.0", "python#3.11.0");
         assert!(get_idp_hover_info(&other, Position::new(5, 10)).is_none());
     }
 

@@ -122,7 +122,7 @@ pub fn declared_dependencies(manifest: &str) -> Vec<DeclaredDependency> {
 }
 
 /// A language `config.idp`'s `code_generation.languages` declares:
-/// `rust#1.70.0` -> `rust`, `1.70.0`.
+/// `rust#1.85.0` -> `rust`, `1.85.0`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclaredLanguage {
     pub language: String,
