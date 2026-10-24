@@ -508,7 +508,7 @@ pub(crate) fn validator_sites(doc: &ProjectDoc) -> Vec<(String, usize)> {
             .filter(|a| a.key.text == "validators")
             .filter_map(|a| match &a.assignment.as_ref()?.value {
                 AnnotationValue::List(list) => Some(list.items.iter().map(|call| call.name.text.as_str())),
-                AnnotationValue::Scalar(_) => None,
+                AnnotationValue::Scalar(_) | AnnotationValue::Dict(_) => None,
             })
             .flatten()
             .collect();

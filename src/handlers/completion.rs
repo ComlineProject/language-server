@@ -830,6 +830,22 @@ fn value_snippet(ty: &ValueType, n: usize) -> Option<String> {
         ValueType::Keyword(_) => format!("${{{n}|{}|}}", spellings.join(",")),
         ValueType::Name => format!("${{{n}:Name}}"),
         ValueType::ValidatorList => format!("[${n}]"),
+        // One of several forms: the first, the plainest (`@framing`'s name,
+        // not its dictionary).
+        ValueType::AnyOf(types) => return types.first().and_then(|first| value_snippet(first, n)),
+        // The keys it can't do without, each its own tab-stop.
+        ValueType::Dict(keys) => {
+            let entries: Vec<String> = keys
+                .iter()
+                .filter(|k| k.required)
+                .enumerate()
+                .map(|(i, k)| match value_snippet(&k.value, n + i) {
+                    Some(value) => format!("{} = {value}", k.key),
+                    None => k.key.to_string(),
+                })
+                .collect();
+            format!("{{ {} }}", entries.join(", "))
+        }
     })
 }
 
@@ -1592,6 +1608,23 @@ mod tests {
         assert_eq!(mode.insert_text_format, Some(lsp_types::InsertTextFormat::SNIPPET));
         assert_eq!(mode.kind, Some(CompletionItemKind::PROPERTY));
         assert!(mode.detail.is_some());
+    }
+
+    #[test]
+    fn a_value_of_several_forms_inserts_the_plainest_and_a_dictionary_its_required_keys() {
+        use comline_core::config_value::DictKey;
+        // `@framing` takes a name or a dictionary; the name is what's typed.
+        let framing = annotations::lookup("framing").unwrap();
+        assert_eq!(
+            annotation_insert_text(framing).as_deref(),
+            Some("framing = \"${1|jsonrpc,datagram,datagram@2|}\"$0")
+        );
+        const KEYS: &[DictKey] = &[
+            DictKey { key: "name", value: ValueType::StrEnum(&[]), required: true },
+            DictKey { key: "level", value: ValueType::Integer, required: true },
+            DictKey { key: "note", value: ValueType::Str, required: false },
+        ];
+        assert_eq!(value_snippet(&ValueType::Dict(KEYS), 1).as_deref(), Some("{ name = \"${1||}\", level = ${2:0} }"));
     }
 
     #[test]
