@@ -1,7 +1,7 @@
 // Diagnostic generation — parse errors, `comline-core`'s validation pass,
 // and missing imports
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::analysis::generation;
 use crate::analysis::import_check::{self, MissingImport, UnresolvedImport, UnverifiedImport};
@@ -9,7 +9,7 @@ use crate::analysis::project::Project;
 use crate::analysis::symbols::Namespace;
 use crate::util::byte_range_to_lsp_range;
 use comline_core::diagnostics::Severity;
-use comline_core::schema::idl::grammar::Document;
+use comline_core::schema::idl::grammar::{Declaration, Document};
 use comline_core::schema::ir::compiler::interpreter::incremental::IncrementalInterpreter;
 use comline_core::schema::ir::compiler::settings::enforcement::check_settings_enforcement;
 use comline_core::schema::ir::compiler::settings::resolution::check_settings_conflicts;
@@ -140,7 +140,7 @@ pub fn validation_diagnostics(source: &str, document: &Document) -> Vec<Diagnost
 
 /// What core's validation asks about names a file imports - an imported
 /// validator's `for` targets and properties, what an imported `type` alias
-/// stands for -
+/// stands for, whether an imported type carries any data -
 /// answered from the declaration the file's own scope brings in
 /// ([`Project::resolve`]), read with core's own helpers so the
 /// editor resolves exactly as `comline build` does.
@@ -181,6 +181,82 @@ impl validation::ImportLookup for ProjectImports<'_, '_> {
 
     fn is_stand_in(&self, name: &str) -> bool {
         self.stand_ins.contains(name)
+    }
+
+    fn carries_data(&self, name: &str) -> Option<bool> {
+        let (doc, real_name) = self.declaration(name)?;
+        Some(DeclaredData { project: self.project, answers: HashMap::new() }.named(doc, &real_name))
+    }
+}
+
+/// Whether a type declared in the project puts any bytes on the wire,
+/// worked out the way `comline build` does (core's `import_resolver`): from
+/// the declaring file's own declarations, following *that* file's `use`s on
+/// to further files - by its scope, never project-wide. Answers are keyed
+/// by file and name, `None` while one is still being worked out, so a type
+/// that refers to itself, in one file or across several, ends the walk as
+/// carrying data, as core's does.
+struct DeclaredData<'p, 'a> {
+    project: &'p Project<'a>,
+    answers: HashMap<(usize, String), Option<bool>>,
+}
+
+impl DeclaredData<'_, '_> {
+    /// Whether `name`, declared in `docs[doc]`, carries data. Anything but
+    /// a struct or an alias does: an enum writes an index or a name, and an
+    /// error or a protocol is never an array's element.
+    fn named(&mut self, doc: usize, name: &str) -> bool {
+        let key = (doc, name.to_string());
+        match self.answers.get(&key) {
+            Some(Some(known)) => return *known,
+            Some(None) => return true,
+            None => {}
+        }
+        self.answers.insert(key.clone(), None);
+        let project = self.project;
+        let declared = project.docs[doc].document.0.iter().find(|decl| match &decl.value {
+            Declaration::Struct(s) => s.name() == name,
+            Declaration::TypeAlias(a) => a.name() == name,
+            _ => false,
+        });
+        let answer = match declared.map(|decl| &decl.value) {
+            Some(Declaration::Struct(s)) => s.fields().iter().any(|field| {
+                field.value.optional()
+                    || self.carries(doc, &TypeRef::from_grammar(field.value.field_type()))
+            }),
+            Some(Declaration::TypeAlias(a)) => {
+                self.carries(doc, &TypeRef::from_grammar(a.target_type()))
+            }
+            _ => true,
+        };
+        self.answers.insert(key, Some(answer));
+        answer
+    }
+
+    /// Whether `ty`, written in `docs[doc]`, carries data - core's
+    /// `validation::data::carries_data`, with a name resolved in that
+    /// file's scope. A name it can't resolve is taken to carry data: an
+    /// unknown type is reported on its own.
+    fn carries(&mut self, doc: usize, ty: &TypeRef) -> bool {
+        match ty {
+            TypeRef::Unit => false,
+            TypeRef::Primitive(_) | TypeRef::Union(_) => true,
+            // A dynamic array writes its count.
+            TypeRef::Array { length: None, .. } => true,
+            TypeRef::Array { length: Some(0), .. } => false,
+            TypeRef::Array { element, .. } => self.carries(doc, element),
+            TypeRef::Named(name) => {
+                let bare = name.rsplit("::").next().unwrap_or(name);
+                let project = self.project;
+                let declared = project.resolve(doc, bare, Namespace::Declaration).and_then(
+                    |target| Some((target.doc, project.symbol(&target)?.name.clone())),
+                );
+                match declared {
+                    Some((doc, real_name)) => self.named(doc, &real_name),
+                    None => true,
+                }
+            }
+        }
     }
 }
 
@@ -1105,6 +1181,81 @@ struct User {
             RULES,
         ]);
         assert!(ok.is_empty(), "{ok:?}");
+    }
+
+    const DATALESS: &str = "validation::array-of-dataless-type";
+
+    fn dataless(messages: &[(String, Option<NumberOrString>, u32, u32)]) -> Vec<&str> {
+        messages
+            .iter()
+            .filter(|m| m.1 == Some(NumberOrString::String(DATALESS.to_string())))
+            .map(|m| m.0.as_str())
+            .collect()
+    }
+
+    /// An array of a type with no data is refused in the file declaring it.
+    #[test]
+    fn an_array_of_a_local_dataless_type_is_an_error() {
+        let source = "struct Empty {}\n\nstruct Batch {\n    items: Empty[]\n}\n";
+        let d = diags(source);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(d[0].code, Some(NumberOrString::String(DATALESS.to_string())));
+        assert!(d[0].message.starts_with("an array of `Empty` carries only its length"), "{d:?}");
+        assert!(diags(&source.replace("{}", "{\n    n: u8\n}")).is_empty());
+    }
+
+    /// The same for a type another file declares: the editor asks that file,
+    /// following its own `use`s on, as `comline build` does - core alone
+    /// would take the imported name to carry data.
+    #[test]
+    fn an_array_of_an_imported_dataless_type_is_an_error() {
+        const API: (&str, &str) =
+            ("file:///pkg/src/api.ids", "use shapes::Empty\n\nstruct Batch {\n    items: Empty[]\n}\n");
+        let messages = |shapes: &str, more: &str| {
+            project_messages(&[API, ("file:///pkg/src/shapes.ids", shapes), ("file:///pkg/src/more.ids", more)])
+        };
+
+        let bad = messages("struct Empty {}\n", "");
+        assert_eq!(bad.len(), 1, "{bad:?}");
+        assert_eq!(
+            dataless(&bad),
+            ["an array of `Empty` carries only its length: `Empty` has no data, so each element \
+              would take no bytes — Struct 'Batch', field 'items' — give `Empty` a field, or use a \
+              count (`u32`) instead"]
+        );
+        assert_eq!((bad[0].2, bad[0].3), (3, 4), "at the field");
+
+        // Through an alias and on into a third file.
+        let through = messages("use more::Nothing\n\ntype Empty = Nothing[2]\n", "struct Nothing {\n    unit: ()\n}\n");
+        assert_eq!(dataless(&through).len(), 1, "{through:?}");
+
+        // Data anywhere along the way: an optional field, a field of the
+        // third file's type, a dynamic array.
+        assert!(messages("struct Empty {\n    note?: ()\n}\n", "").is_empty());
+        assert!(messages("use more::Nothing\n\nstruct Empty {\n    n: Nothing\n}\n", "struct Nothing {\n    n: u8\n}\n").is_empty());
+        assert!(messages("type Empty = ()[]\n", "").is_empty());
+    }
+
+    /// A data-less type the file never imports is a missing `use` and
+    /// nothing more: the editor doesn't look in a file the schema doesn't
+    /// import, even where that file would say "no data".
+    #[test]
+    fn an_unimported_dataless_type_is_only_a_missing_use() {
+        let messages = project_messages(&[
+            ("file:///pkg/src/api.ids", "struct Batch {\n    items: Empty[]\n}\n"),
+            ("file:///pkg/src/shapes.ids", "struct Empty {}\n"),
+        ]);
+        assert!(dataless(&messages).is_empty(), "{messages:?}");
+        assert!(messages.iter().any(|m| m.1 == Some(NumberOrString::String(MISSING_IMPORT.to_string()))), "{messages:?}");
+
+        // Nor does an imported type's own unimported name reach further.
+        let messages = project_messages(&[
+            ("file:///pkg/src/api.ids", "use shapes::Empty\n\nstruct Batch {\n    items: Empty[]\n}\n"),
+            ("file:///pkg/src/shapes.ids", "struct Empty {\n    n: Nothing\n}\n"),
+            ("file:///pkg/src/more.ids", "struct Nothing {}\n"),
+        ]);
+        assert!(dataless(&messages).is_empty(), "{messages:?}");
     }
 
     const BOUNDS: (&str, &str) = (
