@@ -1200,7 +1200,7 @@ struct User {
         let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
         let text = hover_text(hover);
         assert!(text.contains("@framing"), "got: {text}");
-        assert!(text.contains("datagram"), "got: {text}");
+        assert!(text.contains("datagram@2"), "got: {text}");
     }
 
     #[test]
