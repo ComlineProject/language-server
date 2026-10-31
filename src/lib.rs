@@ -36,6 +36,7 @@ pub mod handlers {
     pub mod formatting;
     pub mod hover;
     pub mod idp_hover;
+    pub mod protocol_summary;
     pub mod references;
     pub mod rename;
     pub mod semantic_tokens;

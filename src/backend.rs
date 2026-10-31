@@ -481,12 +481,10 @@ impl LanguageServer for Backend {
 
         // Use our hover handler
         use crate::handlers::hover;
-        Ok(hover::get_hover_info_with_project(
-            &document.text,
-            &uri,
-            position,
-            &other_files,
-        ))
+        let found = hover::get_hover_info_with_project(&document.text, &uri, position, &other_files);
+        // On a protocol's name, `@framing` or `@handshake`: what it speaks
+        // and which guarantees it keeps, as `comline inspect` shows them.
+        Ok(crate::handlers::protocol_summary::extend(found, &document.text, &uri, position))
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
