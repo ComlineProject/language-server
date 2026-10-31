@@ -265,11 +265,31 @@ fn without_encodings(congregation: &mut comline_core::package::config::idl::gram
 /// has: an entry whose `kind` isn't one of the three is left out, and the
 /// build reports it. Empty when the manifest doesn't parse (mid-edit).
 pub fn declared_encodings(manifest: &str) -> Vec<(String, comline_core::encodings::EncodingKind)> {
-    use comline_core::encodings::EncodingKind;
+    declared_encoding_details(manifest).into_iter().map(|e| (e.name, e.kind)).collect()
+}
+
+/// An encoding `config.idp` declares, with the mappings it suggests per
+/// language (`map = { rust = { type = "...", package = "..." } }`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredEncoding {
+    pub name: String,
+    pub kind: comline_core::encodings::EncodingKind,
+    /// By language id. An entry whose mapping is malformed is left out, and
+    /// the build reports it.
+    pub map: std::collections::BTreeMap<String, comline_core::encodings::EncodingMapping>,
+}
+
+/// [`declared_encodings`], with each encoding's suggested mappings.
+pub fn declared_encoding_details(manifest: &str) -> Vec<DeclaredEncoding> {
+    use comline_core::encodings::{EncodingKind, EncodingMapping};
     use comline_core::package::config::idl::grammar::Value;
 
     let Some(congregation) = parser::parse_idp(manifest).ok().and_then(|r| r.document) else {
         return vec![];
+    };
+    let text = |value: &Value| match value {
+        Value::String(s) => Some(s.value.trim_matches('"').to_string()),
+        _ => None,
     };
     let mut declared = vec![];
     for assignment in &congregation.assignments {
@@ -279,21 +299,63 @@ pub fn declared_encodings(manifest: &str) -> Vec<(String, comline_core::encoding
         };
         for entry in &entries.assignments {
             let Value::Dictionary(fields) = &entry.value.value else { continue };
-            let kind = fields.assignments.iter().find_map(|field| match &field.value.value {
-                Value::String(kind) if field.value.key.text() == "kind" => match kind.value.trim_matches('"') {
-                    "format" => Some(EncodingKind::Format),
-                    "framing" => Some(EncodingKind::Framing),
-                    "handshake" => Some(EncodingKind::Handshake),
-                    _ => None,
-                },
-                _ => None,
-            });
+            let mut kind = None;
+            let mut map = std::collections::BTreeMap::new();
+            for field in &fields.assignments {
+                match (field.value.key.text().as_str(), &field.value.value) {
+                    ("kind", value) => {
+                        kind = match text(value).as_deref() {
+                            Some("format") => Some(EncodingKind::Format),
+                            Some("framing") => Some(EncodingKind::Framing),
+                            Some("handshake") => Some(EncodingKind::Handshake),
+                            _ => None,
+                        }
+                    }
+                    ("map", Value::Dictionary(languages)) => {
+                        for language in &languages.assignments {
+                            let Value::Dictionary(parts) = &language.value.value else { continue };
+                            let part = |name: &str| {
+                                parts.assignments.iter().find(|p| p.value.key.text() == name).and_then(|p| text(&p.value.value))
+                            };
+                            if let Some(ty) = part("type") {
+                                map.insert(
+                                    language.value.key.text(),
+                                    EncodingMapping { ty, package: part("package"), version: part("version") },
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
             if let Some(kind) = kind {
-                declared.push((entry.value.key.text(), kind));
+                declared.push(DeclaredEncoding { name: entry.value.key.text(), kind, map });
             }
         }
     }
     declared
+}
+
+/// The wire format `config.idp`'s text declares (`wire = { format = ... }`),
+/// or the default when it declares none or doesn't interpret.
+pub fn declared_wire_format(manifest: &str) -> String {
+    use comline_core::package::config::idl::grammar::Key;
+    use comline_core::package::config::ir::context::ProjectContext;
+    use comline_core::package::config::ir::frozen;
+    use comline_core::package::config::ir::interpreter::interpret::interpret_context;
+
+    let default = || comline_core::schema::idl::annotations::DEFAULT_FORMAT.to_string();
+    let Some(mut congregation) = parser::parse_idp(manifest).ok().and_then(|r| r.document) else {
+        return default();
+    };
+    congregation
+        .assignments
+        .retain(|a| !matches!(&a.value.key, Key::Identifier(id) if id.value == "settings"));
+    without_encodings(&mut congregation);
+    match interpret_context(&ProjectContext::with_config(congregation), None) {
+        Ok(units) => frozen::wire_format(&units).to_string(),
+        Err(_) => default(),
+    }
 }
 
 /// `settings = <dependency>::settings::<name>` resolved live, against
