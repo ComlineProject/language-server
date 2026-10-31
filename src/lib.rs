@@ -14,6 +14,7 @@ pub mod parser;
 pub mod util;
 
 pub mod analysis {
+    pub mod comline_toml;
     pub mod diagnostics;
     pub mod generation;
     pub mod import_check;
@@ -29,6 +30,7 @@ pub mod analysis {
 pub mod handlers {
     pub mod annotation_hover;
     pub mod code_actions;
+    pub mod comline_toml;
     pub mod completion;
     pub mod definition;
     pub mod formatting;

@@ -53,6 +53,12 @@ pub fn resolve(language: &str, version: &str) -> Result<Resolved, Unresolved> {
     registry().resolve(language, version)
 }
 
+/// The oldest version this build's generator for `language` handles - what
+/// `comline new` scaffolds - or `None` when this build has none.
+pub fn floor(language: &str) -> Option<&'static str> {
+    registry().targets().into_iter().find(|t| t.name.eq_ignore_ascii_case(language)).map(|t| t.version)
+}
+
 /// The diagnostics for one schema's `units` (its namespace already among
 /// them, or not - it isn't read), for every language in `languages`.
 pub fn feature_diagnostics(source: &str, units: &[FrozenUnit], languages: &[DeclaredLanguage]) -> Vec<Diagnostic> {

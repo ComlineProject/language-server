@@ -6,6 +6,7 @@ use std::sync::{Arc, RwLock};
 //
 use crate::analysis::imports::namespace_of;
 use crate::analysis::source::SourceFile;
+use crate::analysis::comline_toml::{self, is_comline_toml};
 use crate::analysis::stdlib;
 use crate::dependencies;
 use crate::document::DocumentStore;
@@ -76,7 +77,7 @@ impl Backend {
 
         let mut files: Vec<SourceFile> = open
             .iter()
-            .filter(|d| !is_idp(&d.uri) && !stdlib::is_std(&d.uri) && workspace::package_root(&d.uri) == root)
+            .filter(|d| is_schema(&d.uri) && !stdlib::is_std(&d.uri) && workspace::package_root(&d.uri) == root)
             .map(|d| SourceFile::local(d.uri.clone(), d.text.clone()))
             .collect();
         files.extend(stdlib::files(&stdlib::root()));
@@ -117,6 +118,43 @@ impl Backend {
         files
     }
 
+    /// What a `comline.toml` is checked against: the package in its
+    /// directory (its `config.idp`, schemas and dependencies), seen as one
+    /// of the package's schemas would see it.
+    fn comline_toml_context(&self, uri: &Url) -> comline_toml::Context {
+        let Some(dir) = uri.to_file_path().ok().and_then(|p| p.parent().map(PathBuf::from)) else {
+            return comline_toml::Context::default();
+        };
+        // A stand-in for a file under the package's `src/`: never read, it
+        // only places the view.
+        let probe = dir.join(comline_core::package::layout::SCHEMAS_DIR).join(".comline.toml.ids");
+        let view = match Url::from_file_path(&probe) {
+            Ok(probe) => self.package_view(&probe),
+            Err(()) => vec![],
+        };
+        let mut view: Vec<SourceFile> = view.into_iter().filter(|f| !stdlib::is_std(&f.uri)).collect();
+        // `package_view` finds the manifest from the schemas root; without a
+        // `src/` on disk, read it from beside `comline.toml` instead.
+        if !view.iter().any(|f| f.dependency.is_none() && crate::analysis::source::is_manifest(&f.uri)) {
+            if let Ok(manifest) = Url::from_file_path(dir.join(dependencies::MANIFEST)) {
+                if let Some(text) = self.text_of(&manifest) {
+                    view.push(SourceFile::local(manifest, text));
+                }
+            }
+        }
+        comline_toml::Context::from_files(&view, Some(dir))
+    }
+
+    /// A file's text: its open buffer, else its disk copy.
+    fn text_of(&self, url: &Url) -> Option<String> {
+        let key = workspace::path_key(url);
+        let open = self.documents.get_all_uris().into_iter().find(|u| workspace::path_key(u) == key);
+        match open.and_then(|u| self.documents.get(&u)) {
+            Some(document) => Some(document.text),
+            None => std::fs::read_to_string(url.to_file_path().ok()?).ok(),
+        }
+    }
+
     /// Re-read the dependencies of the package whose `src/` is `src_root`,
     /// from its `config.idp` buffer if open, else from disk.
     fn reindex_dependencies(&self, src_root: &std::path::Path) {
@@ -140,7 +178,7 @@ impl Backend {
             .documents
             .get_all_uris()
             .into_iter()
-            .filter(|u| !is_idp(u))
+            .filter(is_schema)
             .filter_map(|u| self.documents.get(&u).map(|d| (u, d.text)))
             .collect();
         let open_keys: HashSet<Option<String>> = open.iter().map(|(u, _)| workspace::path_key(u)).collect();
@@ -183,6 +221,12 @@ impl Backend {
 /// handle correctly on their own (see `comline-vscode`'s `idpSchema.ts`).
 fn is_idp(uri: &Url) -> bool {
     uri.path().ends_with(".idp")
+}
+
+/// Whether `uri` is a `.ids` schema: neither a `.idp` nor a `comline.toml`,
+/// which every schema handler must leave alone.
+fn is_schema(uri: &Url) -> bool {
+    !is_idp(uri) && !is_comline_toml(uri)
 }
 
 /// The `config.idp` of `uri`'s package (next to its `src/`), if it has one.
@@ -420,6 +464,11 @@ impl LanguageServer for Backend {
             use crate::handlers::idp_hover;
             return Ok(idp_hover::get_idp_hover_info(&document.text, position));
         }
+        if is_comline_toml(&uri) {
+            let Some(document) = self.documents.get(&uri) else { return Ok(None) };
+            let context = self.comline_toml_context(&uri);
+            return Ok(crate::handlers::comline_toml::hover(&document.text, position, &context));
+        }
 
         tracing::debug!("Hover request for {} at {:?}", uri, position);
 
@@ -446,6 +495,12 @@ impl LanguageServer for Backend {
 
         if is_idp(&uri) {
             return Ok(None); // handled client-side — see idpSchema.ts
+        }
+        if is_comline_toml(&uri) {
+            let Some(document) = self.documents.get(&uri) else { return Ok(None) };
+            let context = self.comline_toml_context(&uri);
+            let items = crate::handlers::comline_toml::completion(&document.text, position, &context);
+            return Ok((!items.is_empty()).then_some(CompletionResponse::Array(items)));
         }
 
         tracing::debug!("Completion request for {} at {:?}", uri, position);
@@ -478,7 +533,7 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
-        if is_idp(&uri) {
+        if !is_schema(&uri) {
             return Ok(None);
         }
 
@@ -506,7 +561,7 @@ impl LanguageServer for Backend {
         let position = params.text_document_position.position;
         let include_declaration = params.context.include_declaration;
 
-        if is_idp(&uri) {
+        if !is_schema(&uri) {
             return Ok(None);
         }
 
@@ -540,7 +595,7 @@ impl LanguageServer for Backend {
     ) -> Result<Option<DocumentSymbolResponse>> {
         let uri = params.text_document.uri;
 
-        if is_idp(&uri) {
+        if !is_schema(&uri) {
             return Ok(None);
         }
 
@@ -570,6 +625,9 @@ impl LanguageServer for Backend {
         // fully language-agnostic (plain line/brace text processing, no
         // dependency on `.ids`'s grammar types at all), and `.idp` nests
         // with `{}` the same way `.ids` does, so it applies correctly as-is.
+        if is_comline_toml(&uri) {
+            return Ok(None); // TOML, not braces
+        }
         tracing::debug!("Format request for {}", uri);
         
         let document = match self.documents.get(&uri) {
@@ -593,7 +651,7 @@ impl LanguageServer for Backend {
         let position = params.text_document_position.position;
         let new_name = params.new_name;
 
-        if is_idp(&uri) {
+        if !is_schema(&uri) {
             return Ok(None);
         }
 
@@ -621,7 +679,7 @@ impl LanguageServer for Backend {
     ) -> Result<Option<PrepareRenameResponse>> {
         let uri = params.text_document.uri;
 
-        if is_idp(&uri) {
+        if !is_schema(&uri) {
             return Ok(None);
         }
 
@@ -648,6 +706,21 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
 
+        if is_comline_toml(&uri) {
+            let manifest = uri
+                .to_file_path()
+                .ok()
+                .and_then(|p| Url::from_file_path(p.parent()?.join(dependencies::MANIFEST)).ok());
+            let manifest_text = manifest.as_ref().and_then(|m| self.text_of(m));
+            let actions = crate::handlers::comline_toml::code_actions(
+                &document.text,
+                &uri,
+                &params,
+                manifest.as_ref().zip(manifest_text.as_deref()),
+            );
+            return Ok((!actions.is_empty()).then_some(actions));
+        }
+
         if is_idp(&uri) {
             let Some(package_dir) = uri.to_file_path().ok().and_then(|p| p.parent().map(PathBuf::from)) else {
                 return Ok(None);
@@ -672,7 +745,7 @@ impl LanguageServer for Backend {
     ) -> Result<Option<SemanticTokensResult>> {
         let uri = params.text_document.uri;
 
-        if is_idp(&uri) {
+        if !is_schema(&uri) {
             return Ok(None);
         }
 
@@ -694,6 +767,10 @@ impl Backend {
     /// diagnostics only, no semantic validation pass — see
     /// `parser::IdpParseResult`'s doc comment for why).
     async fn parse_and_publish_diagnostics(&self, uri: &Url) {
+        if is_comline_toml(uri) {
+            self.publish_comline_toml_diagnostics(uri).await;
+            return;
+        }
         if is_idp(uri) {
             self.parse_and_publish_idp_diagnostics(uri).await;
             // A package manifest says what its dependencies are: what the
@@ -721,7 +798,7 @@ impl Backend {
             .documents
             .get_all_uris()
             .into_iter()
-            .filter(|u| !is_idp(u) && !stdlib::is_std(u))
+            .filter(|u| is_schema(u) && !stdlib::is_std(u))
             .filter_map(|u| self.documents.get(&u))
             .collect();
 
@@ -748,6 +825,19 @@ impl Backend {
                     .await;
             }
         }
+
+        // What an open `comline.toml` is checked against - the package's
+        // languages, encodings and schemas - may have just changed.
+        for uri in self.documents.get_all_uris().into_iter().filter(is_comline_toml) {
+            self.publish_comline_toml_diagnostics(&uri).await;
+        }
+    }
+
+    async fn publish_comline_toml_diagnostics(&self, uri: &Url) {
+        let Some(document) = self.documents.get(uri) else { return };
+        let context = self.comline_toml_context(uri);
+        let diagnostics = comline_toml::diagnostics(&document.text, &context);
+        self.client.publish_diagnostics(uri.clone(), diagnostics, Some(document.version)).await;
     }
 
     /// Re-publish every open `config.idp`'s diagnostics - whether a
