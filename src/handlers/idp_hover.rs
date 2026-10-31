@@ -86,12 +86,7 @@ fn dictionary(assignment: &Assignment) -> Option<&[Spanned<Assignment>]> {
 }
 
 fn key_text(key: &Key) -> String {
-    match key {
-        Key::Identifier(id) => id.value.clone(),
-        Key::Namespaced(ns) => ns.value.clone(),
-        Key::VersionMeta(vm) => vm.value.clone(),
-        Key::DependencyAddress(da) => da.value.clone(),
-    }
+    key.text()
 }
 
 /// A rendering of a `Value` that never panics on anything, unlike

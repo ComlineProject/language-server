@@ -147,6 +147,7 @@ pub fn declared_languages(manifest: &str) -> Vec<DeclaredLanguage> {
     congregation
         .assignments
         .retain(|a| !matches!(&a.value.key, Key::Identifier(id) if id.value == "settings"));
+    without_encodings(&mut congregation);
     let Ok(units) = interpret_context(&ProjectContext::with_config(congregation), None) else {
         return vec![];
     };
@@ -199,9 +200,10 @@ pub fn declared_settings(manifest: &str) -> comline_core::settings::SettingsDict
     // floor every package has underneath its own. Falling back to empty
     // made the editor claim `@framing` was allowed by default in exactly
     // the situations where it could not tell.
-    let Some(congregation) = parser::parse_idp(manifest).ok().and_then(|r| r.document) else {
+    let Some(mut congregation) = parser::parse_idp(manifest).ok().and_then(|r| r.document) else {
         return base_settings();
     };
+    without_encodings(&mut congregation);
 
     let is_cross_package_reference = congregation.assignments.iter().any(|a| {
         let a = &a.value;
@@ -230,13 +232,68 @@ pub fn declared_settings(manifest: &str) -> comline_core::settings::SettingsDict
 /// `None` for a manifest that is merely incomplete: a parse failure is
 /// already reported by the parse pass, and reporting it twice is worse
 /// than once.
-pub fn manifest_error(manifest: &str) -> Option<String> {
-    use comline_core::package::config::ir::context::ProjectContext;
+pub fn manifest_error(manifest: &str, path: Option<&std::path::Path>) -> Option<String> {
+    use comline_core::package::config::ir::context::{Origin, ProjectContext};
     use comline_core::package::config::ir::interpreter::interpret::interpret_context;
 
-    let congregation = parser::parse_idp(manifest).ok().and_then(|r| r.document)?;
-    let context = ProjectContext::with_config(congregation);
+    let mut congregation = parser::parse_idp(manifest).ok().and_then(|r| r.document)?;
+    let context = match path {
+        // On disk, `encodings` is checked as a build checks it: each
+        // profile read from beside the manifest.
+        Some(path) => ProjectContext::with_config_from_origin(Origin::Disk(path.to_path_buf()), congregation),
+        // Elsewhere there is no directory to read a profile from, so the
+        // entries are left to the build rather than reported as unreadable.
+        None => {
+            without_encodings(&mut congregation);
+            ProjectContext::with_config(congregation)
+        }
+    };
     interpret_context(&context, None).err().map(|e| e.to_string())
+}
+
+/// `congregation` without its `encodings` key. Core freezes an encoding by
+/// reading its profile from the package directory, which the text alone
+/// doesn't have, so the key is left out wherever only other keys matter.
+/// The names it declares are read by [`declared_encodings`].
+fn without_encodings(congregation: &mut comline_core::package::config::idl::grammar::Congregation) {
+    congregation.assignments.retain(|a| a.value.key.text() != "encodings");
+}
+
+/// Every encoding `config.idp`'s text declares under `encodings`, by name
+/// and kind (`"com.acme.x@1" = { kind = "framing", ... }`). Read from the
+/// text alone, with no profile read, so it works on any file the editor
+/// has: an entry whose `kind` isn't one of the three is left out, and the
+/// build reports it. Empty when the manifest doesn't parse (mid-edit).
+pub fn declared_encodings(manifest: &str) -> Vec<(String, comline_core::encodings::EncodingKind)> {
+    use comline_core::encodings::EncodingKind;
+    use comline_core::package::config::idl::grammar::Value;
+
+    let Some(congregation) = parser::parse_idp(manifest).ok().and_then(|r| r.document) else {
+        return vec![];
+    };
+    let mut declared = vec![];
+    for assignment in &congregation.assignments {
+        let assignment = &assignment.value;
+        let (true, Value::Dictionary(entries)) = (assignment.key.text() == "encodings", &assignment.value) else {
+            continue;
+        };
+        for entry in &entries.assignments {
+            let Value::Dictionary(fields) = &entry.value.value else { continue };
+            let kind = fields.assignments.iter().find_map(|field| match &field.value.value {
+                Value::String(kind) if field.value.key.text() == "kind" => match kind.value.trim_matches('"') {
+                    "format" => Some(EncodingKind::Format),
+                    "framing" => Some(EncodingKind::Framing),
+                    "handshake" => Some(EncodingKind::Handshake),
+                    _ => None,
+                },
+                _ => None,
+            });
+            if let Some(kind) = kind {
+                declared.push((entry.value.key.text(), kind));
+            }
+        }
+    }
+    declared
 }
 
 /// `settings = <dependency>::settings::<name>` resolved live, against
@@ -412,17 +469,39 @@ mod tests {
         // server died rather than reporting anything.
         let manifest = "congregation app\nspecification_version = 1\n\
             dependencies = {\n    std = {}\n}\n";
-        let err = manifest_error(manifest).expect("a reserved dependency name is an error");
+        let err = manifest_error(manifest, None).expect("a reserved dependency name is an error");
         assert!(err.contains("std"), "got: {err}");
         assert!(err.contains("reserved"), "got: {err}");
     }
 
     #[test]
     fn manifest_error_is_quiet_for_a_valid_or_incomplete_manifest() {
-        assert_eq!(manifest_error("congregation app\nspecification_version = 1\n"), None);
+        assert_eq!(manifest_error("congregation app\nspecification_version = 1\n", None), None);
         // Incomplete: the parse pass already reports this, so reporting it
         // here too would double up.
-        assert_eq!(manifest_error("congregation app\nsettings = {"), None);
+        assert_eq!(manifest_error("congregation app\nsettings = {", None), None);
+    }
+
+    #[test]
+    fn declared_encodings_reads_names_and_kinds() {
+        use comline_core::encodings::EncodingKind;
+        let manifest = "congregation app\nspecification_version = 1\n\
+            encodings = {\n    \"com.acme.x@1\" = { kind = \"format\" profile = \"x.json\" }\n    \
+            \"com.acme.y@1\" = { kind = \"nonsense\" profile = \"y.json\" }\n}\n";
+        assert_eq!(declared_encodings(manifest), vec![("com.acme.x@1".to_string(), EncodingKind::Format)]);
+        assert!(declared_encodings("congregation app\nencodings = {").is_empty());
+    }
+
+    #[test]
+    fn a_manifest_declaring_encodings_still_says_what_else_it_declares() {
+        // Freezing `encodings` reads each profile from the package
+        // directory, which a manifest's text alone doesn't have; the rest
+        // of the manifest is read regardless.
+        let manifest = "congregation app\nspecification_version = 1\n\
+            code_generation = {\n    languages = {\n        rust#1.85.0 = {}\n    }\n}\n\
+            encodings = {\n    \"com.acme.x@1\" = { kind = \"format\" profile = \"x.json\" }\n}\n";
+        assert_eq!(declared_languages(manifest).len(), 1);
+        assert_eq!(manifest_error(manifest, None), None);
     }
 
     fn consumer_manifest() -> String {

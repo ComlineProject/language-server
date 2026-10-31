@@ -791,7 +791,7 @@ impl Backend {
                     // `manifest_diagnostics` covers the dependency block
                     // in more detail, and anchors its range at the entry
                     // rather than at the top of the file.
-                    if let Some(message) = crate::analysis::source::manifest_error(&document.text) {
+                    if let Some(message) = crate::analysis::source::manifest_error(&document.text, document.uri.to_file_path().ok().as_deref()) {
                         if !lsp_diagnostics.iter().any(|d| d.message == message) {
                             lsp_diagnostics.push(Diagnostic {
                                 range: byte_range_to_lsp_range(&document.text, 0, 0),
