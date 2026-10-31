@@ -164,6 +164,13 @@ impl ProjectImports<'_, '_> {
 }
 
 impl validation::ImportLookup for ProjectImports<'_, '_> {
+    /// Declared by the package's `config.idp` or a dependency's, as far as
+    /// the view has them: core's own `encodings::is_declared`, read from
+    /// the manifests' text.
+    fn encoding_declared(&self, kind: comline_core::encodings::EncodingKind, name: &str) -> bool {
+        self.project.encodings.iter().any(|(n, k)| n == name && *k == kind)
+    }
+
     fn validator_targets(&self, name: &str) -> Option<Vec<TypeRef>> {
         let (doc, real_name) = self.declaration(name)?;
         declared_validator_targets(&self.project.docs[doc].document.0, &real_name)
@@ -1441,6 +1448,53 @@ struct User {
         assert!(
             !found.iter().any(|(msg, ..)| msg.contains("framing")),
             "expected no forbidden-annotation diagnostic once the manifest allows it, got {found:?}"
+        );
+    }
+
+    /// A manifest that allows `@framing` and declares one namespaced
+    /// encoding of each kind.
+    const ENCODINGS_MANIFEST: &str = "congregation pkg\nspecification_version = 1\n\
+        settings = {\n    protocol = {\n        annotations = {\n            \
+        framing = {\n                allowed = true\n            }\n        }\n    }\n}\n\
+        encodings = {\n    \"com.acme.frames@1\" = { kind = \"framing\" profile = \"profiles/frames.json\" }\n    \
+        \"com.acme.hello@1\" = { kind = \"handshake\" profile = \"profiles/hello.json\" }\n}\n";
+
+    #[test]
+    fn a_declared_namespaced_framing_and_handshake_are_accepted() {
+        let chat = "@framing = \"com.acme.frames@1\"\n@handshake = \"com.acme.hello@1\"\n\
+            protocol Chat {\n    function ping() -> string;\n}\n";
+        let found = project_messages(&[(MANIFEST_URI, ENCODINGS_MANIFEST), ("file:///pkg/src/chat.ids", chat)]);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn an_undeclared_namespaced_framing_is_still_an_error() {
+        // Declared as a handshake, not a framing; and one nothing declares.
+        for written in ["com.acme.hello@1", "com.acme.nope@1"] {
+            let chat = format!("@framing = \"{written}\"\nprotocol Chat {{\n    function ping() -> string;\n}}\n");
+            let found = project_messages(&[(MANIFEST_URI, ENCODINGS_MANIFEST), ("file:///pkg/src/chat.ids", &chat)]);
+            assert!(
+                found.iter().any(|(msg, ..)| msg.contains(&format!("framing `{written}` isn't declared"))),
+                "{found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dependency_declares_encodings_too() {
+        let dependency = crate::analysis::source::SourceFile::of_dependency(
+            Url::parse("file:///deps/frames/config.idp").unwrap(),
+            "congregation frames\nspecification_version = 1\n\
+             encodings = {\n    \"com.acme.frames@1\" = { kind = \"framing\" profile = \"p.json\" }\n}\n"
+                .to_string(),
+            "frames",
+            vec!["frames".to_string()],
+        );
+        let files = [dependency];
+        let project = Project::new(&files);
+        assert_eq!(
+            project.encodings,
+            vec![("com.acme.frames@1".to_string(), comline_core::encodings::EncodingKind::Framing)]
         );
     }
 

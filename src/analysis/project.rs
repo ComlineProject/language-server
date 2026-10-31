@@ -65,6 +65,10 @@ pub struct Project<'a> {
     /// a malformed shape) - `settings` above is left empty in that case.
     /// Surfaced as a diagnostic on the manifest's `settings` line.
     pub settings_error: Option<String>,
+    /// The encodings the package's `config.idp` and its dependencies'
+    /// declare under `encodings`, by name and kind - what `@framing` and
+    /// `@handshake` may name beyond the official ones.
+    pub encodings: Vec<(String, comline_core::encodings::EncodingKind)>,
 }
 
 /// A declaration [`Project::resolve`] found: which file (an index into
@@ -125,6 +129,7 @@ impl<'a> Project<'a> {
         Self {
             docs, unparsed: vec![], has_manifest: false, languages: vec![], dependencies: vec![],
             package_docs: BTreeMap::new(), settings: Default::default(), settings_error: None,
+            encodings: vec![],
         }
     }
 
@@ -143,6 +148,7 @@ impl<'a> Project<'a> {
             package_docs: BTreeMap::new(),
             settings: Default::default(),
             settings_error: None,
+            encodings: vec![],
         };
 
         for &input in &inputs {
@@ -150,12 +156,14 @@ impl<'a> Project<'a> {
                 match input.dependency {
                     // A dependency's own manifest: what its package says about itself.
                     Some(name) => {
+                        project.encodings.extend(source::declared_encodings(input.text));
                         if let Some(docs) = module_docs(input.text) {
                             project.package_docs.insert(name.to_string(), docs);
                         }
                     }
                     None => {
                         project.has_manifest = true;
+                        project.encodings.extend(source::declared_encodings(input.text));
                         project.dependencies = source::declared_dependencies(input.text);
                         project.languages = source::declared_languages(input.text);
                         match source::resolve_cross_package_settings(input.text, &inputs) {
