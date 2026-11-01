@@ -526,6 +526,13 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_package_id_is_what_a_build_would_reject() {
+        let err = manifest_error("congregation app\nid = \"nope\"\nspecification_version = 1\n", None)
+            .expect("a malformed id is an error");
+        assert!(err.contains("hex"), "{err}");
+    }
+
+    #[test]
     fn manifest_error_names_what_a_build_would_reject() {
         // Silent in the editor before: this was a panic in core, so the
         // server died rather than reporting anything.
@@ -539,6 +546,10 @@ mod tests {
     #[test]
     fn manifest_error_is_quiet_for_a_valid_or_incomplete_manifest() {
         assert_eq!(manifest_error("congregation app\nspecification_version = 1\n", None), None);
+        // The package id (core#159) is a key the editor knows; a malformed
+        // one is what a build refuses.
+        let id = "congregation app\nid = \"0123456789abcdef0123456789abcdef\"\nspecification_version = 1\n";
+        assert_eq!(manifest_error(id, None), None);
         // Incomplete: the parse pass already reports this, so reporting it
         // here too would double up.
         assert_eq!(manifest_error("congregation app\nsettings = {", None), None);
