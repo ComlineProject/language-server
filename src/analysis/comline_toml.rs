@@ -466,6 +466,13 @@ pub fn values_at(path: &[String]) -> Vec<String> {
         return vec![];
     };
     let node = deref(node);
+    // Of several types, the named values come from the string branch.
+    let node = node
+        .get("anyOf")
+        .or_else(|| node.get("oneOf"))
+        .and_then(Json::as_array)
+        .and_then(|branches| branches.iter().map(deref).find(|b| b.get("enum").is_some()))
+        .unwrap_or(node);
     if let Some(values) = node.get("enum").and_then(Json::as_array) {
         return values
             .iter()
@@ -622,7 +629,13 @@ impl Walk<'_, '_> {
     ) {
         let node = deref(node);
         let key = path.last().map(String::as_str).unwrap_or_default();
-        if let Some(branches) = node.get("anyOf").and_then(Json::as_array) {
+        // A value of one of several types (`validate_on_decode`: a mode, or
+        // `{ off = "why" }`): checked against the branch of its type.
+        if let Some(branches) = node
+            .get("anyOf")
+            .or_else(|| node.get("oneOf"))
+            .and_then(Json::as_array)
+        {
             let matching = branches
                 .iter()
                 .find(|b| deref(b).get("type").and_then(Json::as_str) == Some(value.type_name()));
@@ -664,6 +677,17 @@ impl Walk<'_, '_> {
             }
         }
         match value {
+            Node::Str(s) if key == "validate_on_decode" && s == "off" => {
+                // Not running validators is a give-up, and says why (core#98).
+                self.problem(
+                    span,
+                    BAD_VALUE,
+                    "`validate_on_decode = \"off\"` - not running validators is a give-up and \
+                     needs its reason: `validate_on_decode = { off = \"why\" }`"
+                        .to_string(),
+                    Some(json!({ "fix": FIX_REPLACE, "candidates": ["{ off = \"why\" }"] })),
+                );
+            }
             Node::Str(s) => {
                 if let Some(allowed) = node.get("enum").and_then(Json::as_array) {
                     let allowed: Vec<&str> = allowed.iter().filter_map(Json::as_str).collect();
@@ -1207,6 +1231,30 @@ mod tests {
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].code, Some(NumberOrString::String(SYNTAX.into())));
         assert_eq!(d[0].range.start.line, 0);
+    }
+
+    #[test]
+    fn validate_on_decode_off_is_a_give_up_with_its_reason() {
+        let ok = "[generate]\nvalidate_on_decode = { off = \"checked upstream\" }\n";
+        assert_eq!(codes(ok, &Context::default()), vec![]);
+        let found = codes(
+            "[generate]\nvalidate_on_decode = \"off\"\n",
+            &Context::default(),
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].0, BAD_VALUE);
+        assert!(found[0].1.contains("{ off = \"why\" }"), "{found:?}");
+        let found = codes(
+            "[generate]\nvalidate_on_decode = { of = \"x\" }\n",
+            &Context::default(),
+        );
+        assert_eq!(
+            found.iter().filter(|(c, _)| c == UNKNOWN_KEY).count(),
+            1,
+            "{found:?}"
+        );
+        let found = codes("[generate]\nvalidate_on_decode = 3\n", &Context::default());
+        assert_eq!(found[0].0, WRONG_TYPE, "{found:?}");
     }
 
     #[test]

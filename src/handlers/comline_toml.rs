@@ -496,8 +496,8 @@ mod tests {
             Position::new(1, 22),
             &context(),
         );
-        assert_eq!(labels(&items), ["off", "collect", "first"]);
-        assert_eq!(items[0].insert_text.as_deref(), Some("off"));
+        assert_eq!(labels(&items), ["collect", "first"]);
+        assert_eq!(items[0].insert_text.as_deref(), Some("collect"));
     }
 
     #[test]
