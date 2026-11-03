@@ -48,22 +48,28 @@ const COMPARISON: [char; 4] = ['=', '<', '>', '!'];
 pub(super) fn context(cleaned: &str, offset: usize, toks: &[(Tok, usize)]) -> Option<Body> {
     let inner = innermost_open_brace(toks, toks.len())?;
     let in_validate = inner > 0 && matches!(toks[inner - 1].0, Tok::Word("validate"));
-    let body = if in_validate { innermost_open_brace(toks, inner - 1)? } else { inner };
+    let body = if in_validate {
+        innermost_open_brace(toks, inner - 1)?
+    } else {
+        inner
+    };
     let header = validator_header(toks, body)?;
 
     let at_line_start = {
         let line = &cleaned[cleaned[..offset].rfind('\n').map_or(0, |i| i + 1)..offset];
         // The word being typed doesn't count.
-        line.trim_end_matches(|c: char| c.is_alphanumeric() || c == '_').trim().is_empty()
+        line.trim_end_matches(|c: char| c.is_alphanumeric() || c == '_')
+            .trim()
+            .is_empty()
     };
     let last = toks.last().map(|(t, _)| *t);
 
     if !in_validate {
         return Some(match last {
             Some(Tok::Punct(':')) => Body::Type,
-            _ if at_line_start || last == Some(Tok::Punct('{')) => {
-                Body::Member { has_validate: body_has_validate(cleaned, toks[body].1, offset) }
-            }
+            _ if at_line_start || last == Some(Tok::Punct('{')) => Body::Member {
+                has_validate: body_has_validate(cleaned, toks[body].1, offset),
+            },
             _ => Body::Nothing,
         });
     }
@@ -80,7 +86,10 @@ pub(super) fn context(cleaned: &str, offset: usize, toks: &[(Tok, usize)]) -> Op
             .rposition(|(t, _)| matches!(t, Tok::Word("and") | Tok::Word("or")))
             .map_or(0, |i| i + 1);
         return Some(condition(&after[start..], || {
-            (properties(cleaned, toks[body].1), targets(cleaned, toks, header, body))
+            (
+                properties(cleaned, toks[body].1),
+                targets(cleaned, toks, header, body),
+            )
         }));
     }
     Some(match last {
@@ -100,13 +109,17 @@ fn condition(
     match (at(2), at(1)) {
         (Some(Tok::Word("value")), Some(Tok::Punct('.'))) => {
             let (_, targets) = parts();
-            Body::ValueAccessor { has_length: targets.iter().any(|t| may_have_length(t)) }
+            Body::ValueAccessor {
+                has_length: targets.iter().any(|t| may_have_length(t)),
+            }
         }
         (Some(Tok::Word("params")), Some(Tok::Punct('.'))) => Body::Param(parts().0),
         (_, None) => Body::Operand,
         (_, Some(Tok::Punct(c))) if COMPARISON.contains(&c) => Body::Operand,
         (_, Some(Tok::Word(_))) | (_, Some(Tok::Punct('"')))
-            if comparison.iter().any(|(t, _)| matches!(t, Tok::Punct(c) if COMPARISON.contains(c))) =>
+            if comparison
+                .iter()
+                .any(|(t, _)| matches!(t, Tok::Punct(c) if COMPARISON.contains(c))) =>
         {
             Body::Connective
         }
@@ -141,7 +154,10 @@ fn innermost_open_brace(toks: &[(Tok, usize)], end: usize) -> Option<usize> {
 /// body: `validator NAME for ... {`.
 fn validator_header(toks: &[(Tok, usize)], brace: usize) -> Option<usize> {
     let start = toks[..brace].iter().rposition(|(t, _)| {
-        matches!(t, Tok::Word("validator") | Tok::Punct('{') | Tok::Punct('}') | Tok::Punct(';'))
+        matches!(
+            t,
+            Tok::Word("validator") | Tok::Punct('{') | Tok::Punct('}') | Tok::Punct(';')
+        )
     })?;
     matches!(toks[start].0, Tok::Word("validator")).then_some(start)
 }
@@ -211,7 +227,10 @@ fn targets(cleaned: &str, toks: &[(Tok, usize)], header: usize, brace: usize) ->
     };
     // Up to just before the `{`.
     let text = &cleaned[after_for..toks[brace].1 - 1];
-    text.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect()
+    text.split(',')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect()
 }
 
 /// The items for `body`; `None` for a type position, which the caller
@@ -219,10 +238,9 @@ fn targets(cleaned: &str, toks: &[(Tok, usize)], header: usize, brace: usize) ->
 pub(super) fn completions(body: Body) -> Option<Vec<CompletionItem>> {
     Some(match body {
         Body::Type => return None,
-        Body::Member { has_validate: false } => vec![snippet(
-            "validate",
-            "validate {\n\tassert($1, \"$2\")\n}",
-        )],
+        Body::Member {
+            has_validate: false,
+        } => vec![snippet("validate", "validate {\n\tassert($1, \"$2\")\n}")],
         Body::Member { has_validate: true } | Body::Nothing => Vec::new(),
         Body::Statement => vec![snippet("assert", "assert($1, \"$2\")$0")],
         Body::Operand => vec![
@@ -244,7 +262,10 @@ pub(super) fn completions(body: Body) -> Option<Vec<CompletionItem>> {
         Body::ValueAccessor { has_length } => {
             let mut items = Vec::new();
             if has_length {
-                items.push(accessor("length", "Its length: a string's characters, an array's elements"));
+                items.push(accessor(
+                    "length",
+                    "Its length: a string's characters, an array's elements",
+                ));
             }
             items.push(accessor("name", "The checked field's name, for a message"));
             items

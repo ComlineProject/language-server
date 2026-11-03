@@ -89,7 +89,8 @@ impl DeclKind {
 pub fn module(project: &Project, namespace: &[String]) -> Option<Module> {
     let first = namespace.first()?;
     let package = namespace.len() == 1
-        && (project.package_docs.contains_key(first) || project.docs.iter().any(|d| d.dependency == Some(first)));
+        && (project.package_docs.contains_key(first)
+            || project.docs.iter().any(|d| d.dependency == Some(first)));
     let schema = project.docs.iter().find(|d| d.namespace == namespace);
     let modules = children(project, namespace, false);
     if !package && schema.is_none() && modules.is_empty() {
@@ -122,17 +123,31 @@ pub fn children(project: &Project, base: &[String], local_only: bool) -> Vec<Chi
     }
 
     let mut found: BTreeMap<String, Seen> = BTreeMap::new();
-    for doc in project.docs.iter().filter(|d| !local_only || d.dependency.is_none()) {
+    for doc in project
+        .docs
+        .iter()
+        .filter(|d| !local_only || d.dependency.is_none())
+    {
         if let Some(name) = child_of(&doc.namespace, base) {
-            let seen = found.entry(name.to_string()).or_insert(Seen { schema: false, dependency: None });
+            let seen = found.entry(name.to_string()).or_insert(Seen {
+                schema: false,
+                dependency: None,
+            });
             seen.schema |= doc.namespace.len() == base.len() + 1;
             seen.dependency = seen.dependency.take().or(doc.dependency.map(String::from));
         }
     }
     // Schemas that exist but don't parse right now: their names still count.
-    for namespace in project.unparsed.iter().filter(|ns| !local_only || !is_dependency_root(project, ns.first())) {
+    for namespace in project
+        .unparsed
+        .iter()
+        .filter(|ns| !local_only || !is_dependency_root(project, ns.first()))
+    {
         if let Some(name) = child_of(namespace, base) {
-            let seen = found.entry(name.to_string()).or_insert(Seen { schema: false, dependency: None });
+            let seen = found.entry(name.to_string()).or_insert(Seen {
+                schema: false,
+                dependency: None,
+            });
             seen.schema |= namespace.len() == base.len() + 1;
         }
     }
@@ -142,20 +157,33 @@ pub fn children(project: &Project, base: &[String], local_only: bool) -> Vec<Chi
         .map(|(name, seen)| {
             let mut namespace = base.to_vec();
             namespace.push(name.clone());
-            let docs = project.docs.iter().find(|d| d.namespace == namespace).and_then(|d| d.docs.clone());
-            ChildModule { name, docs, schema: seen.schema, dependency: seen.dependency }
+            let docs = project
+                .docs
+                .iter()
+                .find(|d| d.namespace == namespace)
+                .and_then(|d| d.docs.clone());
+            ChildModule {
+                name,
+                docs,
+                schema: seen.schema,
+                dependency: seen.dependency,
+            }
         })
         .collect()
 }
 
 fn child_of<'n>(namespace: &'n [String], base: &[String]) -> Option<&'n str> {
-    (namespace.len() > base.len() && namespace.starts_with(base)).then(|| namespace[base.len()].as_str())
+    (namespace.len() > base.len() && namespace.starts_with(base))
+        .then(|| namespace[base.len()].as_str())
 }
 
 fn is_dependency_root(project: &Project, first: Option<&String>) -> bool {
     first.is_some_and(|first| {
         project.dependencies.iter().any(|d| d.name == *first)
-            || project.docs.iter().any(|d| d.dependency == Some(first.as_str()))
+            || project
+                .docs
+                .iter()
+                .any(|d| d.dependency == Some(first.as_str()))
     })
 }
 
@@ -189,12 +217,21 @@ pub fn declarations(doc: &ProjectDoc) -> Vec<Declared> {
 /// `None` for a `parent::` above the top. The legacy `import` predates
 /// relative prefixes, so its path is taken as written.
 pub fn resolve_path(segments: &[String], legacy: bool, uri: &Url) -> Option<Vec<String>> {
-    if legacy || !segments.first().is_some_and(|first| is_relative_prefix(first)) {
+    if legacy
+        || !segments
+            .first()
+            .is_some_and(|first| is_relative_prefix(first))
+    {
         return Some(segments.to_vec());
     }
-    let path = UsePath::Absolute(ScopedIdentifier { text: format!("{}::_", segments.join("::")) });
+    let path = UsePath::Absolute(ScopedIdentifier {
+        text: format!("{}::_", segments.join("::")),
+    });
     let resolver = ImportResolver::new(vec![], HashMap::new(), None);
-    let mut namespace = resolver.resolve_namespace(&path, &imports::namespace_of(uri)).ok()?.absolute_namespace;
+    let mut namespace = resolver
+        .resolve_namespace(&path, &imports::namespace_of(uri))
+        .ok()?
+        .absolute_namespace;
     namespace.pop();
     Some(namespace)
 }
@@ -212,14 +249,20 @@ pub fn is_relative_prefix(segment: &str) -> bool {
 /// symbol-based lookup handles that one). The one place this detection
 /// lives, so hover and go-to-definition can't disagree about which
 /// positions are "a module" versus "a declaration".
-pub fn path_module_at(source: &str, uri: &Url, offset: usize, project: &Project) -> Option<(Vec<String>, (usize, usize))> {
+pub fn path_module_at(
+    source: &str,
+    uri: &Url,
+    offset: usize,
+    project: &Project,
+) -> Option<(Vec<String>, (usize, usize))> {
     if in_comment_or_string(source, offset) {
         return None;
     }
     let at = path_at(source, offset)?;
     let keyword = statement_keyword(source, offset);
     // A lone word is a path only in a `use` line (`use types`).
-    if !(at.continues || at.segments.len() > 1 || keyword.is_some()) || is_alias(source, at.range.0) {
+    if !(at.continues || at.segments.len() > 1 || keyword.is_some()) || is_alias(source, at.range.0)
+    {
         return None;
     }
 
@@ -227,8 +270,8 @@ pub fn path_module_at(source: &str, uri: &Url, offset: usize, project: &Project)
 
     if !at.continues {
         let (last, parent) = namespace.split_last()?;
-        let declared =
-            module(project, parent).is_some_and(|parent| parent.declarations.iter().any(|d| d.name == *last));
+        let declared = module(project, parent)
+            .is_some_and(|parent| parent.declarations.iter().any(|d| d.name == *last));
         if declared {
             return None;
         }
@@ -239,11 +282,14 @@ pub fn path_module_at(source: &str, uri: &Url, offset: usize, project: &Project)
 
 /// `use` or `import` when the line `offset` is on starts with it.
 fn statement_keyword(source: &str, offset: usize) -> Option<&'static str> {
-    let line_start = source[..offset.min(source.len())].rfind('\n').map_or(0, |i| i + 1);
+    let line_start = source[..offset.min(source.len())]
+        .rfind('\n')
+        .map_or(0, |i| i + 1);
     let line = source[line_start..].trim_start();
-    ["use", "import"]
-        .into_iter()
-        .find(|keyword| line.strip_prefix(keyword).is_some_and(|rest| rest.starts_with(char::is_whitespace)))
+    ["use", "import"].into_iter().find(|keyword| {
+        line.strip_prefix(keyword)
+            .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+    })
 }
 
 /// Whether the word starting at `start` is the alias in `... as Alias`.
@@ -262,7 +308,10 @@ mod tests {
     const MANIFEST: &str = "congregation app\nspecification_version = 1\n\ndependencies = {\n    shared = {\n        path = \"../shared\"\n    }\n}\n";
 
     fn file(path: &str, text: &str) -> SourceFile {
-        SourceFile::local(Url::parse(&format!("file:///pkg/{path}")).unwrap(), text.to_string())
+        SourceFile::local(
+            Url::parse(&format!("file:///pkg/{path}")).unwrap(),
+            text.to_string(),
+        )
     }
 
     fn dependency(path: &str, text: &str, namespace: &[&str]) -> SourceFile {
@@ -305,8 +354,16 @@ mod tests {
         assert_eq!(
             types.declarations,
             vec![
-                Declared { kind: DeclKind::Struct, name: "User".into(), docs: Some("Someone.".into()) },
-                Declared { kind: DeclKind::Enum, name: "Kind".into(), docs: None },
+                Declared {
+                    kind: DeclKind::Struct,
+                    name: "User".into(),
+                    docs: Some("Someone.".into())
+                },
+                Declared {
+                    kind: DeclKind::Enum,
+                    name: "Kind".into(),
+                    docs: None
+                },
             ]
         );
     }
@@ -319,8 +376,11 @@ mod tests {
 
         assert_eq!(api.docs.as_deref(), Some("The API."));
         assert_eq!(api.declarations.len(), 1, "api.ids declares Root");
-        let children: Vec<(&str, bool, Option<&str>)> =
-            api.modules.iter().map(|m| (m.name.as_str(), m.schema, m.docs.as_deref())).collect();
+        let children: Vec<(&str, bool, Option<&str>)> = api
+            .modules
+            .iter()
+            .map(|m| (m.name.as_str(), m.schema, m.docs.as_deref()))
+            .collect();
         assert_eq!(children, [("common", true, None), ("v1", false, None)]);
     }
 
@@ -334,7 +394,11 @@ mod tests {
         assert!(v1.declarations.is_empty());
         assert_eq!(v1.modules.len(), 1);
         assert_eq!(v1.modules[0].name, "user");
-        assert_eq!(v1.modules[0].docs.as_deref(), Some("Users, v1."), "the child schema's own docs");
+        assert_eq!(
+            v1.modules[0].docs.as_deref(),
+            Some("Users, v1."),
+            "the child schema's own docs"
+        );
     }
 
     #[test]
@@ -360,7 +424,14 @@ mod tests {
         let files = files();
         let project = Project::new(files.iter());
         assert!(project.has_manifest);
-        assert_eq!(project.dependencies.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["shared"]);
+        assert_eq!(
+            project
+                .dependencies
+                .iter()
+                .map(|d| d.name.as_str())
+                .collect::<Vec<_>>(),
+            ["shared"]
+        );
         assert_eq!(project.package_docs.keys().collect::<Vec<_>>(), ["shared"]);
     }
 
@@ -379,23 +450,50 @@ mod tests {
         let project = Project::new(files.iter());
         let top = children(&project, &[], true);
         let names: Vec<&str> = top.iter().map(|m| m.name.as_str()).collect();
-        assert_eq!(names, ["api", "broken", "types"], "no dependencies when local only");
+        assert_eq!(
+            names,
+            ["api", "broken", "types"],
+            "no dependencies when local only"
+        );
         assert!(top.iter().find(|m| m.name == "broken").unwrap().schema);
     }
 
     #[test]
     fn relative_paths_resolve_like_the_build() {
         let uri = Url::parse("file:///pkg/src/api/v1/user.ids").unwrap();
-        assert_eq!(resolve_path(&ns("parent"), false, &uri), Some(ns("api::v1")));
-        assert_eq!(resolve_path(&ns("parent::common"), false, &uri), Some(ns("api::v1::common")));
-        assert_eq!(resolve_path(&ns("self"), false, &uri), Some(ns("api::v1::user")));
+        assert_eq!(
+            resolve_path(&ns("parent"), false, &uri),
+            Some(ns("api::v1"))
+        );
+        assert_eq!(
+            resolve_path(&ns("parent::common"), false, &uri),
+            Some(ns("api::v1::common"))
+        );
+        assert_eq!(
+            resolve_path(&ns("self"), false, &uri),
+            Some(ns("api::v1::user"))
+        );
         assert_eq!(resolve_path(&ns("package"), false, &uri), Some(vec![]));
-        assert_eq!(resolve_path(&ns("shared::models"), false, &uri), Some(ns("shared::models")));
-        assert_eq!(resolve_path(&ns("parent"), true, &uri), Some(ns("parent")), "`import` has no prefixes");
+        assert_eq!(
+            resolve_path(&ns("shared::models"), false, &uri),
+            Some(ns("shared::models"))
+        );
+        assert_eq!(
+            resolve_path(&ns("parent"), true, &uri),
+            Some(ns("parent")),
+            "`import` has no prefixes"
+        );
         let top = Url::parse("file:///pkg/src/types.ids").unwrap();
-        assert_eq!(resolve_path(&ns("parent"), false, &top), Some(vec![]), "one up from a top-level schema");
+        assert_eq!(
+            resolve_path(&ns("parent"), false, &top),
+            Some(vec![]),
+            "one up from a top-level schema"
+        );
         // Like the build: only the leading segment is a prefix, a second `parent`
         // is a module's name.
-        assert_eq!(resolve_path(&ns("parent::parent"), false, &top), Some(ns("parent")));
+        assert_eq!(
+            resolve_path(&ns("parent::parent"), false, &top),
+            Some(ns("parent"))
+        );
     }
 }

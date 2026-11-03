@@ -1,6 +1,6 @@
 use dashmap::DashMap;
-use std::sync::Arc;
 use lsp_types::Url;
+use std::sync::Arc;
 
 /// Represents a document in the workspace
 #[derive(Debug, Clone)]
@@ -61,7 +61,10 @@ impl DocumentStore {
 
     /// Get all document URIs
     pub fn get_all_uris(&self) -> Vec<Url> {
-        self.documents.iter().map(|entry| entry.key().clone()).collect()
+        self.documents
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect()
     }
 
     /// Check if a document exists

@@ -32,7 +32,11 @@ pub struct ProjectFile<'a> {
 
 impl<'a> ProjectFile<'a> {
     pub fn new(uri: &'a Url, source: &'a str) -> Self {
-        Self { uri, source, namespace: namespace_of(uri) }
+        Self {
+            uri,
+            source,
+            namespace: namespace_of(uri),
+        }
     }
 }
 
@@ -52,7 +56,11 @@ pub fn namespace_of(uri: &Url) -> Vec<String> {
         }
     }
 
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
     vec![stem]
 }
 
@@ -85,9 +93,15 @@ pub fn resolved_imports(document: &Document, current_namespace: &[String]) -> Ve
         .iter()
         .filter_map(|decl| match &decl.value {
             Declaration::Use(use_stmt) => {
-                let resolved = resolver.resolve_namespace(&use_stmt.path, current_namespace).ok()?;
+                let resolved = resolver
+                    .resolve_namespace(&use_stmt.path, current_namespace)
+                    .ok()?;
                 let alias = use_stmt.alias.as_ref().map(|a| a.name.text.clone());
-                Some(ResolvedUse { resolved, alias, span: decl.span })
+                Some(ResolvedUse {
+                    resolved,
+                    alias,
+                    span: decl.span,
+                })
             }
             Declaration::Import(import) => {
                 // The legacy `import pkg::Type` form - same shape as an
@@ -137,8 +151,7 @@ pub fn resolve_symbol<'a>(
             let candidate_namespace = &ns[..split_at];
             let remaining = &ns[split_at..];
 
-            let Some(sibling) = siblings.iter().find(|s| s.namespace == candidate_namespace)
-            else {
+            let Some(sibling) = siblings.iter().find(|s| s.namespace == candidate_namespace) else {
                 continue;
             };
 
@@ -150,9 +163,15 @@ pub fn resolve_symbol<'a>(
                 // symbol table, which never heard of "Msg"). Empty
                 // `remaining` means a whole-namespace/glob/multi import,
                 // where the symbol genuinely is named `name` in `sibling`.
-                let real_name =
-                    if remaining.is_empty() { name.to_string() } else { remaining.join("::") };
-                return Some(ResolvedSymbol { file: sibling, real_name });
+                let real_name = if remaining.is_empty() {
+                    name.to_string()
+                } else {
+                    remaining.join("::")
+                };
+                return Some(ResolvedSymbol {
+                    file: sibling,
+                    real_name,
+                });
             }
         }
     }
@@ -181,14 +200,18 @@ pub fn add_use_edit(source: &str, path: &str) -> TextEdit {
 
     let (position, new_text) = match last_use {
         // The last line, with no newline after it to insert behind.
-        Some(i) if i + 1 == lines.len() && !source.ends_with('\n') => {
-            (Position::new(i as u32, lines[i].chars().count() as u32), format!("\nuse {path}"))
-        }
+        Some(i) if i + 1 == lines.len() && !source.ends_with('\n') => (
+            Position::new(i as u32, lines[i].chars().count() as u32),
+            format!("\nuse {path}"),
+        ),
         Some(i) => (Position::new(i as u32 + 1, 0), format!("use {path}\n")),
         None => (Position::new(0, 0), format!("use {path}\n\n")),
     };
 
-    TextEdit { range: Range::new(position, position), new_text }
+    TextEdit {
+        range: Range::new(position, position),
+        new_text,
+    }
 }
 
 #[cfg(test)]
@@ -211,7 +234,10 @@ mod tests {
     #[test]
     fn namespace_of_a_nested_schema_path() {
         let uri = Url::parse("file:///pkg/src/chat/admin.ids").unwrap();
-        assert_eq!(namespace_of(&uri), vec!["chat".to_string(), "admin".to_string()]);
+        assert_eq!(
+            namespace_of(&uri),
+            vec!["chat".to_string(), "admin".to_string()]
+        );
     }
 
     #[test]
@@ -267,7 +293,10 @@ mod tests {
         let siblings = vec![file(&["chat"])];
 
         let glob = resolved_imports(&parse_use("use parent::*"), &current);
-        assert_eq!(glob[0].resolved.absolute_namespace, vec!["chat".to_string()]);
+        assert_eq!(
+            glob[0].resolved.absolute_namespace,
+            vec!["chat".to_string()]
+        );
         assert!(resolve_symbol("AnyName", &glob, &siblings).is_some());
 
         let list = resolved_imports(&parse_use("use parent::{User, Post}"), &current);
@@ -347,8 +376,14 @@ mod tests {
     }
 
     fn apply(source: &str, edit: &TextEdit) -> String {
-        let offset = crate::util::position_to_offset(source, edit.range.start).unwrap_or(source.len());
-        format!("{}{}{}", &source[..offset], edit.new_text, &source[offset..])
+        let offset =
+            crate::util::position_to_offset(source, edit.range.start).unwrap_or(source.len());
+        format!(
+            "{}{}{}",
+            &source[..offset],
+            edit.new_text,
+            &source[offset..]
+        )
     }
 
     #[test]
@@ -363,12 +398,18 @@ mod tests {
     #[test]
     fn add_use_goes_at_the_top_when_there_is_none() {
         let source = "struct S {\n    m: Z\n}\n";
-        assert_eq!(apply(source, &add_use_edit(source, "types::Z")), "use types::Z\n\nstruct S {\n    m: Z\n}\n");
+        assert_eq!(
+            apply(source, &add_use_edit(source, "types::Z")),
+            "use types::Z\n\nstruct S {\n    m: Z\n}\n"
+        );
     }
 
     #[test]
     fn add_use_after_a_final_use_line_with_no_newline() {
         let source = "use a::X";
-        assert_eq!(apply(source, &add_use_edit(source, "types::Z")), "use a::X\nuse types::Z");
+        assert_eq!(
+            apply(source, &add_use_edit(source, "types::Z")),
+            "use a::X\nuse types::Z"
+        );
     }
 }

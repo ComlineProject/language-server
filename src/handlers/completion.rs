@@ -10,13 +10,13 @@ use crate::analysis::project::{Project, ProjectDoc};
 use crate::analysis::source::ProjectSource;
 use crate::analysis::stdlib;
 use crate::analysis::symbols;
+use crate::analysis::symbols::Namespace;
 use crate::parser;
 use crate::util::{in_comment_or_string, position_to_offset};
+use comline_core::config_value::{self, ValueType};
 use comline_core::schema::idl::annotations::{self, AnnotationScope};
 use comline_core::schema::idl::vocabulary::{self, KeywordKind};
-use comline_core::config_value::{self, ValueType};
 use comline_core::settings::keys::{self, NameKind};
-use crate::analysis::symbols::Namespace;
 use lsp_types::{CompletionItem, CompletionItemKind, Position, SymbolKind, Url};
 use std::collections::BTreeSet;
 
@@ -50,7 +50,9 @@ pub fn get_completions_with_project<S: ProjectSource>(
     // In a `use` path, only what the path can go on with.
     if let Some(context) = use_path::context_at(source, offset) {
         return match context {
-            use_path::UseContext::Path(prefix) => use_path::completions(&prefix, source, uri, offset, other_files),
+            use_path::UseContext::Path(prefix) => {
+                use_path::completions(&prefix, source, uri, offset, other_files)
+            }
             use_path::UseContext::Nothing => Vec::new(),
         };
     }
@@ -79,7 +81,12 @@ pub fn get_completions_with_project<S: ProjectSource>(
             // that `:`/`->`/`(`.
             completions.extend(get_primitive_type_completions());
             completions.extend(get_type_completions(symbol_table.as_ref(), source));
-            completions.extend(get_import_completions(source, uri, other_files, symbol_table.as_ref()));
+            completions.extend(get_import_completions(
+                source,
+                uri,
+                other_files,
+                symbol_table.as_ref(),
+            ));
         }
         CompletionContext::TopLevel => {
             // Nothing (or only a partial keyword) typed yet, no enclosing
@@ -99,8 +106,10 @@ pub fn get_completions_with_project<S: ProjectSource>(
             completions.push(function_keyword_completion());
         }
         CompletionContext::AnnotationKey(scope) => {
-            completions
-                .extend(get_annotation_completions(scope, &effective_settings(source, offset, other_files)));
+            completions.extend(get_annotation_completions(
+                scope,
+                &effective_settings(source, offset, other_files),
+            ));
         }
         CompletionContext::ValidatorBody(body) => match validator_body::completions(body) {
             Some(items) => completions.extend(items),
@@ -108,7 +117,12 @@ pub fn get_completions_with_project<S: ProjectSource>(
             None => {
                 completions.extend(get_primitive_type_completions());
                 completions.extend(get_type_completions(symbol_table.as_ref(), source));
-                completions.extend(get_import_completions(source, uri, other_files, symbol_table.as_ref()));
+                completions.extend(get_import_completions(
+                    source,
+                    uri,
+                    other_files,
+                    symbol_table.as_ref(),
+                ));
             }
         },
         CompletionContext::ValidatorFor => {
@@ -131,7 +145,13 @@ pub fn get_completions_with_project<S: ProjectSource>(
             completions.extend(validators::names(source, uri, other_files));
         }
         CompletionContext::ValidatorArgument { validator, written } => {
-            completions.extend(validators::arguments(source, uri, other_files, &validator, &written));
+            completions.extend(validators::arguments(
+                source,
+                uri,
+                other_files,
+                &validator,
+                &written,
+            ));
         }
         CompletionContext::Unknown => {
             // Context couldn't be narrowed down — offer the same broad
@@ -140,7 +160,12 @@ pub fn get_completions_with_project<S: ProjectSource>(
             completions.extend(get_keyword_completions());
             completions.extend(get_primitive_type_completions());
             completions.extend(get_type_completions(symbol_table.as_ref(), source));
-            completions.extend(get_import_completions(source, uri, other_files, symbol_table.as_ref()));
+            completions.extend(get_import_completions(
+                source,
+                uri,
+                other_files,
+                symbol_table.as_ref(),
+            ));
         }
     }
 
@@ -167,24 +192,30 @@ fn get_import_completions<S: ProjectSource>(
     let mut items = Vec::new();
 
     for use_decl in uses_in(source, uri) {
-        let Target::Found(sibling, remaining) = import_check::target_of(&siblings, None, &use_decl) else {
+        let Target::Found(sibling, remaining) = import_check::target_of(&siblings, None, &use_decl)
+        else {
             continue; // can't list what a file outside the project declares
         };
         let doc = &siblings.docs[sibling];
         let symbols = &use_decl.resolved.symbols;
 
         // (name in scope here, name declared there)
-        let names: Vec<(String, String)> = if symbols == &["*"] || (symbols.is_empty() && remaining.is_empty()) {
-            type_names(doc).map(|n| (n.clone(), n)).collect()
-        } else if !symbols.is_empty() {
-            symbols.iter().filter(|n| declares_type(doc, n)).map(|n| (n.clone(), n.clone())).collect()
-        } else {
-            let real = remaining.join("::");
-            match declares_type(doc, &real) {
-                true => vec![(use_decl.alias.clone().unwrap_or_else(|| real.clone()), real)],
-                false => vec![],
-            }
-        };
+        let names: Vec<(String, String)> =
+            if symbols == &["*"] || (symbols.is_empty() && remaining.is_empty()) {
+                type_names(doc).map(|n| (n.clone(), n)).collect()
+            } else if !symbols.is_empty() {
+                symbols
+                    .iter()
+                    .filter(|n| declares_type(doc, n))
+                    .map(|n| (n.clone(), n.clone()))
+                    .collect()
+            } else {
+                let real = remaining.join("::");
+                match declares_type(doc, &real) {
+                    true => vec![(use_decl.alias.clone().unwrap_or_else(|| real.clone()), real)],
+                    false => vec![],
+                }
+            };
 
         for (label, real) in names {
             imported.insert((sibling, real.clone()));
@@ -204,7 +235,12 @@ fn get_import_completions<S: ProjectSource>(
                 continue;
             }
             let path = format!("{}::{}", doc.namespace.join("::"), name);
-            let mut item = type_item(doc, &name, name.clone(), format!("from {} — adds `use {path}`", origin(doc)));
+            let mut item = type_item(
+                doc,
+                &name,
+                name.clone(),
+                format!("from {} — adds `use {path}`", origin(doc)),
+            );
             // After everything in scope; a dependency's after the package's own.
             item.sort_text = Some(match doc.dependency {
                 Some(_) => format!("~~{name}"),
@@ -242,16 +278,29 @@ fn origin(doc: &ProjectDoc) -> String {
 
 /// Every struct, enum and type alias `doc` declares.
 fn type_names<'d>(doc: &'d ProjectDoc) -> impl Iterator<Item = String> + 'd {
-    doc.symbols.all_symbols().iter().filter(|s| is_type_kind(s.kind)).map(|s| s.name.clone())
+    doc.symbols
+        .all_symbols()
+        .iter()
+        .filter(|s| is_type_kind(s.kind))
+        .map(|s| s.name.clone())
 }
 
 fn type_item(doc: &ProjectDoc, real: &str, label: String, detail: String) -> CompletionItem {
-    let kind = match doc.symbols.get_in(real, Namespace::Declaration).map(|s| s.kind) {
+    let kind = match doc
+        .symbols
+        .get_in(real, Namespace::Declaration)
+        .map(|s| s.kind)
+    {
         Some(SymbolKind::ENUM) => CompletionItemKind::ENUM,
         Some(SymbolKind::TYPE_PARAMETER) => CompletionItemKind::CLASS,
         _ => CompletionItemKind::STRUCT,
     };
-    CompletionItem { label, kind: Some(kind), detail: Some(detail), ..Default::default() }
+    CompletionItem {
+        label,
+        kind: Some(kind),
+        detail: Some(detail),
+        ..Default::default()
+    }
 }
 
 /// Blank out `//` line comments, `/* ... */` block comments, and the
@@ -467,7 +516,9 @@ fn determine_context(source: &str, offset: usize) -> CompletionContext {
             // `enclosing_block` gives any other token there (nothing for
             // an enum, the broad fallback otherwise), rather than
             // inventing a separate rule just for a stray `@`.
-            Some(EnclosingBlock::Enum) | Some(EnclosingBlock::Settings) | Some(EnclosingBlock::Other) => {}
+            Some(EnclosingBlock::Enum)
+            | Some(EnclosingBlock::Settings)
+            | Some(EnclosingBlock::Other) => {}
         }
     }
 
@@ -548,7 +599,10 @@ fn validator_list_context(toks: &[(Tok, usize)]) -> Option<CompletionContext> {
                         _ => None,
                     })
                     .collect();
-                return Some(CompletionContext::ValidatorArgument { validator: validator.to_string(), written });
+                return Some(CompletionContext::ValidatorArgument {
+                    validator: validator.to_string(),
+                    written,
+                });
             }
             // Out of the annotation and into a declaration: no list here.
             Tok::Punct('{') | Tok::Punct('}') | Tok::Punct(';') => return None,
@@ -564,7 +618,10 @@ fn validator_list_context(toks: &[(Tok, usize)]) -> Option<CompletionContext> {
 fn validator_header_context(toks: &[(Tok, usize)]) -> Option<CompletionContext> {
     // The last `validator`, unless a block opened or closed since.
     let start = toks.iter().rposition(|(t, _)| {
-        matches!(t, Tok::Word("validator") | Tok::Punct('{') | Tok::Punct('}') | Tok::Punct(';'))
+        matches!(
+            t,
+            Tok::Word("validator") | Tok::Punct('{') | Tok::Punct('}') | Tok::Punct(';')
+        )
     })?;
     if !matches!(toks[start].0, Tok::Word("validator")) {
         return None;
@@ -748,7 +805,11 @@ fn declared_types_by_scan(source: &str) -> Vec<CompletionItem> {
                     _ => continue,
                 };
                 if !items.iter().any(|i: &CompletionItem| i.label == *name) {
-                    items.push(CompletionItem { label: name.to_string(), kind: Some(kind), ..Default::default() });
+                    items.push(CompletionItem {
+                        label: name.to_string(),
+                        kind: Some(kind),
+                        ..Default::default()
+                    });
                 }
             }
             _ => {}
@@ -777,7 +838,10 @@ fn get_primitive_type_completions() -> Vec<CompletionItem> {
 /// in a type position). `None` when the document doesn't currently parse —
 /// no custom names are available yet, but callers still have the
 /// primitive list.
-fn get_type_completions(symbol_table: Option<&symbols::SymbolTable>, source: &str) -> Vec<CompletionItem> {
+fn get_type_completions(
+    symbol_table: Option<&symbols::SymbolTable>,
+    source: &str,
+) -> Vec<CompletionItem> {
     let Some(symbol_table) = symbol_table else {
         return declared_types_by_scan(source);
     };
@@ -924,9 +988,7 @@ fn settings_path_prefix(source: &str, offset: usize) -> Vec<String> {
     let start = source[..end]
         .char_indices()
         .rev()
-        .take_while(|&(_, c)| {
-            c.is_alphanumeric() || matches!(c, '_' | '.' | '"' | ':' | '-')
-        })
+        .take_while(|&(_, c)| c.is_alphanumeric() || matches!(c, '_' | '.' | '"' | ':' | '-'))
         .last()
         .map(|(i, _)| i)
         .unwrap_or(end);
@@ -999,9 +1061,8 @@ fn get_settings_completions(source: &str, offset: usize) -> Vec<CompletionItem> 
     // scoped forms are offered only once a decl path has actually been
     // typed - which is also the point where the unscoped patterns stop
     // matching and the list used to go empty.
-    let (decl, _) = keys::DeclPath::split_prefix(
-        &typed.iter().map(String::as_str).collect::<Vec<_>>(),
-    );
+    let (decl, _) =
+        keys::DeclPath::split_prefix(&typed.iter().map(String::as_str).collect::<Vec<_>>());
     let patterns: Vec<(String, &comline_core::settings::catalog::FieldDoc)> = listing
         .iter()
         .flat_map(|f| {
@@ -1049,10 +1110,17 @@ fn get_settings_completions(source: &str, offset: usize) -> Vec<CompletionItem> 
 fn blank_line_at(source: &str, offset: usize) -> String {
     let offset = offset.min(source.len());
     let start = source[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
-    let end = source[offset..].find('\n').map(|i| offset + i).unwrap_or(source.len());
+    let end = source[offset..]
+        .find('\n')
+        .map(|i| offset + i)
+        .unwrap_or(source.len());
     let mut out = String::with_capacity(source.len());
     out.push_str(&source[..start]);
-    out.extend(source[start..end].chars().map(|c| if c == '\n' { c } else { ' ' }));
+    out.extend(
+        source[start..end]
+            .chars()
+            .map(|c| if c == '\n' { c } else { ' ' }),
+    );
     out.push_str(&source[end..]);
     out
 }
@@ -1089,7 +1157,9 @@ fn effective_settings<S: ProjectSource>(
         .and_then(|r| r.document)
         .or_else(|| {
             let without_cursor_line = blank_line_at(source, offset);
-            parser::parse(&without_cursor_line).ok().and_then(|r| r.document)
+            parser::parse(&without_cursor_line)
+                .ok()
+                .and_then(|r| r.document)
         });
     let Some(document) = document else {
         return package;
@@ -1164,12 +1234,12 @@ fn forbidding_key(
     let mut forbidding = None;
     for candidates in candidate_sets {
         // First key with an opinion wins, exactly as enforcement resolves.
-        let verdict = candidates.iter().find_map(|candidate| {
-            match effective.get_path(candidate) {
+        let verdict = candidates
+            .iter()
+            .find_map(|candidate| match effective.get_path(candidate) {
                 Some(SettingsValue::Bool(allowed)) => Some((*allowed, candidate.clone())),
                 _ => None,
-            }
-        });
+            });
         match verdict {
             Some((false, candidate)) => forbidding = Some(candidate),
             // Allowed, or no key at all: allowed by default.
@@ -1212,7 +1282,10 @@ enum CompletionContext {
     ValidatorName,
     /// Inside the parentheses of a `@validators` entry, before an argument's
     /// name: `validator` as written, and the arguments already given.
-    ValidatorArgument { validator: String, written: Vec<String> },
+    ValidatorArgument {
+        validator: String,
+        written: Vec<String>,
+    },
     /// Context couldn't be narrowed down.
     Unknown,
 }
@@ -1228,7 +1301,8 @@ fn declaration_after(cleaned: &str, offset: usize) -> Option<&str> {
         .lines()
         .map(str::trim_start)
         .find(|l| !l.is_empty() && !l.starts_with('@'))?;
-    line.split(|c: char| !c.is_alphanumeric() && c != '_').next()
+    line.split(|c: char| !c.is_alphanumeric() && c != '_')
+        .next()
 }
 
 #[cfg(test)]
@@ -1253,15 +1327,25 @@ mod tests {
         let uri = Url::parse("file:///test.ids").unwrap();
         let line = source.lines().count().saturating_sub(1) as u32;
         let column = source.rsplit('\n').next().unwrap_or("").len() as u32;
-        let line = if source.ends_with('\n') { line + 1 } else { line };
-        get_completions(source, &uri, Position::new(line, column)).into_iter().map(|c| c.label).collect()
+        let line = if source.ends_with('\n') {
+            line + 1
+        } else {
+            line
+        };
+        get_completions(source, &uri, Position::new(line, column))
+            .into_iter()
+            .map(|c| c.label)
+            .collect()
     }
 
     #[test]
     fn after_a_validators_name_only_for_is_offered() {
         // Offered every top-level keyword, none of which can go there.
         assert_eq!(labels_at_end("validator Positive "), ["for"]);
-        assert_eq!(labels_at_end("type N = u8\n\nvalidator Positive f"), ["for"]);
+        assert_eq!(
+            labels_at_end("type N = u8\n\nvalidator Positive f"),
+            ["for"]
+        );
     }
 
     #[test]
@@ -1269,7 +1353,10 @@ mod tests {
         let uri = Url::parse("file:///test.ids").unwrap();
         let item = get_completions("validator Positive ", &uri, Position::new(0, 19)).remove(0);
         assert_eq!(item.insert_text.as_deref(), Some("for "));
-        assert_eq!(item.command.map(|c| c.command).as_deref(), Some("editor.action.triggerSuggest"));
+        assert_eq!(
+            item.command.map(|c| c.command).as_deref(),
+            Some("editor.action.triggerSuggest")
+        );
     }
 
     #[test]
@@ -1281,10 +1368,19 @@ mod tests {
         ] {
             let labels = labels_at_end(source);
             assert!(labels.iter().any(|l| l == "u8"), "{source:?}: {labels:?}");
-            assert!(labels.iter().any(|l| l == "string"), "{source:?}: {labels:?}");
-            assert!(labels.iter().any(|l| l == "FixedNum"), "{source:?}: {labels:?}");
+            assert!(
+                labels.iter().any(|l| l == "string"),
+                "{source:?}: {labels:?}"
+            );
+            assert!(
+                labels.iter().any(|l| l == "FixedNum"),
+                "{source:?}: {labels:?}"
+            );
             for keyword in ["const", "struct", "validator", "for"] {
-                assert!(!labels.iter().any(|l| l == keyword), "{source:?} offered {keyword}: {labels:?}");
+                assert!(
+                    !labels.iter().any(|l| l == keyword),
+                    "{source:?} offered {keyword}: {labels:?}"
+                );
             }
         }
     }
@@ -1294,7 +1390,9 @@ mod tests {
         // The trailing field doesn't parse, so there's no symbol table; the
         // declarations are found by scanning instead. A name inside a block
         // isn't a declaration.
-        let labels = labels_at_end("type Id = u64\nenum Mode { Fast }\nstruct S {\n    struct_like: u8\n    a: ");
+        let labels = labels_at_end(
+            "type Id = u64\nenum Mode { Fast }\nstruct S {\n    struct_like: u8\n    a: ",
+        );
         assert!(labels.iter().any(|l| l == "Id"), "{labels:?}");
         assert!(labels.iter().any(|l| l == "Mode"), "{labels:?}");
         assert!(labels.iter().any(|l| l == "S"), "{labels:?}");
@@ -1326,13 +1424,20 @@ mod tests {
         assert_eq!(labels_at_end("validator V for u8 {\n    "), ["validate"]);
         // A second `validate` block isn't valid.
         let source = format!("{BODY_HEAD}    validate {{\n    }}\n    ");
-        assert!(labels_at_end(&source).is_empty(), "{:?}", labels_at_end(&source));
+        assert!(
+            labels_at_end(&source).is_empty(),
+            "{:?}",
+            labels_at_end(&source)
+        );
     }
 
     #[test]
     fn a_property_takes_a_type_and_nothing_else_is_offered() {
         let labels = labels_at_end(&format!("{BODY_HEAD}    max: "));
-        assert!(labels.iter().any(|l| l == "u32") && labels.iter().any(|l| l == "Name"), "{labels:?}");
+        assert!(
+            labels.iter().any(|l| l == "u32") && labels.iter().any(|l| l == "Name"),
+            "{labels:?}"
+        );
         // After a property's type, and in its default: nothing.
         assert!(labels_at_end(&format!("{BODY_HEAD}    max: u32 ")).is_empty());
         assert!(labels_at_end(&format!("{BODY_HEAD}    max: u32 = ")).is_empty());
@@ -1340,9 +1445,16 @@ mod tests {
 
     #[test]
     fn a_validate_block_offers_assert() {
-        assert_eq!(labels_at_end(&format!("{BODY_HEAD}    validate {{\n        ")), ["assert"]);
-        assert_eq!(labels_at_end(&format!("{BODY_HEAD}    validate {{\n        a")), ["assert"]);
-        let after_one = format!("{BODY_HEAD}    validate {{\n        assert(value > 0, \"x\")\n        ");
+        assert_eq!(
+            labels_at_end(&format!("{BODY_HEAD}    validate {{\n        ")),
+            ["assert"]
+        );
+        assert_eq!(
+            labels_at_end(&format!("{BODY_HEAD}    validate {{\n        a")),
+            ["assert"]
+        );
+        let after_one =
+            format!("{BODY_HEAD}    validate {{\n        assert(value > 0, \"x\")\n        ");
         assert_eq!(labels_at_end(&after_one), ["assert"]);
     }
 
@@ -1350,12 +1462,27 @@ mod tests {
     fn a_condition_offers_its_roots_accessors_and_properties() {
         let validate = format!("{BODY_HEAD}    validate {{\n        assert(");
         assert_eq!(labels_at_end(&validate), ["value", "params"]);
-        assert_eq!(labels_at_end(&format!("{validate}value >= ")), ["value", "params"]);
+        assert_eq!(
+            labels_at_end(&format!("{validate}value >= ")),
+            ["value", "params"]
+        );
         // `Name` is an alias of `string`, so `length` may apply.
-        assert_eq!(labels_at_end(&format!("{validate}value.")), ["length", "name"]);
-        assert_eq!(labels_at_end(&format!("{validate}params.")), ["min", "label"]);
-        assert_eq!(labels_at_end(&format!("{validate}value > params.min ")), ["and", "or"]);
-        assert_eq!(labels_at_end(&format!("{validate}value > 1 and ")), ["value", "params"]);
+        assert_eq!(
+            labels_at_end(&format!("{validate}value.")),
+            ["length", "name"]
+        );
+        assert_eq!(
+            labels_at_end(&format!("{validate}params.")),
+            ["min", "label"]
+        );
+        assert_eq!(
+            labels_at_end(&format!("{validate}value > params.min ")),
+            ["and", "or"]
+        );
+        assert_eq!(
+            labels_at_end(&format!("{validate}value > 1 and ")),
+            ["value", "params"]
+        );
         // The message is a string.
         assert!(labels_at_end(&format!("{validate}value > 1, ")).is_empty());
     }
@@ -1382,8 +1509,14 @@ mod tests {
     fn the_validator_snippet_writes_for() {
         // Without it, the inserted validator fails the build: it must name
         // the type it checks.
-        let validator = get_keyword_completions().into_iter().find(|c| c.label == "validator").unwrap();
-        assert_eq!(validator.insert_text.as_deref(), Some("validator $1 for $2 {\n\t$0\n}"));
+        let validator = get_keyword_completions()
+            .into_iter()
+            .find(|c| c.label == "validator")
+            .unwrap();
+        assert_eq!(
+            validator.insert_text.as_deref(),
+            Some("validator $1 for $2 {\n\t$0\n}")
+        );
     }
 
     #[test]
@@ -1396,7 +1529,10 @@ mod tests {
         // The actual regression check: `i8`/`i16`/`i32`/`i64` are not real
         // Comline syntax and must never be offered.
         for fake in ["i8", "i16", "i32", "i64"] {
-            assert!(!completions.iter().any(|c| c.label == fake), "offered {fake}");
+            assert!(
+                !completions.iter().any(|c| c.label == fake),
+                "offered {fake}"
+            );
         }
     }
 
@@ -1421,7 +1557,10 @@ mod tests {
         let uri = Url::parse("file:///test.ids").unwrap();
         let position = Position::new(0, 6);
 
-        let labels: Vec<String> = get_completions(source, &uri, position).into_iter().map(|c| c.label).collect();
+        let labels: Vec<String> = get_completions(source, &uri, position)
+            .into_iter()
+            .map(|c| c.label)
+            .collect();
         assert_eq!(labels, ["self", "parent", "package", "std"]);
     }
 
@@ -1523,10 +1662,24 @@ mod tests {
         let position = Position::new(1, 5);
 
         let completions = get_completions(source, &uri, position);
-        assert!(completions.iter().any(|c| c.label == "validators.<name>.allowed"), "{completions:?}");
-        assert!(completions.iter().any(|c| c.label == "validators.allowed"), "{completions:?}");
-        assert!(!completions.iter().any(|c| c.label == "validator"), "{completions:?}");
-        assert!(!completions.iter().any(|c| c.label == "struct"), "{completions:?}");
+        assert!(
+            completions
+                .iter()
+                .any(|c| c.label == "validators.<name>.allowed"),
+            "{completions:?}"
+        );
+        assert!(
+            completions.iter().any(|c| c.label == "validators.allowed"),
+            "{completions:?}"
+        );
+        assert!(
+            !completions.iter().any(|c| c.label == "validator"),
+            "{completions:?}"
+        );
+        assert!(
+            !completions.iter().any(|c| c.label == "struct"),
+            "{completions:?}"
+        );
     }
 
     #[test]
@@ -1540,7 +1693,12 @@ mod tests {
         let position = Position::new(1, 6);
 
         let completions = get_completions(source, &uri, position);
-        assert!(completions.iter().any(|c| c.label == "annotations.<name>.allowed"), "{completions:?}");
+        assert!(
+            completions
+                .iter()
+                .any(|c| c.label == "annotations.<name>.allowed"),
+            "{completions:?}"
+        );
     }
 
     #[test]
@@ -1562,7 +1720,10 @@ mod tests {
         assert!(!labels.contains(&"validators.<name>.allowed"), "{labels:?}");
         assert!(!labels.contains(&"validators.allowed"), "{labels:?}");
         assert!(!labels.contains(&"mode"), "{labels:?}");
-        assert!(!labels.iter().any(|l| l.starts_with("annotations")), "{labels:?}");
+        assert!(
+            !labels.iter().any(|l| l.starts_with("annotations")),
+            "{labels:?}"
+        );
     }
 
     #[test]
@@ -1588,8 +1749,14 @@ mod tests {
         let position = Position::new(1, 15);
 
         let completions = get_completions(source, &uri, position);
-        let allowed = completions.iter().find(|c| c.label == "allowed").expect("allowed should be offered");
-        assert_eq!(allowed.insert_text.as_deref(), Some("allowed = ${1:true}$0"));
+        let allowed = completions
+            .iter()
+            .find(|c| c.label == "allowed")
+            .expect("allowed should be offered");
+        assert_eq!(
+            allowed.insert_text.as_deref(),
+            Some("allowed = ${1:true}$0")
+        );
     }
 
     #[test]
@@ -1599,13 +1766,19 @@ mod tests {
         let position = Position::new(1, 5);
 
         let completions = get_completions(source, &uri, position);
-        let mode = completions.iter().find(|c| c.label == "mode").expect("mode should be offered");
+        let mode = completions
+            .iter()
+            .find(|c| c.label == "mode")
+            .expect("mode should be offered");
         // `mode`'s single legal keyword is still inserted finished rather
         // than as a one-item choice list - it just falls out of
         // `Keyword(["replace"])` now instead of being special-cased. The
         // trailing `$0` is the final cursor stop every entry now ends with.
         assert_eq!(mode.insert_text.as_deref(), Some("mode = replace$0"));
-        assert_eq!(mode.insert_text_format, Some(lsp_types::InsertTextFormat::SNIPPET));
+        assert_eq!(
+            mode.insert_text_format,
+            Some(lsp_types::InsertTextFormat::SNIPPET)
+        );
         assert_eq!(mode.kind, Some(CompletionItemKind::PROPERTY));
         assert!(mode.detail.is_some());
     }
@@ -1620,11 +1793,26 @@ mod tests {
             Some("framing = \"${1|jsonrpc,datagram,datagram@2|}\"$0")
         );
         const KEYS: &[DictKey] = &[
-            DictKey { key: "name", value: ValueType::StrEnum(&[]), required: true },
-            DictKey { key: "level", value: ValueType::Integer, required: true },
-            DictKey { key: "note", value: ValueType::Str, required: false },
+            DictKey {
+                key: "name",
+                value: ValueType::StrEnum(&[]),
+                required: true,
+            },
+            DictKey {
+                key: "level",
+                value: ValueType::Integer,
+                required: true,
+            },
+            DictKey {
+                key: "note",
+                value: ValueType::Str,
+                required: false,
+            },
         ];
-        assert_eq!(value_snippet(&ValueType::Dict(KEYS), 1).as_deref(), Some("{ name = \"${1||}\", level = ${2:0} }"));
+        assert_eq!(
+            value_snippet(&ValueType::Dict(KEYS), 1).as_deref(),
+            Some("{ name = \"${1||}\", level = ${2:0} }")
+        );
     }
 
     #[test]
@@ -1642,11 +1830,18 @@ mod tests {
             .find(|c| c.label == "framing")
             .expect("framing should still be offered, just marked");
         assert!(
-            framing.detail.as_deref().unwrap_or_default().contains("forbidden here by"),
+            framing
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("forbidden here by"),
             "got: {:?}",
             framing.detail
         );
-        assert_eq!(framing.tags, Some(vec![lsp_types::CompletionItemTag::DEPRECATED]));
+        assert_eq!(
+            framing.tags,
+            Some(vec![lsp_types::CompletionItemTag::DEPRECATED])
+        );
     }
 
     #[test]
@@ -1657,7 +1852,10 @@ mod tests {
         let position = Position::new(0, 1);
 
         let completions = get_completions(source, &uri, position);
-        let framing = completions.iter().find(|c| c.label == "framing").expect("offered");
+        let framing = completions
+            .iter()
+            .find(|c| c.label == "framing")
+            .expect("offered");
         assert_eq!(framing.tags, None, "got: {:?}", framing.detail);
     }
 
@@ -1691,7 +1889,10 @@ mod tests {
         assert!(labels.contains(&"annotations.<name>.allowed"), "{labels:?}");
         // `diagnostics` is project-wide only, so it must not be offered
         // under a declaration path.
-        assert!(!labels.iter().any(|l| l.starts_with("diagnostics")), "{labels:?}");
+        assert!(
+            !labels.iter().any(|l| l.starts_with("diagnostics")),
+            "{labels:?}"
+        );
     }
 
     #[test]
@@ -1775,7 +1976,10 @@ mod tests {
             .expect("framing is a protocol annotation");
         let snippet = annotation_insert_text(info).expect("framing takes a value");
         for spelling in config_value::spellings(&info.value) {
-            assert!(snippet.contains(spelling), "{spelling} missing from {snippet}");
+            assert!(
+                snippet.contains(spelling),
+                "{spelling} missing from {snippet}"
+            );
         }
     }
 
@@ -1784,22 +1988,34 @@ mod tests {
         let uri = Url::parse("file:///test.ids").unwrap();
         let text = source.lines().nth(line as usize).unwrap();
         let position = Position::new(line, text.chars().count() as u32);
-        get_completions(source, &uri, position).into_iter().map(|c| c.label).collect()
+        get_completions(source, &uri, position)
+            .into_iter()
+            .map(|c| c.label)
+            .collect()
     }
 
     #[test]
     fn above_a_type_alias_validators_and_deprecated_are_offered() {
         let source = "@\n@deprecated\ntype Name = string\n";
         let labels = labels_at_end_of(source, 0);
-        assert!(labels.iter().any(|l| l.contains("validators")), "{labels:?}");
-        assert!(labels.iter().any(|l| l.contains("deprecated")), "{labels:?}");
+        assert!(
+            labels.iter().any(|l| l.contains("validators")),
+            "{labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l.contains("deprecated")),
+            "{labels:?}"
+        );
         assert!(!labels.iter().any(|l| l.contains("framing")), "{labels:?}");
     }
 
     #[test]
     fn above_a_struct_validators_are_not_offered() {
         let labels = labels_at_end_of("@\nstruct S {\n}\n", 0);
-        assert!(!labels.iter().any(|l| l.contains("validators")), "{labels:?}");
+        assert!(
+            !labels.iter().any(|l| l.contains("validators")),
+            "{labels:?}"
+        );
         assert!(labels.iter().any(|l| l.contains("framing")), "{labels:?}");
     }
 
@@ -1808,7 +2024,11 @@ mod tests {
         let info = annotations::for_scope(AnnotationScope::Function)
             .find(|i| i.key == "idempotent")
             .expect("idempotent is a function annotation");
-        assert_eq!(annotation_insert_text(info), None, "a marker takes no `= value`");
+        assert_eq!(
+            annotation_insert_text(info),
+            None,
+            "a marker takes no `= value`"
+        );
     }
 
     #[test]
@@ -2001,14 +2221,26 @@ mod tests {
     fn a_validators_list_is_its_own_context() {
         let at_end = |source: &str| determine_context(source, source.len());
         assert_eq!(at_end("@validators = ["), CompletionContext::ValidatorName);
-        assert_eq!(at_end("@validators = [St"), CompletionContext::ValidatorName);
-        assert_eq!(at_end("struct S {\n    @validators = [A(min = 1), "), CompletionContext::ValidatorName);
+        assert_eq!(
+            at_end("@validators = [St"),
+            CompletionContext::ValidatorName
+        );
+        assert_eq!(
+            at_end("struct S {\n    @validators = [A(min = 1), "),
+            CompletionContext::ValidatorName
+        );
         assert_eq!(
             at_end("@validators = [A(min = 1, m"),
-            CompletionContext::ValidatorArgument { validator: "A".into(), written: vec!["min".into()] }
+            CompletionContext::ValidatorArgument {
+                validator: "A".into(),
+                written: vec!["min".into()]
+            }
         );
         // An argument's value: nothing to offer.
-        assert_eq!(at_end("@validators = [A(min = "), CompletionContext::DeclarationName);
+        assert_eq!(
+            at_end("@validators = [A(min = "),
+            CompletionContext::DeclarationName
+        );
         // Closed: back to whatever follows.
         assert_eq!(at_end("@validators = [A]\n"), CompletionContext::TopLevel);
     }
@@ -2022,25 +2254,39 @@ mod tests {
 
     #[test]
     fn a_validators_list_offers_validators_not_keywords() {
-        let items = validator_completions("validator Mine for string {\n}\n\n@validators = [St|]\ntype T = string\n");
+        let items = validator_completions(
+            "validator Mine for string {\n}\n\n@validators = [St|]\ntype T = string\n",
+        );
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(labels.contains(&"Mine"), "{labels:?}");
         assert!(labels.contains(&"StringBounds"), "{labels:?}");
-        assert!(!labels.contains(&"struct") && !labels.contains(&"settings"), "{labels:?}");
+        assert!(
+            !labels.contains(&"struct") && !labels.contains(&"settings"),
+            "{labels:?}"
+        );
 
         // Not imported: it brings its `use` along, after what's in scope.
         let bounds = items.iter().find(|i| i.label == "StringBounds").unwrap();
         let edit = &bounds.additional_text_edits.as_ref().expect("adds the use")[0];
         assert_eq!(edit.new_text, "use std::validators::StringBounds\n\n");
-        assert!(bounds.sort_text.as_deref().unwrap_or_default().starts_with('~'));
+        assert!(bounds
+            .sort_text
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with('~'));
     }
 
     #[test]
     fn an_imported_validator_needs_no_use() {
-        let items = validator_completions("use std::validators::StringBounds\n\n@validators = [|]\ntype T = string\n");
+        let items = validator_completions(
+            "use std::validators::StringBounds\n\n@validators = [|]\ntype T = string\n",
+        );
         let bounds = items.iter().find(|i| i.label == "StringBounds").unwrap();
         assert!(bounds.additional_text_edits.is_none(), "{bounds:?}");
-        assert_eq!(items.iter().filter(|i| i.label == "StringBounds").count(), 1);
+        assert_eq!(
+            items.iter().filter(|i| i.label == "StringBounds").count(),
+            1
+        );
     }
 
     #[test]
@@ -2069,14 +2315,23 @@ mod tests {
 
     #[test]
     fn test_context_detection() {
-        assert_eq!(determine_context("name: ", 6), CompletionContext::TypePosition);
+        assert_eq!(
+            determine_context("name: ", 6),
+            CompletionContext::TypePosition
+        );
         assert_eq!(determine_context("", 0), CompletionContext::TopLevel);
-        assert_eq!(determine_context("struct User {\n    ", 18), CompletionContext::StructBody);
+        assert_eq!(
+            determine_context("struct User {\n    ", 18),
+            CompletionContext::StructBody
+        );
         assert_eq!(
             determine_context("protocol Thing {\n    ", 21),
             CompletionContext::ProtocolBody
         );
-        assert_eq!(determine_context("struct ", 7), CompletionContext::DeclarationName);
+        assert_eq!(
+            determine_context("struct ", 7),
+            CompletionContext::DeclarationName
+        );
     }
 
     const TYPES: &str = "struct Message {\n    text: string\n}\n\nenum Kind {\n    A\n}\n\nprotocol Api {\n    function f();\n}\n";
@@ -2086,7 +2341,10 @@ mod tests {
     /// item from another file.
     fn imported_items(source: &str) -> Vec<(String, String, Option<String>)> {
         let uri = Url::parse("file:///pkg/src/chat.ids").unwrap();
-        let others = [(Url::parse("file:///pkg/src/types.ids").unwrap(), TYPES.to_string())];
+        let others = [(
+            Url::parse("file:///pkg/src/types.ids").unwrap(),
+            TYPES.to_string(),
+        )];
         let end = crate::util::offset_to_position(source, source.len());
 
         get_completions_with_project(source, &uri, end, &others)
@@ -2120,9 +2378,18 @@ mod tests {
     #[test]
     fn an_alias_is_offered_under_its_alias_only() {
         let items = imported_items("use types::Message as Msg\n\nstruct S {\n    m: ");
-        let labels: Vec<_> = items.iter().map(|(l, d, _)| (l.as_str(), d.as_str())).collect();
-        assert!(labels.contains(&("Msg", "`Message` from `types.ids`")), "{items:?}");
-        assert!(!labels.iter().any(|(l, _)| *l == "Message"), "already imported as `Msg`: {items:?}");
+        let labels: Vec<_> = items
+            .iter()
+            .map(|(l, d, _)| (l.as_str(), d.as_str()))
+            .collect();
+        assert!(
+            labels.contains(&("Msg", "`Message` from `types.ids`")),
+            "{items:?}"
+        );
+        assert!(
+            !labels.iter().any(|(l, _)| *l == "Message"),
+            "already imported as `Msg`: {items:?}"
+        );
     }
 
     #[test]
@@ -2136,7 +2403,9 @@ mod tests {
     fn without_a_use_every_type_adds_one_at_the_top() {
         let items = imported_items("struct S {\n    m: ");
         assert_eq!(items.len(), 2, "{items:?}");
-        assert!(items.iter().any(|(l, _, edit)| l == "Message" && edit.as_deref() == Some("use types::Message\n\n")));
+        assert!(items.iter().any(
+            |(l, _, edit)| l == "Message" && edit.as_deref() == Some("use types::Message\n\n")
+        ));
     }
 
     #[test]
@@ -2144,7 +2413,10 @@ mod tests {
         let source = "struct Message {\n    mine: bool\n}\n\nstruct S {\n    m: Message\n    n: ";
         let finished = format!("{source}bool\n}}\n");
         let uri = Url::parse("file:///pkg/src/chat.ids").unwrap();
-        let others = [(Url::parse("file:///pkg/src/types.ids").unwrap(), TYPES.to_string())];
+        let others = [(
+            Url::parse("file:///pkg/src/types.ids").unwrap(),
+            TYPES.to_string(),
+        )];
         let at = crate::util::offset_to_position(&finished, source.len());
 
         let labels: Vec<_> = get_completions_with_project(&finished, &uri, at, &others)
@@ -2181,8 +2453,14 @@ mod tests {
         let end = crate::util::offset_to_position(source, source.len());
 
         let items = get_completions_with_project(source, &uri, end, &others);
-        let user = items.iter().find(|c| c.label == "User").expect("the package's own type");
-        let thing = items.iter().find(|c| c.label == "Thing").expect("the dependency's type");
+        let user = items
+            .iter()
+            .find(|c| c.label == "User")
+            .expect("the package's own type");
+        let thing = items
+            .iter()
+            .find(|c| c.label == "Thing")
+            .expect("the dependency's type");
 
         assert_eq!(user.sort_text.as_deref(), Some("~User"));
         assert_eq!(thing.sort_text.as_deref(), Some("~~Thing"));

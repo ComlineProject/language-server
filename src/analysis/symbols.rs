@@ -1,9 +1,9 @@
 // Symbol table building from AST
 
-use comline_core::schema::idl::grammar::{Declaration, Document};
-use std::collections::HashMap;
 use crate::util::{byte_range_to_lsp_range, word_occurrences};
+use comline_core::schema::idl::grammar::{Declaration, Document};
 use lsp_types::{Location, SymbolKind, Url};
+use std::collections::HashMap;
 
 /// Which namespace a declared name lives in.
 ///
@@ -55,11 +55,17 @@ pub struct SymbolTable {
 
 impl SymbolTable {
     pub fn new() -> Self {
-        Self { symbols: Vec::new(), by_name: HashMap::new() }
+        Self {
+            symbols: Vec::new(),
+            by_name: HashMap::new(),
+        }
     }
 
     pub fn insert(&mut self, symbol: Symbol) {
-        self.by_name.entry(symbol.name.clone()).or_default().push(self.symbols.len());
+        self.by_name
+            .entry(symbol.name.clone())
+            .or_default()
+            .push(self.symbols.len());
         self.symbols.push(symbol);
     }
 
@@ -108,7 +114,10 @@ impl SymbolTable {
     /// does have the name ranges, so it narrows core's span back down to
     /// the thing that is actually wrong.
     pub fn name_span_of_decl(&self, decl_span: (usize, usize)) -> Option<(usize, usize)> {
-        self.symbols.iter().find(|s| s.decl_span == decl_span).map(|s| s.name_span)
+        self.symbols
+            .iter()
+            .find(|s| s.decl_span == decl_span)
+            .map(|s| s.name_span)
     }
 
     /// Every group of two or more symbols sharing a name *and* a namespace -
@@ -207,7 +216,10 @@ pub fn build_symbol_table(document: &Document, uri: &Url, source: &str) -> Symbo
                     e.name(),
                     SymbolKind::ENUM,
                     Namespace::Declaration,
-                    e.variants().iter().map(|v| v.identifier().text.clone()).collect(),
+                    e.variants()
+                        .iter()
+                        .map(|v| v.identifier().text.clone())
+                        .collect(),
                 ),
                 Declaration::Protocol(p) => (
                     "protocol",
@@ -216,16 +228,24 @@ pub fn build_symbol_table(document: &Document, uri: &Url, source: &str) -> Symbo
                     Namespace::Declaration,
                     p.functions().iter().map(|f| f.name()).collect(),
                 ),
-                Declaration::Const(c) => {
-                    ("const", c.name(), SymbolKind::CONSTANT, Namespace::Declaration, vec![])
-                }
+                Declaration::Const(c) => (
+                    "const",
+                    c.name(),
+                    SymbolKind::CONSTANT,
+                    Namespace::Declaration,
+                    vec![],
+                ),
                 // `TYPE_PARAMETER` is the closest LSP-standard fit for a
                 // transparent type alias - LSP 3.17's `SymbolKind` has no
                 // dedicated "type alias" entry, and other LSPs (e.g.
                 // rust-analyzer, for Rust's own `type`) use this same kind.
-                Declaration::TypeAlias(t) => {
-                    ("type", t.name(), SymbolKind::TYPE_PARAMETER, Namespace::Declaration, vec![])
-                }
+                Declaration::TypeAlias(t) => (
+                    "type",
+                    t.name(),
+                    SymbolKind::TYPE_PARAMETER,
+                    Namespace::Declaration,
+                    vec![],
+                ),
                 // `EVENT` is the closest LSP-standard fit: a named, raised/
                 // caught thing, same spirit as `TYPE_PARAMETER` standing in
                 // for a type alias above - LSP 3.17 has no dedicated
@@ -305,7 +325,9 @@ fn declaration_name_span(
         .into_iter()
         .find(|&i| {
             let before = text[..i].trim_end();
-            word_occurrences(before, keyword).last().is_some_and(|&k| k + keyword.len() == before.len())
+            word_occurrences(before, keyword)
+                .last()
+                .is_some_and(|&k| k + keyword.len() == before.len())
         })
         .map(|i| start + i)
         .unwrap_or(start);
@@ -334,24 +356,24 @@ enum Role {
         let uri = Url::parse("file:///test.ids").unwrap();
         let result = parser::parse(source).unwrap();
         assert!(result.is_ok());
-        
+
         let table = build_symbol_table(&result.document.unwrap(), &uri, source);
-        
+
         assert_eq!(table.len(), 2);
         assert!(table.get_in("User", Namespace::Declaration).is_some());
         assert!(table.get_in("Role", Namespace::Declaration).is_some());
-        
+
         let user_symbol = table.get_in("User", Namespace::Declaration).unwrap();
         assert_eq!(user_symbol.kind, SymbolKind::STRUCT);
         assert_eq!(user_symbol.children.len(), 2);
         assert!(user_symbol.children.contains(&"name".to_string()));
         assert!(user_symbol.children.contains(&"age".to_string()));
-        
+
         let role_symbol = table.get_in("Role", Namespace::Declaration).unwrap();
         assert_eq!(role_symbol.kind, SymbolKind::ENUM);
         assert_eq!(role_symbol.children.len(), 2);
     }
-    
+
     #[test]
     fn test_symbol_table_with_type_alias() {
         let source = "type UserId = u64\n";
@@ -376,9 +398,9 @@ protocol UserService {
 "#;
         let uri = Url::parse("file:///test.ids").unwrap();
         let result = parser::parse(source).unwrap();
-        
+
         let table = build_symbol_table(&result.document.unwrap(), &uri, source);
-        
+
         assert_eq!(table.len(), 1);
         let protocol = table.get_in("UserService", Namespace::Declaration).unwrap();
         assert_eq!(protocol.kind, SymbolKind::INTERFACE);
@@ -403,7 +425,10 @@ protocol UserService {
             SymbolKind::STRUCT
         );
         assert_eq!(
-            table.get_in("Test", Namespace::SettingsPreset).unwrap().kind,
+            table
+                .get_in("Test", Namespace::SettingsPreset)
+                .unwrap()
+                .kind,
             SymbolKind::OBJECT
         );
     }
@@ -419,10 +444,16 @@ protocol UserService {
         // Each `Test` resolves to the declaration it is part of, by
         // position - no name lookup to be ambiguous about.
         let struct_name = source.find("struct Test").unwrap() + "struct ".len();
-        assert_eq!(table.at_offset(struct_name).unwrap().kind, SymbolKind::STRUCT);
+        assert_eq!(
+            table.at_offset(struct_name).unwrap().kind,
+            SymbolKind::STRUCT
+        );
 
         let settings_name = source.find("settings Test").unwrap() + "settings ".len();
-        assert_eq!(table.at_offset(settings_name).unwrap().kind, SymbolKind::OBJECT);
+        assert_eq!(
+            table.at_offset(settings_name).unwrap().kind,
+            SymbolKind::OBJECT
+        );
 
         // Inside the struct body is not any declaration's own name.
         let body = source.find("a: string").unwrap();
@@ -454,7 +485,11 @@ protocol UserService {
         let result = parser::parse(source).unwrap();
 
         let table = build_symbol_table(&result.document.unwrap(), &uri, source);
-        let range = table.get_in("User", Namespace::Declaration).unwrap().location.range;
+        let range = table
+            .get_in("User", Namespace::Declaration)
+            .unwrap()
+            .location
+            .range;
 
         assert_eq!(range.start, lsp_types::Position::new(7, 7));
         assert_eq!(range.end, lsp_types::Position::new(7, 11));

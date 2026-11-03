@@ -23,8 +23,8 @@ use comline_core::package::config::dependency::DependencyConfig;
 use comline_core::schema::ir::frozen::unit::Guarantee;
 use comline_core::schema::ir::unverified;
 use lsp_types::{
-    CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams, Diagnostic, DiagnosticSeverity,
-    NumberOrString, TextEdit, Url, WorkspaceEdit,
+    CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams, Diagnostic,
+    DiagnosticSeverity, NumberOrString, TextEdit, Url, WorkspaceEdit,
 };
 use serde_json::json;
 
@@ -44,13 +44,19 @@ pub struct Unverified {
 /// Every `@unverified` protocol in the package at `dir`. Empty when it
 /// doesn't compile on its own.
 pub fn unverified_in(dir: &Path) -> Vec<Unverified> {
-    let compiled = panic::catch_unwind(AssertUnwindSafe(|| comline_core::package::build::compile_package_without_fetching(dir)));
-    let Ok(Ok(context)) = compiled else { return vec![] };
+    let compiled = panic::catch_unwind(AssertUnwindSafe(|| {
+        comline_core::package::build::compile_package_without_fetching(dir)
+    }));
+    let Ok(Ok(context)) = compiled else {
+        return vec![];
+    };
     let mut found = Vec::new();
     for schema in &context.schema_contexts {
         let schema = schema.borrow();
         let frozen = schema.frozen_schema.borrow();
-        let Some(units) = frozen.as_ref() else { continue };
+        let Some(units) = frozen.as_ref() else {
+            continue;
+        };
         for (protocol, set, reason) in unverified::protocols(units) {
             found.push(Unverified {
                 protocol: protocol.to_string(),
@@ -83,13 +89,24 @@ pub fn diagnostics(
         .iter()
         .map(|u| {
             let given_up = unverified::describe(&u.set);
-            let reason = u.reason.as_deref().map(|r| format!(": \"{r}\"")).unwrap_or_default();
+            let reason = u
+                .reason
+                .as_deref()
+                .map(|r| format!(": \"{r}\""))
+                .unwrap_or_default();
             let what = match dependency.accept_unverified.get(&u.protocol) {
-                None => format!("protocol `{}` is unverified, giving up {given_up}{reason}", u.protocol),
+                None => format!(
+                    "protocol `{}` is unverified, giving up {given_up}{reason}",
+                    u.protocol
+                ),
                 Some(old) => format!(
                     "protocol `{}` now gives up {given_up}{reason}; it was accepted for {}",
                     u.protocol,
-                    if old.is_empty() { "nothing".to_string() } else { unverified::describe(old) }
+                    if old.is_empty() {
+                        "nothing".to_string()
+                    } else {
+                        unverified::describe(old)
+                    }
                 ),
             };
             Diagnostic {
@@ -117,7 +134,9 @@ pub fn code_actions(
     let Some(dependencies) = crate::parser::parse_idp(manifest)
         .ok()
         .and_then(|r| r.document)
-        .and_then(|congregation| DependencyConfig::parse_dependencies(&congregation.assignments).ok())
+        .and_then(|congregation| {
+            DependencyConfig::parse_dependencies(&congregation.assignments).ok()
+        })
     else {
         return vec![];
     };
@@ -128,16 +147,26 @@ pub fn code_actions(
         if diagnostic.code != Some(NumberOrString::String(UNACCEPTED.to_string())) {
             continue;
         }
-        let Some(data) = &diagnostic.data else { continue };
-        let (Some(name), Some(protocol)) = (data["dependency"].as_str(), data["protocol"].as_str()) else {
+        let Some(data) = &diagnostic.data else {
             continue;
         };
-        let Some(dependency) = dependencies.get(name) else { continue };
-        let Some(dir) = dependency.package_dir(package_dir) else { continue };
+        let (Some(name), Some(protocol)) = (data["dependency"].as_str(), data["protocol"].as_str())
+        else {
+            continue;
+        };
+        let Some(dependency) = dependencies.get(name) else {
+            continue;
+        };
+        let Some(dir) = dependency.package_dir(package_dir) else {
+            continue;
+        };
         let unaccepted = unaccepted(dependency, unverified_in(&dir));
 
         if let Some(one) = unaccepted.iter().find(|u| u.protocol == protocol) {
-            let title = format!("Accept that `{protocol}` gives up {}", unverified::describe(&one.set));
+            let title = format!(
+                "Accept that `{protocol}` gives up {}",
+                unverified::describe(&one.set)
+            );
             actions.extend(action(title, uri, manifest, dependency, &[one], diagnostic));
         }
         if unaccepted.len() > 1 && !offered_all.contains(&name) {
@@ -168,7 +197,10 @@ fn action(
         kind: Some(CodeActionKind::QUICKFIX),
         diagnostics: Some(vec![diagnostic.clone()]),
         edit: Some(WorkspaceEdit {
-            changes: Some(HashMap::from([(uri.clone(), vec![edit_between(manifest, &updated)])])),
+            changes: Some(HashMap::from([(
+                uri.clone(),
+                vec![edit_between(manifest, &updated)],
+            )])),
             document_changes: None,
             change_annotations: None,
         }),
@@ -193,7 +225,10 @@ fn edit_between(before: &str, after: &str) -> TextEdit {
         .map(|(c, _)| c.len_utf8())
         .sum::<usize>();
     let range = byte_range_to_lsp_range(before, prefix, before.len() - suffix);
-    TextEdit { range, new_text: after[prefix..after.len() - suffix].to_string() }
+    TextEdit {
+        range,
+        new_text: after[prefix..after.len() - suffix].to_string(),
+    }
 }
 
 /// `{ A = ["schema_agreement"] B = [...] }`, as `config.idp` reads it.
@@ -208,32 +243,61 @@ fn render(accepted: &BTreeMap<String, Vec<Guarantee>>) -> String {
 /// `manifest` with `name`'s entry carrying `accept_unverified = accepted`,
 /// replacing one already there - the edit `comline accept` makes. Every
 /// other byte is left as written.
-fn with_acceptance(manifest: &str, name: &str, accepted: &BTreeMap<String, Vec<Guarantee>>) -> Option<String> {
+fn with_acceptance(
+    manifest: &str,
+    name: &str,
+    accepted: &BTreeMap<String, Vec<Guarantee>>,
+) -> Option<String> {
     let tokens = tokens(manifest);
     let (block_open, block_close) = block(&tokens, 0, manifest.len(), "dependencies")?;
     let (entry_open, entry_close) = block(&tokens, block_open, block_close, name)?;
     let line = format!("accept_unverified = {}", render(accepted));
 
     if let Some((start, end)) = block(&tokens, entry_open, entry_close, "accept_unverified") {
-        let key = tokens.iter().rev().find(|&&(t, at)| at < start && t == Token::Word("accept_unverified"))?.1;
-        return Some(format!("{}{line}{}", &manifest[..key], &manifest[end + 1..]));
+        let key = tokens
+            .iter()
+            .rev()
+            .find(|&&(t, at)| at < start && t == Token::Word("accept_unverified"))?
+            .1;
+        return Some(format!(
+            "{}{line}{}",
+            &manifest[..key],
+            &manifest[end + 1..]
+        ));
     }
 
     let line_start = manifest[..entry_close].rfind('\n').map_or(0, |i| i + 1);
     if manifest[line_start..entry_close].trim().is_empty() {
         // `}` on its own line: a new line before it, indented like the fields.
         let close_indent = indent_of(manifest, entry_close);
-        let step = if close_indent.starts_with('\t') { "\t" } else { "    " };
-        Some(format!("{}{close_indent}{step}{line}\n{}", &manifest[..line_start], &manifest[line_start..]))
+        let step = if close_indent.starts_with('\t') {
+            "\t"
+        } else {
+            "    "
+        };
+        Some(format!(
+            "{}{close_indent}{step}{line}\n{}",
+            &manifest[..line_start],
+            &manifest[line_start..]
+        ))
     } else {
         // A one-line entry (`a = { path = "../a" }`): keep it on one line.
-        Some(format!("{} {line} {}", manifest[..entry_close].trim_end(), &manifest[entry_close..]))
+        Some(format!(
+            "{} {line} {}",
+            manifest[..entry_close].trim_end(),
+            &manifest[entry_close..]
+        ))
     }
 }
 
 /// The `{` and matching `}` of `key = { ... }` directly inside the brackets
 /// at `open` and `close` (`0` and the length for the top level).
-fn block(tokens: &[(Token<'_>, usize)], open: usize, close: usize, key: &str) -> Option<(usize, usize)> {
+fn block(
+    tokens: &[(Token<'_>, usize)],
+    open: usize,
+    close: usize,
+    key: &str,
+) -> Option<(usize, usize)> {
     let inside: Vec<_> = tokens
         .iter()
         .copied()
@@ -284,7 +348,8 @@ enum Token<'a> {
 /// (`//`, `/* */`) and string contents.
 fn tokens(text: &str) -> Vec<(Token<'_>, usize)> {
     let bytes = text.as_bytes();
-    let is_word = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'_' | b':' | b'#' | b'@' | b'.');
+    let is_word =
+        |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'_' | b':' | b'#' | b'@' | b'.');
     let mut tokens = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
@@ -294,7 +359,9 @@ fn tokens(text: &str) -> Vec<(Token<'_>, usize)> {
                 i = text[i..].find('\n').map_or(bytes.len(), |n| i + n);
             }
             b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                i = text[i + 2..].find("*/").map_or(bytes.len(), |n| i + 2 + n + 2);
+                i = text[i + 2..]
+                    .find("*/")
+                    .map_or(bytes.len(), |n| i + 2 + n + 2);
             }
             b'"' => {
                 i += 1;
@@ -356,10 +423,19 @@ mod tests {
 
     fn apply(manifest: &str, edit: &TextEdit) -> String {
         let offset = |p: Position| {
-            let line_start: usize = manifest.split_inclusive('\n').take(p.line as usize).map(str::len).sum();
+            let line_start: usize = manifest
+                .split_inclusive('\n')
+                .take(p.line as usize)
+                .map(str::len)
+                .sum();
             line_start + p.character as usize
         };
-        format!("{}{}{}", &manifest[..offset(edit.range.start)], edit.new_text, &manifest[offset(edit.range.end)..])
+        format!(
+            "{}{}{}",
+            &manifest[..offset(edit.range.start)],
+            edit.new_text,
+            &manifest[offset(edit.range.end)..]
+        )
     }
 
     #[test]
@@ -373,12 +449,16 @@ mod tests {
                  accept_unverified = {{ Billing = [\"schema_agreement\", \"encoding_agreement\"] }}\n    }}\n}}\n"
             )
         );
-        assert_eq!(apply(&manifest, &edit_between(&manifest, &updated)), updated);
+        assert_eq!(
+            apply(&manifest, &edit_between(&manifest, &updated)),
+            updated
+        );
     }
 
     #[test]
     fn a_one_line_entry_stays_on_one_line() {
-        let manifest = format!("{HEAD}dependencies = {{\n    billing = {{ path = \"../billing\" }}\n}}\n");
+        let manifest =
+            format!("{HEAD}dependencies = {{\n    billing = {{ path = \"../billing\" }}\n}}\n");
         let updated = with_acceptance(&manifest, "billing", &both()).unwrap();
         assert_eq!(
             updated,
@@ -407,7 +487,8 @@ mod tests {
 
     #[test]
     fn a_missing_entry_gives_no_edit() {
-        let manifest = format!("{HEAD}dependencies = {{\n    other = {{ path = \"../other\" }}\n}}\n");
+        let manifest =
+            format!("{HEAD}dependencies = {{\n    other = {{ path = \"../other\" }}\n}}\n");
         assert_eq!(with_acceptance(&manifest, "billing", &both()), None);
         // A `billing` key that isn't directly in the block doesn't count.
         let nested = format!("{HEAD}dependencies = {{\n    other = {{ billing = {{ }} }}\n}}\n");
@@ -419,6 +500,12 @@ mod tests {
         let edit = edit_between("a = { x }\n", "a = { x y }\n");
         assert_eq!(edit.new_text, "y ");
         assert_eq!(edit.range.start, edit.range.end);
-        assert_eq!(edit.range.start, Position { line: 0, character: 8 });
+        assert_eq!(
+            edit.range.start,
+            Position {
+                line: 0,
+                character: 8
+            }
+        );
     }
 }

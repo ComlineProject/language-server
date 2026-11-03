@@ -3,8 +3,8 @@
 use crate::analysis::project::{Project, Target};
 use crate::analysis::source::ProjectSource;
 use crate::util::{byte_range_to_lsp_range, position_to_offset, word_range_at};
-use std::collections::HashMap;
 use lsp_types::{Position, Range, TextEdit, Url, WorkspaceEdit};
+use std::collections::HashMap;
 
 /// Rename a symbol at a position to a new name, considering only this file.
 pub fn rename_symbol(
@@ -37,19 +37,32 @@ pub fn rename_symbol_with_project<S: ProjectSource>(
     let project = Project::with_active(uri, source, other_files);
     let (target, _) = renameable_at(&project, source, uri, position)?;
 
-    let edit = |range| TextEdit { range, new_text: new_name.to_string() };
+    let edit = |range| TextEdit {
+        range,
+        new_text: new_name.to_string(),
+    };
 
     let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
     let declaration = project.declaration(&target)?;
-    changes.entry(declaration.uri).or_default().push(edit(declaration.range));
+    changes
+        .entry(declaration.uri)
+        .or_default()
+        .push(edit(declaration.range));
 
     for reference in project.references(&target) {
         if reference.spelled_as_target {
-            changes.entry(reference.location.uri).or_default().push(edit(reference.location.range));
+            changes
+                .entry(reference.location.uri)
+                .or_default()
+                .push(edit(reference.location.range));
         }
     }
 
-    Some(WorkspaceEdit { changes: Some(changes), document_changes: None, change_annotations: None })
+    Some(WorkspaceEdit {
+        changes: Some(changes),
+        document_changes: None,
+        change_annotations: None,
+    })
 }
 
 /// The range of the word a rename at `position` would start from, or
@@ -68,7 +81,12 @@ pub fn prepare_rename_with_project<S: ProjectSource>(
 
 /// The declaration a rename at `position` targets, and the cursor word's
 /// range - shared by prepare-rename and rename so they always agree.
-fn renameable_at(project: &Project, source: &str, uri: &Url, position: Position) -> Option<(Target, Range)> {
+fn renameable_at(
+    project: &Project,
+    source: &str,
+    uri: &Url,
+    position: Position,
+) -> Option<(Target, Range)> {
     let offset = position_to_offset(source, position)?;
     let (start, end) = word_range_at(source, offset)?;
     let word = &source[start..end];
@@ -90,7 +108,7 @@ fn is_valid_identifier(name: &str) -> bool {
     if name.is_empty() {
         return false;
     }
-    
+
     // First character must be letter or underscore
     let mut chars = name.chars();
     if let Some(first) = chars.next() {
@@ -98,7 +116,7 @@ fn is_valid_identifier(name: &str) -> bool {
             return false;
         }
     }
-    
+
     // Rest must be alphanumeric or underscore
     chars.all(|c| c.is_alphanumeric() || c == '_')
 }
@@ -106,7 +124,7 @@ fn is_valid_identifier(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn renaming_a_struct_leaves_a_same_named_settings_preset_alone() {
         // `renameable_at` resolved by name, so renaming either of these
@@ -127,7 +145,10 @@ mod tests {
         let lines: Vec<u32> = edits.iter().map(|e| e.range.start.line).collect();
         assert!(lines.contains(&0), "the declaration: {lines:?}");
         assert!(lines.contains(&9), "the reference: {lines:?}");
-        assert!(!lines.contains(&4), "must not touch `settings Test`: {lines:?}");
+        assert!(
+            !lines.contains(&4),
+            "must not touch `settings Test`: {lines:?}"
+        );
     }
 
     #[test]
@@ -143,41 +164,41 @@ struct Request {
 "#;
         let uri = Url::parse("file:///test.ids").unwrap();
         let position = Position::new(1, 8); // On "User"
-        
+
         let edit = rename_symbol(source, &uri, position, "Person");
         assert!(edit.is_some());
-        
+
         let edit = edit.unwrap();
         let changes = edit.changes.unwrap();
         let edits = changes.get(&uri).unwrap();
-        
+
         // Should have at least 2 edits (declaration + 1 reference)
         assert!(edits.len() >= 2);
         assert!(edits.iter().all(|e| e.new_text == "Person"));
     }
-    
+
     #[test]
     fn test_rename_invalid_identifier() {
         let source = "struct User {}";
         let uri = Url::parse("file:///test.ids").unwrap();
         let position = Position::new(0, 8);
-        
+
         // Invalid names should return None
         assert!(rename_symbol(source, &uri, position, "123Invalid").is_none());
         assert!(rename_symbol(source, &uri, position, "My-Type").is_none());
         assert!(rename_symbol(source, &uri, position, "").is_none());
-        
+
         // Valid names should work
         assert!(rename_symbol(source, &uri, position, "ValidName").is_some());
         assert!(rename_symbol(source, &uri, position, "_Private").is_some());
     }
-    
+
     #[test]
     fn test_identifier_validation() {
         assert!(is_valid_identifier("User"));
         assert!(is_valid_identifier("_private"));
         assert!(is_valid_identifier("Type123"));
-        
+
         assert!(!is_valid_identifier("123Type"));
         assert!(!is_valid_identifier("My-Type"));
         assert!(!is_valid_identifier(""));
@@ -191,7 +212,9 @@ struct Request {
             .into_iter()
             .flat_map(|(uri, edits)| {
                 let file = uri.path().rsplit('/').next().unwrap().to_string();
-                edits.into_iter().map(move |e| (file.clone(), e.range.start.line, e.range.start.character))
+                edits
+                    .into_iter()
+                    .map(move |e| (file.clone(), e.range.start.line, e.range.start.character))
             })
             .collect();
         out.sort();
@@ -209,7 +232,11 @@ struct Request {
         let edit = rename_symbol(source, &uri, Position::new(5, 12), "Person").unwrap();
         assert_eq!(
             edits_by_file(edit),
-            vec![("test.ids".into(), 0, 7), ("test.ids".into(), 5, 10), ("test.ids".into(), 6, 9)]
+            vec![
+                ("test.ids".into(), 0, 7),
+                ("test.ids".into(), 5, 10),
+                ("test.ids".into(), 6, 9)
+            ]
         );
     }
 
@@ -223,14 +250,32 @@ struct Request {
 
         let types_uri = Url::parse("file:///types.ids").unwrap();
         let project = vec![
-            (Url::parse("file:///chat.ids").unwrap(), chat_source.to_string()),
-            (Url::parse("file:///aliased.ids").unwrap(), aliased_source.to_string()),
-            (Url::parse("file:///uses_other.ids").unwrap(), other_source.to_string()),
-            (Url::parse("file:///other.ids").unwrap(), other_decl.to_string()),
+            (
+                Url::parse("file:///chat.ids").unwrap(),
+                chat_source.to_string(),
+            ),
+            (
+                Url::parse("file:///aliased.ids").unwrap(),
+                aliased_source.to_string(),
+            ),
+            (
+                Url::parse("file:///uses_other.ids").unwrap(),
+                other_source.to_string(),
+            ),
+            (
+                Url::parse("file:///other.ids").unwrap(),
+                other_decl.to_string(),
+            ),
         ];
 
-        let edit = rename_symbol_with_project(types_source, &types_uri, Position::new(0, 9), "Envelope", &project)
-            .unwrap();
+        let edit = rename_symbol_with_project(
+            types_source,
+            &types_uri,
+            Position::new(0, 9),
+            "Envelope",
+            &project,
+        )
+        .unwrap();
         assert_eq!(
             edits_by_file(edit),
             vec![
@@ -254,7 +299,10 @@ struct Request {
             &aliased_uri,
             Position::new(3, 8),
             "Other",
-            &[(Url::parse("file:///types.ids").unwrap(), types_source.to_string())],
+            &[(
+                Url::parse("file:///types.ids").unwrap(),
+                types_source.to_string(),
+            )],
         );
         assert!(edit.is_none());
     }
@@ -262,16 +310,37 @@ struct Request {
     #[test]
     fn test_prepare_rename_returns_the_word_range_or_nothing() {
         let types_source = "struct Message {\n    text: string\n}\n";
-        let aliased_source = "use types::Message as Msg\n\nstruct T {\n    m: Msg\n    s: string\n}\n";
+        let aliased_source =
+            "use types::Message as Msg\n\nstruct T {\n    m: Msg\n    s: string\n}\n";
         let aliased_uri = Url::parse("file:///aliased.ids").unwrap();
-        let project = [(Url::parse("file:///types.ids").unwrap(), types_source.to_string())];
+        let project = [(
+            Url::parse("file:///types.ids").unwrap(),
+            types_source.to_string(),
+        )];
 
-        let range = prepare_rename_with_project(aliased_source, &aliased_uri, Position::new(0, 14), &project)
-            .expect("`Message` in the `use` line is renameable");
+        let range = prepare_rename_with_project(
+            aliased_source,
+            &aliased_uri,
+            Position::new(0, 14),
+            &project,
+        )
+        .expect("`Message` in the `use` line is renameable");
         assert_eq!((range.start.character, range.end.character), (11, 18));
 
-        assert!(prepare_rename_with_project(aliased_source, &aliased_uri, Position::new(3, 8), &project).is_none());
-        assert!(prepare_rename_with_project(aliased_source, &aliased_uri, Position::new(4, 8), &project).is_none());
+        assert!(prepare_rename_with_project(
+            aliased_source,
+            &aliased_uri,
+            Position::new(3, 8),
+            &project
+        )
+        .is_none());
+        assert!(prepare_rename_with_project(
+            aliased_source,
+            &aliased_uri,
+            Position::new(4, 8),
+            &project
+        )
+        .is_none());
     }
 
     fn package_with_dependency(active_uri: &str) -> Vec<crate::analysis::source::SourceFile> {
@@ -298,9 +367,16 @@ struct Request {
         let chat_uri = Url::parse("file:///pkg/src/chat.ids").unwrap();
         let others = package_with_dependency("file:///pkg/src/chat.ids");
 
-        assert!(prepare_rename_with_project(chat, &chat_uri, Position::new(3, 8), &others).is_none());
-        assert!(rename_symbol_with_project(chat, &chat_uri, Position::new(3, 8), "Other", &others).is_none());
+        assert!(
+            prepare_rename_with_project(chat, &chat_uri, Position::new(3, 8), &others).is_none()
+        );
+        assert!(
+            rename_symbol_with_project(chat, &chat_uri, Position::new(3, 8), "Other", &others)
+                .is_none()
+        );
         // ...while the package's own symbols still rename.
-        assert!(prepare_rename_with_project(chat, &chat_uri, Position::new(2, 8), &others).is_some());
+        assert!(
+            prepare_rename_with_project(chat, &chat_uri, Position::new(2, 8), &others).is_some()
+        );
     }
 }

@@ -20,7 +20,13 @@ pub struct AnnotationHover {
 
 impl AnnotationHover {
     pub fn new(key: impl Into<String>) -> Self {
-        Self { key: key.into(), description: None, default: None, value: None, notes: Vec::new() }
+        Self {
+            key: key.into(),
+            description: None,
+            default: None,
+            value: None,
+            notes: Vec::new(),
+        }
     }
 
     pub fn description(mut self, text: impl Into<String>) -> Self {
@@ -54,7 +60,10 @@ impl AnnotationHover {
     }
 
     pub fn build(self) -> Hover {
-        let mut contents = vec![MarkedString::from_markdown(format!("```comline\n@{}\n```", self.key))];
+        let mut contents = vec![MarkedString::from_markdown(format!(
+            "```comline\n@{}\n```",
+            self.key
+        ))];
 
         if let Some(description) = self.description {
             contents.push(MarkedString::from_markdown(description));
@@ -77,7 +86,10 @@ impl AnnotationHover {
             contents.push(MarkedString::from_markdown(block.join("\n")));
         }
 
-        Hover { contents: HoverContents::Array(contents), range: None }
+        Hover {
+            contents: HoverContents::Array(contents),
+            range: None,
+        }
     }
 }
 
@@ -113,12 +125,17 @@ mod tests {
             .build();
         let parts = blocks(hover);
         assert_eq!(parts.len(), 2, "{parts:?}");
-        assert_eq!(parts[1], "- **default:** no preset applied\n- **value:** a bare name");
+        assert_eq!(
+            parts[1],
+            "- **default:** no preset applied\n- **value:** a bare name"
+        );
     }
 
     #[test]
     fn omitted_default_or_value_is_just_skipped() {
-        let hover = AnnotationHover::new("settings").value("a bare name").build();
+        let hover = AnnotationHover::new("settings")
+            .value("a bare name")
+            .build();
         let parts = blocks(hover);
         assert_eq!(parts[1], "- **value:** a bare name");
         assert!(!parts[1].contains("default"), "{}", parts[1]);
@@ -126,7 +143,9 @@ mod tests {
 
     #[test]
     fn notes_get_their_own_section_as_a_separate_block() {
-        let hover = AnnotationHover::new("settings").note("consumed by: enforcement").build();
+        let hover = AnnotationHover::new("settings")
+            .note("consumed by: enforcement")
+            .build();
         let parts = blocks(hover);
         let notes = parts.last().unwrap();
         assert!(notes.starts_with("#### Notes"), "{notes}");
@@ -135,7 +154,9 @@ mod tests {
 
     #[test]
     fn a_warning_gets_a_glyph_prefix_in_the_same_notes_section() {
-        let hover = AnnotationHover::new("settings").warning("not consumed anywhere yet").build();
+        let hover = AnnotationHover::new("settings")
+            .warning("not consumed anywhere yet")
+            .build();
         let parts = blocks(hover);
         let notes = parts.last().unwrap();
         assert!(notes.contains("- ⚠️ not consumed anywhere yet"), "{notes}");
@@ -143,7 +164,9 @@ mod tests {
 
     #[test]
     fn no_notes_means_no_notes_block_at_all() {
-        let hover = AnnotationHover::new("settings").description("does a thing").build();
+        let hover = AnnotationHover::new("settings")
+            .description("does a thing")
+            .build();
         let parts = blocks(hover);
         assert!(!parts.iter().any(|p| p.contains("Notes")), "{parts:?}");
     }
@@ -172,6 +195,9 @@ mod tests {
             "- **default:** no preset applied — only the package/schema-level settings apply\n\
              - **value:** a bare name, e.g. `Strict` for a `settings Strict { ... }` block"
         );
-        assert_eq!(parts[3], "#### Notes\n\n- ⚠️ not consumed anywhere yet — decided, advisory metadata only");
+        assert_eq!(
+            parts[3],
+            "#### Notes\n\n- ⚠️ not consumed anywhere yet — decided, advisory metadata only"
+        );
     }
 }

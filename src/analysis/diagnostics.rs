@@ -9,18 +9,18 @@ use crate::analysis::project::Project;
 use crate::analysis::symbols::Namespace;
 use crate::util::byte_range_to_lsp_range;
 use comline_core::diagnostics::Severity;
+use comline_core::package::layout;
 use comline_core::schema::idl::grammar::{Declaration, Document};
+use comline_core::schema::ir::compiler::import_resolver::{
+    declared_alias_target, declared_validator_properties, declared_validator_targets,
+};
 use comline_core::schema::ir::compiler::interpreter::incremental::IncrementalInterpreter;
 use comline_core::schema::ir::compiler::settings::enforcement::check_settings_enforcement;
 use comline_core::schema::ir::compiler::settings::resolution::check_settings_conflicts;
 use comline_core::schema::ir::compiler::settings::severity::resolve_diagnostic_overrides;
-use comline_core::schema::ir::compiler::import_resolver::{
-    declared_alias_target, declared_validator_properties, declared_validator_targets,
-};
 use comline_core::schema::ir::compiler::Compile;
-use comline_core::schema::ir::frozen::unit::FrozenUnit;
 use comline_core::schema::ir::frozen::types::TypeRef;
-use comline_core::package::layout;
+use comline_core::schema::ir::frozen::unit::FrozenUnit;
 use comline_core::schema::ir::validation;
 use comline_core::settings::{SettingsDict, SettingsSpans};
 use lsp_types::{
@@ -111,7 +111,11 @@ fn lsp_tags(code_id: &str) -> Option<Vec<DiagnosticTag>> {
 /// `document` frozen the way validation reads it: its own units, then
 /// `extra` (imports core can't see from one file alone), behind a
 /// `Namespace` unit when the module path is known.
-fn frozen_units(document: &Document, extra: Vec<FrozenUnit>, namespace: &[String]) -> Vec<FrozenUnit> {
+fn frozen_units(
+    document: &Document,
+    extra: Vec<FrozenUnit>,
+    namespace: &[String],
+) -> Vec<FrozenUnit> {
     let mut units = IncrementalInterpreter::from_declarations(document.0.clone());
     units.extend(extra);
     if !namespace.is_empty() {
@@ -157,7 +161,9 @@ impl ProjectImports<'_, '_> {
         let bare = name.rsplit("::").next()?;
         // In scope only, as `comline build` resolves: the project-wide
         // fallback would answer for a validator this file never imported.
-        let target = self.project.resolve(self.doc, bare, Namespace::Declaration)?;
+        let target = self
+            .project
+            .resolve(self.doc, bare, Namespace::Declaration)?;
         let real_name = self.project.symbol(&target)?.name.clone();
         Some((target.doc, real_name))
     }
@@ -168,7 +174,10 @@ impl validation::ImportLookup for ProjectImports<'_, '_> {
     /// the view has them: core's own `encodings::is_declared`, read from
     /// the manifests' text.
     fn encoding_declared(&self, kind: comline_core::encodings::EncodingKind, name: &str) -> bool {
-        self.project.encodings.iter().any(|(n, k)| n == name && *k == kind)
+        self.project
+            .encodings
+            .iter()
+            .any(|(n, k)| n == name && *k == kind)
     }
 
     fn validator_targets(&self, name: &str) -> Option<Vec<TypeRef>> {
@@ -192,7 +201,13 @@ impl validation::ImportLookup for ProjectImports<'_, '_> {
 
     fn carries_data(&self, name: &str) -> Option<bool> {
         let (doc, real_name) = self.declaration(name)?;
-        Some(DeclaredData { project: self.project, answers: HashMap::new() }.named(doc, &real_name))
+        Some(
+            DeclaredData {
+                project: self.project,
+                answers: HashMap::new(),
+            }
+            .named(doc, &real_name),
+        )
     }
 }
 
@@ -221,11 +236,15 @@ impl DeclaredData<'_, '_> {
         }
         self.answers.insert(key.clone(), None);
         let project = self.project;
-        let declared = project.docs[doc].document.0.iter().find(|decl| match &decl.value {
-            Declaration::Struct(s) => s.name() == name,
-            Declaration::TypeAlias(a) => a.name() == name,
-            _ => false,
-        });
+        let declared = project.docs[doc]
+            .document
+            .0
+            .iter()
+            .find(|decl| match &decl.value {
+                Declaration::Struct(s) => s.name() == name,
+                Declaration::TypeAlias(a) => a.name() == name,
+                _ => false,
+            });
         let answer = match declared.map(|decl| &decl.value) {
             Some(Declaration::Struct(s)) => s.fields().iter().any(|field| {
                 field.value.optional()
@@ -250,14 +269,16 @@ impl DeclaredData<'_, '_> {
             TypeRef::Primitive(_) | TypeRef::Union(_) => true,
             // A dynamic array writes its count.
             TypeRef::Array { length: None, .. } => true,
-            TypeRef::Array { length: Some(0), .. } => false,
+            TypeRef::Array {
+                length: Some(0), ..
+            } => false,
             TypeRef::Array { element, .. } => self.carries(doc, element),
             TypeRef::Named(name) => {
                 let bare = name.rsplit("::").next().unwrap_or(name);
                 let project = self.project;
-                let declared = project.resolve(doc, bare, Namespace::Declaration).and_then(
-                    |target| Some((target.doc, project.symbol(&target)?.name.clone())),
-                );
+                let declared = project
+                    .resolve(doc, bare, Namespace::Declaration)
+                    .and_then(|target| Some((target.doc, project.symbol(&target)?.name.clone())));
                 match declared {
                     Some((doc, real_name)) => self.named(doc, &real_name),
                     None => true,
@@ -292,8 +313,9 @@ fn validation_diagnostics_with(
     // They are reported here rather than by switching to
     // `check_and_from_declarations`, whose import and alias checks would
     // duplicate `analysis::import_check`'s own.
-    let settings_errors =
-        check_settings_conflicts(&document.0).err().unwrap_or_default();
+    let settings_errors = check_settings_conflicts(&document.0)
+        .err()
+        .unwrap_or_default();
 
     let mut errors = match validation::validate_with(units, imports) {
         Ok(warnings) => {
@@ -301,7 +323,10 @@ fn validation_diagnostics_with(
             // an "error"-escalated or malformed-level diagnostic just
             // renders as a real LSP error alongside everything else.
             let (warnings, fatal) = resolve_diagnostic_overrides(
-                units, warnings, package_settings, &SettingsSpans::default(),
+                units,
+                warnings,
+                package_settings,
+                &SettingsSpans::default(),
             );
             let mut combined = warnings;
             combined.extend(fatal);
@@ -322,8 +347,7 @@ fn validation_diagnostics_with(
     // affected as well as the entry itself, which is the more useful of
     // the two. Same code at the same origin means the same mistake, so
     // only the ones enforcement said nothing about are added.
-    let already: Vec<_> =
-        errors.iter().map(|e| (e.code.id, e.span)).collect();
+    let already: Vec<_> = errors.iter().map(|e| (e.code.id, e.span)).collect();
     errors.extend(
         settings_errors
             .into_iter()
@@ -344,7 +368,10 @@ fn validation_diagnostics_with(
         .any(|e| narrows_to_name(e.code.id))
         .then(|| crate::analysis::symbols::build_symbol_table(document, uri, source));
     let names = |span: (usize, usize)| -> (usize, usize) {
-        table.as_ref().and_then(|t| t.name_span_of_decl(span)).unwrap_or(span)
+        table
+            .as_ref()
+            .and_then(|t| t.name_span_of_decl(span))
+            .unwrap_or(span)
     };
 
     errors
@@ -353,9 +380,12 @@ fn validation_diagnostics_with(
             let narrow = narrows_to_name(error.code.id);
             let error = if narrow {
                 let span = error.span.map(&names);
-                let secondary =
-                    error.secondary.map(|(span, label)| (names(span), label));
-                comline_core::diagnostics::Diagnostic { span, secondary, ..error }
+                let secondary = error.secondary.map(|(span, label)| (names(span), label));
+                comline_core::diagnostics::Diagnostic {
+                    span,
+                    secondary,
+                    ..error
+                }
             } else {
                 error
             };
@@ -413,7 +443,10 @@ fn validation_diagnostics_with(
                 source: Some("comline".to_string()),
                 message: message.clone(),
                 related_information: Some(vec![DiagnosticRelatedInformation {
-                    location: Location { uri: uri.clone(), range: sec_range },
+                    location: Location {
+                        uri: uri.clone(),
+                        range: sec_range,
+                    },
                     message: sec_label.clone(),
                 }]),
                 tags: lsp_tags(code.id),
@@ -427,7 +460,10 @@ fn validation_diagnostics_with(
                 source: Some("comline".to_string()),
                 message: format!("{sec_label} — {}", hint_pointer(code.id)),
                 related_information: Some(vec![DiagnosticRelatedInformation {
-                    location: Location { uri: uri.clone(), range },
+                    location: Location {
+                        uri: uri.clone(),
+                        range,
+                    },
                     message,
                 }]),
                 tags: None,
@@ -451,7 +487,11 @@ pub fn all_diagnostics(
             // A project of one: no siblings, but `use` forms core can't
             // expand alone still aren't reported as unknown types.
             let uri = Url::parse("file:///schema.ids").expect("static URL");
-            let project = Project::from_parsed([(&uri, source, std::sync::Arc::new(Document(doc.0.clone())))]);
+            let project = Project::from_parsed([(
+                &uri,
+                source,
+                std::sync::Arc::new(Document(doc.0.clone())),
+            )]);
             diagnostics.extend(project_diagnostics(&project, 0));
         }
     }
@@ -475,16 +515,39 @@ pub fn project_diagnostics(project: &Project, doc: usize) -> Vec<Diagnostic> {
         &units,
         &project.settings,
         here.uri,
-        &ProjectImports { project, doc, stand_ins },
+        &ProjectImports {
+            project,
+            doc,
+            stand_ins,
+        },
     );
     // A dependency's schemas aren't generated by this package.
     if here.dependency.is_none() {
-        diagnostics.extend(generation::feature_diagnostics(here.source, &units, &project.languages));
+        diagnostics.extend(generation::feature_diagnostics(
+            here.source,
+            &units,
+            &project.languages,
+        ));
     }
     diagnostics.extend(reserved_name_diagnostic(here));
-    diagnostics.extend(check.missing.iter().map(|m| missing_import_diagnostic(here.source, m)));
-    diagnostics.extend(check.unresolved.iter().map(|u| unresolved_import_diagnostic(here.source, u)));
-    diagnostics.extend(check.unverified.iter().map(|u| unverified_import_diagnostic(here.source, u)));
+    diagnostics.extend(
+        check
+            .missing
+            .iter()
+            .map(|m| missing_import_diagnostic(here.source, m)),
+    );
+    diagnostics.extend(
+        check
+            .unresolved
+            .iter()
+            .map(|u| unresolved_import_diagnostic(here.source, u)),
+    );
+    diagnostics.extend(
+        check
+            .unverified
+            .iter()
+            .map(|u| unverified_import_diagnostic(here.source, u)),
+    );
     diagnostics
 }
 
@@ -525,12 +588,24 @@ fn unresolved_import_diagnostic(source: &str, unresolved: &UnresolvedImport) -> 
     if let Some(suggestion) = &unresolved.suggestion {
         message.push_str(&format!(" - did you mean '{suggestion}'?"));
     }
-    import_diagnostic(source, unresolved.range, DiagnosticSeverity::ERROR, UNRESOLVED_IMPORT, message)
+    import_diagnostic(
+        source,
+        unresolved.range,
+        DiagnosticSeverity::ERROR,
+        UNRESOLVED_IMPORT,
+        message,
+    )
 }
 
 fn unverified_import_diagnostic(source: &str, unverified: &UnverifiedImport) -> Diagnostic {
     let message = format!("Not checked: {}", unverified.reason);
-    import_diagnostic(source, unverified.range, DiagnosticSeverity::INFORMATION, UNVERIFIED_IMPORT, message)
+    import_diagnostic(
+        source,
+        unverified.range,
+        DiagnosticSeverity::INFORMATION,
+        UNVERIFIED_IMPORT,
+        message,
+    )
 }
 
 fn import_diagnostic(
@@ -567,7 +642,10 @@ fn missing_import_diagnostic(source: &str, missing: &MissingImport) -> Diagnosti
         ),
         (_, many) => format!(
             "`{name}` is declared in {} but not imported here — add a `use` for one of them",
-            many.iter().map(|c| format!("`{}`", c.file)).collect::<Vec<_>>().join(", ")
+            many.iter()
+                .map(|c| format!("`{}`", c.file))
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
     };
 
@@ -604,7 +682,10 @@ fn missing_import_diagnostic(source: &str, missing: &MissingImport) -> Diagnosti
 /// it is a bare error node over the `->` (or the whole file, when the `->`
 /// ends a block), so each such entry is dropped in favour of the named
 /// diagnostic rather than shown alongside it.
-pub fn generate_diagnostics(source: &str, errors: &[rust_sitter::errors::ParseError]) -> Vec<Diagnostic> {
+pub fn generate_diagnostics(
+    source: &str,
+    errors: &[rust_sitter::errors::ParseError],
+) -> Vec<Diagnostic> {
     if errors.is_empty() {
         return Vec::new();
     }
@@ -624,10 +705,15 @@ pub fn generate_diagnostics(source: &str, errors: &[rust_sitter::errors::ParseEr
         .iter()
         .filter(|error| !covers_a_missing_return(error))
         .map(|error| {
-            let diagnostic = comline_core::diagnostics::from_parse_errors(std::slice::from_ref(error));
+            let diagnostic =
+                comline_core::diagnostics::from_parse_errors(std::slice::from_ref(error));
             parse_diagnostic(source, &diagnostic, Some((error.start, error.end)))
         })
-        .chain(missing_returns.iter().map(|d| parse_diagnostic(source, d, None)))
+        .chain(
+            missing_returns
+                .iter()
+                .map(|d| parse_diagnostic(source, d, None)),
+        )
         .collect()
 }
 
@@ -668,7 +754,7 @@ fn parse_diagnostic(
 mod tests {
     use super::*;
     use crate::parser;
-    
+
     #[test]
     fn test_generate_diagnostics_for_errors() {
         let source = r#"
@@ -678,12 +764,12 @@ struct User {
 "#;
         let result = parser::parse(source).unwrap();
         assert!(result.has_errors());
-        
+
         let diagnostics = generate_diagnostics(source, &result.errors);
         assert!(!diagnostics.is_empty());
         assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
     }
-    
+
     #[test]
     fn test_no_diagnostics_for_valid_code() {
         let source = r#"
@@ -707,7 +793,8 @@ struct User {
     fn validation_flags_an_undefined_type_reference() {
         let d = diags("struct Order {\n    buyer: Customer\n}\n");
         assert!(
-            d.iter().any(|x| x.message.to_lowercase().contains("customer")),
+            d.iter()
+                .any(|x| x.message.to_lowercase().contains("customer")),
             "expected an undefined-type diagnostic mentioning `Customer`, got {d:?}"
         );
     }
@@ -716,7 +803,8 @@ struct User {
     fn validation_flags_a_duplicate_declaration() {
         let d = diags("struct User {\n    a: string\n}\nstruct User {\n    b: string\n}\n");
         assert!(
-            d.iter().any(|x| x.message.to_lowercase().contains("duplicate")),
+            d.iter()
+                .any(|x| x.message.to_lowercase().contains("duplicate")),
             "expected a duplicate-definition diagnostic, got {d:?}"
         );
     }
@@ -724,7 +812,12 @@ struct User {
     /// The text a diagnostic's range covers.
     fn covered<'s>(source: &'s str, d: &Diagnostic) -> &'s str {
         let offset = |p: lsp_types::Position| {
-            source.lines().take(p.line as usize).map(|l| l.len() + 1).sum::<usize>() + p.character as usize
+            source
+                .lines()
+                .take(p.line as usize)
+                .map(|l| l.len() + 1)
+                .sum::<usize>()
+                + p.character as usize
         };
         &source[offset(d.range.start)..offset(d.range.end)]
     }
@@ -735,7 +828,11 @@ struct User {
         let d = diags(source);
         assert_eq!(d.len(), 1, "{d:?}");
         assert_eq!(d[0].severity, Some(DiagnosticSeverity::WARNING));
-        assert!(d[0].message.starts_with("validator 'Positive' checks nothing"), "{d:?}");
+        assert!(
+            d[0].message
+                .starts_with("validator 'Positive' checks nothing"),
+            "{d:?}"
+        );
         assert_eq!(covered(source, &d[0]), "Positive");
     }
 
@@ -743,10 +840,16 @@ struct User {
     fn an_empty_validate_block_warns_at_the_block() {
         let source = "validator Positive for u8 {\n    validate {\n    }\n}\n";
         let d = diags(source);
-        let warning = d.iter().find(|x| x.severity == Some(DiagnosticSeverity::WARNING)).expect("the warning");
+        let warning = d
+            .iter()
+            .find(|x| x.severity == Some(DiagnosticSeverity::WARNING))
+            .expect("the warning");
         assert!(warning.message.contains("no `assert`"), "{d:?}");
         assert!(covered(source, warning).starts_with("validate {"), "{d:?}");
-        let hint = d.iter().find(|x| x.severity == Some(DiagnosticSeverity::HINT)).expect("the hint");
+        let hint = d
+            .iter()
+            .find(|x| x.severity == Some(DiagnosticSeverity::HINT))
+            .expect("the hint");
         assert_eq!(covered(source, hint), "Positive");
         assert!(hint.message.contains("`validate` block"), "{d:?}");
     }
@@ -756,7 +859,10 @@ struct User {
         let source = "validator NonEmpty for string {\n    validate {\n        assert(value.length > 0, \"{value.name} is empty\")\n    }\n}\n";
         let d = diags(source);
         assert_eq!(d.len(), 1, "{d:?}");
-        assert_eq!(d[0].code, Some(NumberOrString::String(MESSAGE_NOT_INTERPOLATED.into())));
+        assert_eq!(
+            d[0].code,
+            Some(NumberOrString::String(MESSAGE_NOT_INTERPOLATED.into()))
+        );
         assert_eq!(covered(source, &d[0]), "\"{value.name} is empty\"");
         assert!(diags(&source.replace(", \"{", ", f\"{")).is_empty());
     }
@@ -775,15 +881,16 @@ struct User {
         // It had no span, so the editor put it at the top of the file.
         let source = "struct S {\n    a: u8\n}\n\nvalidator Short for string {\n    validate {\n        assert(value.length <= params.mx, \"long\")\n    }\n}\n";
         let d = diags(source);
-        let e = d.iter().find(|x| x.message.contains("params.mx")).expect("the error");
+        let e = d
+            .iter()
+            .find(|x| x.message.contains("params.mx"))
+            .expect("the error");
         assert_eq!(covered(source, e), "Short");
     }
 
     #[test]
     fn a_well_formed_schema_has_no_diagnostics() {
-        let d = diags(
-            "struct Item {\n    id: u64\n}\n\nstruct Cart {\n    items: Item[]\n}\n",
-        );
+        let d = diags("struct Item {\n    id: u64\n}\n\nstruct Cart {\n    items: Item[]\n}\n");
         assert!(d.is_empty(), "expected no diagnostics, got {d:?}");
     }
 
@@ -850,7 +957,10 @@ struct User {
         let source = "struct User {\n    name: string\n";
         let result = parser::parse(source).unwrap();
         let diagnostics = generate_diagnostics(source, &result.errors);
-        assert_eq!(diagnostics[0].message, "unclosed `{` — add a matching `}` to close this block");
+        assert_eq!(
+            diagnostics[0].message,
+            "unclosed `{` — add a matching `}` to close this block"
+        );
     }
 
     #[test]
@@ -863,7 +973,9 @@ struct User {
         let diagnostics = generate_diagnostics(source, &result.errors);
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert!(
-            diagnostics[0].message.starts_with("missing return type after `->`"),
+            diagnostics[0]
+                .message
+                .starts_with("missing return type after `->`"),
             "{}",
             diagnostics[0].message
         );
@@ -879,7 +991,9 @@ struct User {
         let result = parser::parse(source).unwrap();
         let diagnostics = generate_diagnostics(source, &result.errors);
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-        assert!(diagnostics[0].message.starts_with("missing return type after `->`"));
+        assert!(diagnostics[0]
+            .message
+            .starts_with("missing return type after `->`"));
     }
 
     #[test]
@@ -930,7 +1044,10 @@ struct User {
 
     fn messages(source: &str) -> Vec<String> {
         let r = parser::parse(source).unwrap();
-        all_diagnostics(source, &r.errors, r.document.as_ref()).into_iter().map(|d| d.message).collect()
+        all_diagnostics(source, &r.errors, r.document.as_ref())
+            .into_iter()
+            .map(|d| d.message)
+            .collect()
     }
 
     #[test]
@@ -943,7 +1060,9 @@ struct User {
              settings {\n    annotations.framing.alowed = true\n}\n",
         );
         assert!(
-            found.iter().any(|m| m.contains("annotations.framing.allowed")),
+            found
+                .iter()
+                .any(|m| m.contains("annotations.framing.allowed")),
             "expected a suggestion: {found:?}"
         );
     }
@@ -966,7 +1085,10 @@ struct User {
             "struct Message {\n    body: string\n}\n\n\
              settings {\n    forbid_indexing = true\n}\n",
         );
-        assert!(found.is_empty(), "an open-namespace key must not be flagged: {found:?}");
+        assert!(
+            found.is_empty(),
+            "an open-namespace key must not be flagged: {found:?}"
+        );
     }
 
     #[test]
@@ -981,24 +1103,40 @@ struct User {
         let source = "validator StringBounds for string {\n    min_chars: u32\n    max_chars: u32\n}\n\nstruct Message {\n    @validators = [StringBounds(min_chars=3, max_chars=10)]\n    message: string\n}\n\nsettings {\n    validators.allowed = Tru\n}\n";
         let d = diags(source);
 
-        let errors: Vec<_> =
-            d.iter().filter(|x| x.severity == Some(DiagnosticSeverity::ERROR)).collect();
-        let hints: Vec<_> = d.iter().filter(|x| x.severity == Some(DiagnosticSeverity::HINT)).collect();
+        let errors: Vec<_> = d
+            .iter()
+            .filter(|x| x.severity == Some(DiagnosticSeverity::ERROR))
+            .collect();
+        let hints: Vec<_> = d
+            .iter()
+            .filter(|x| x.severity == Some(DiagnosticSeverity::HINT))
+            .collect();
         assert_eq!(errors.len(), 1, "{d:?}");
         assert_eq!(hints.len(), 1, "{d:?}");
 
         let error = errors[0];
         assert!(error.message.contains("must be a boolean"), "{error:?}");
-        assert!(error.related_information.is_some(), "error should link to the usage site: {error:?}");
+        assert!(
+            error.related_information.is_some(),
+            "error should link to the usage site: {error:?}"
+        );
         assert_eq!(
             error.code,
-            Some(NumberOrString::String("settings::malformed-value".to_string())),
+            Some(NumberOrString::String(
+                "settings::malformed-value".to_string()
+            )),
             "{error:?}"
         );
 
         let hint = hints[0];
-        assert!(hint.related_information.is_some(), "hint should link back to the real error: {hint:?}");
-        assert_eq!(hint.code, error.code, "the hint should share the error's own code: {hint:?}");
+        assert!(
+            hint.related_information.is_some(),
+            "hint should link back to the real error: {hint:?}"
+        );
+        assert_eq!(
+            hint.code, error.code,
+            "the hint should share the error's own code: {hint:?}"
+        );
 
         // The settings block is textually after the struct, so its origin
         // span's line must be later than the usage site's - the mix-up
@@ -1085,14 +1223,26 @@ struct User {
         let source = "@deprecated = \"use NewAuthor instead\"\nstruct Author {\n    name: string\n}\n\nstruct Post {\n    author: Author\n}\n";
         let d = diags(source);
         assert_eq!(d.len(), 1, "{d:?}");
-        assert_eq!(d[0].severity, Some(DiagnosticSeverity::WARNING), "{:?}", d[0]);
         assert_eq!(
-            d[0].code,
-            Some(NumberOrString::String("validation::deprecated-type-usage".to_string())),
+            d[0].severity,
+            Some(DiagnosticSeverity::WARNING),
             "{:?}",
             d[0]
         );
-        assert_eq!(d[0].tags, Some(vec![DiagnosticTag::DEPRECATED]), "{:?}", d[0]);
+        assert_eq!(
+            d[0].code,
+            Some(NumberOrString::String(
+                "validation::deprecated-type-usage".to_string()
+            )),
+            "{:?}",
+            d[0]
+        );
+        assert_eq!(
+            d[0].tags,
+            Some(vec![DiagnosticTag::DEPRECATED]),
+            "{:?}",
+            d[0]
+        );
         assert!(d[0].message.contains("use NewAuthor instead"), "{:?}", d[0]);
     }
 
@@ -1111,19 +1261,30 @@ struct User {
         assert_eq!(d[0].severity, Some(DiagnosticSeverity::ERROR), "{:?}", d[0]);
         assert_eq!(
             d[0].code,
-            Some(NumberOrString::String("validation::deprecated-type-usage".to_string())),
+            Some(NumberOrString::String(
+                "validation::deprecated-type-usage".to_string()
+            )),
             "{:?}",
             d[0]
         );
     }
 
     fn project_messages(files: &[(&str, &str)]) -> Vec<(String, Option<NumberOrString>, u32, u32)> {
-        let files: Vec<(Url, String)> =
-            files.iter().map(|(u, s)| (Url::parse(u).unwrap(), s.to_string())).collect();
+        let files: Vec<(Url, String)> = files
+            .iter()
+            .map(|(u, s)| (Url::parse(u).unwrap(), s.to_string()))
+            .collect();
         let project = Project::new(files.iter());
         project_diagnostics(&project, 0)
             .into_iter()
-            .map(|d| (d.message, d.code, d.range.start.line, d.range.start.character))
+            .map(|d| {
+                (
+                    d.message,
+                    d.code,
+                    d.range.start.line,
+                    d.range.start.character,
+                )
+            })
             .collect()
     }
 
@@ -1131,7 +1292,10 @@ struct User {
     /// whole alias it's on.
     #[test]
     fn an_unknown_validator_is_underlined_at_its_name() {
-        let messages = project_messages(&[("file:///pkg/src/api.ids", "@validators = [Pos]\ntype FixedNum = string\n")]);
+        let messages = project_messages(&[(
+            "file:///pkg/src/api.ids",
+            "@validators = [Pos]\ntype FixedNum = string\n",
+        )]);
         assert_eq!(messages.len(), 1, "{messages:?}");
         let (message, _, line, character) = &messages[0];
         assert!(message.starts_with("Unknown validator 'Pos'"), "{message}");
@@ -1142,22 +1306,39 @@ struct User {
     /// the declaration its `use` brings in - as `comline build` does.
     #[test]
     fn an_imported_validators_arguments_are_checked() {
-        let rules = ("file:///pkg/src/rules.ids", "validator AtLeast for u32 {\n    min: u32\n    validate {\n        \
-                      assert(value >= params.min, f\"{value.name}\")\n    }\n}\n");
+        let rules = (
+            "file:///pkg/src/rules.ids",
+            "validator AtLeast for u32 {\n    min: u32\n    validate {\n        \
+                      assert(value >= params.min, f\"{value.name}\")\n    }\n}\n",
+        );
         let messages = |call: &str| -> Vec<String> {
-            let api = format!("use rules::AtLeast\n\nstruct S {{\n    @validators = [{call}]\n    n: u32\n}}\n");
-            project_messages(&[("file:///pkg/src/api.ids", &api), rules]).into_iter().map(|m| m.0).collect()
+            let api = format!(
+                "use rules::AtLeast\n\nstruct S {{\n    @validators = [{call}]\n    n: u32\n}}\n"
+            );
+            project_messages(&[("file:///pkg/src/api.ids", &api), rules])
+                .into_iter()
+                .map(|m| m.0)
+                .collect()
         };
         let only = |call: &str, expected: &str| {
             let got = messages(call);
-            assert!(got.len() == 1 && got[0].starts_with(expected), "{call}: {got:?}");
+            assert!(
+                got.len() == 1 && got[0].starts_with(expected),
+                "{call}: {got:?}"
+            );
         };
         only("AtLeast", "validator 'AtLeast' is missing argument 'min'");
-        only("AtLeast(mni = 1)", "validator 'AtLeast' has no argument 'mni' - did you mean 'min'?");
+        only(
+            "AtLeast(mni = 1)",
+            "validator 'AtLeast' has no argument 'mni' - did you mean 'min'?",
+        );
         assert!(messages("AtLeast(min = 1)").is_empty());
     }
 
-    const TYPES: (&str, &str) = ("file:///pkg/src/types.ids", "struct Message {\n    text: string\n}\n");
+    const TYPES: (&str, &str) = (
+        "file:///pkg/src/types.ids",
+        "struct Message {\n    text: string\n}\n",
+    );
 
     /// A validator and an alias from another file: the editor checks the
     /// field against the validator's `for` the way `comline build` does,
@@ -1180,7 +1361,9 @@ struct User {
         );
         assert_eq!(
             bad[0].1,
-            Some(NumberOrString::String("validation::validator-target-mismatch".to_string()))
+            Some(NumberOrString::String(
+                "validation::validator-target-mismatch".to_string()
+            ))
         );
 
         let ok = project_messages(&[
@@ -1207,8 +1390,15 @@ struct User {
         let d = diags(source);
         assert_eq!(d.len(), 1, "{d:?}");
         assert_eq!(d[0].severity, Some(DiagnosticSeverity::ERROR));
-        assert_eq!(d[0].code, Some(NumberOrString::String(DATALESS.to_string())));
-        assert!(d[0].message.starts_with("an array of `Empty` carries only its length"), "{d:?}");
+        assert_eq!(
+            d[0].code,
+            Some(NumberOrString::String(DATALESS.to_string()))
+        );
+        assert!(
+            d[0].message
+                .starts_with("an array of `Empty` carries only its length"),
+            "{d:?}"
+        );
         assert!(diags(&source.replace("{}", "{\n    n: u8\n}")).is_empty());
     }
 
@@ -1217,10 +1407,16 @@ struct User {
     /// would take the imported name to carry data.
     #[test]
     fn an_array_of_an_imported_dataless_type_is_an_error() {
-        const API: (&str, &str) =
-            ("file:///pkg/src/api.ids", "use shapes::Empty\n\nstruct Batch {\n    items: Empty[]\n}\n");
+        const API: (&str, &str) = (
+            "file:///pkg/src/api.ids",
+            "use shapes::Empty\n\nstruct Batch {\n    items: Empty[]\n}\n",
+        );
         let messages = |shapes: &str, more: &str| {
-            project_messages(&[API, ("file:///pkg/src/shapes.ids", shapes), ("file:///pkg/src/more.ids", more)])
+            project_messages(&[
+                API,
+                ("file:///pkg/src/shapes.ids", shapes),
+                ("file:///pkg/src/more.ids", more),
+            ])
         };
 
         let bad = messages("struct Empty {}\n", "");
@@ -1234,13 +1430,20 @@ struct User {
         assert_eq!((bad[0].2, bad[0].3), (3, 4), "at the field");
 
         // Through an alias and on into a third file.
-        let through = messages("use more::Nothing\n\ntype Empty = Nothing[2]\n", "struct Nothing {\n    unit: ()\n}\n");
+        let through = messages(
+            "use more::Nothing\n\ntype Empty = Nothing[2]\n",
+            "struct Nothing {\n    unit: ()\n}\n",
+        );
         assert_eq!(dataless(&through).len(), 1, "{through:?}");
 
         // Data anywhere along the way: an optional field, a field of the
         // third file's type, a dynamic array.
         assert!(messages("struct Empty {\n    note?: ()\n}\n", "").is_empty());
-        assert!(messages("use more::Nothing\n\nstruct Empty {\n    n: Nothing\n}\n", "struct Nothing {\n    n: u8\n}\n").is_empty());
+        assert!(messages(
+            "use more::Nothing\n\nstruct Empty {\n    n: Nothing\n}\n",
+            "struct Nothing {\n    n: u8\n}\n"
+        )
+        .is_empty());
         assert!(messages("type Empty = ()[]\n", "").is_empty());
     }
 
@@ -1250,16 +1453,30 @@ struct User {
     #[test]
     fn an_unimported_dataless_type_is_only_a_missing_use() {
         let messages = project_messages(&[
-            ("file:///pkg/src/api.ids", "struct Batch {\n    items: Empty[]\n}\n"),
+            (
+                "file:///pkg/src/api.ids",
+                "struct Batch {\n    items: Empty[]\n}\n",
+            ),
             ("file:///pkg/src/shapes.ids", "struct Empty {}\n"),
         ]);
         assert!(dataless(&messages).is_empty(), "{messages:?}");
-        assert!(messages.iter().any(|m| m.1 == Some(NumberOrString::String(MISSING_IMPORT.to_string()))), "{messages:?}");
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.1 == Some(NumberOrString::String(MISSING_IMPORT.to_string()))),
+            "{messages:?}"
+        );
 
         // Nor does an imported type's own unimported name reach further.
         let messages = project_messages(&[
-            ("file:///pkg/src/api.ids", "use shapes::Empty\n\nstruct Batch {\n    items: Empty[]\n}\n"),
-            ("file:///pkg/src/shapes.ids", "struct Empty {\n    n: Nothing\n}\n"),
+            (
+                "file:///pkg/src/api.ids",
+                "use shapes::Empty\n\nstruct Batch {\n    items: Empty[]\n}\n",
+            ),
+            (
+                "file:///pkg/src/shapes.ids",
+                "struct Empty {\n    n: Nothing\n}\n",
+            ),
             ("file:///pkg/src/more.ids", "struct Nothing {}\n"),
         ]);
         assert!(dataless(&messages).is_empty(), "{messages:?}");
@@ -1277,7 +1494,10 @@ struct User {
     #[test]
     fn a_validator_the_file_never_imports_is_unknown_and_nothing_more() {
         let messages: Vec<String> = project_messages(&[
-            ("file:///pkg/src/api.ids", "@validators = [Bounds()]\ntype FixedNum = u8[2]\n"),
+            (
+                "file:///pkg/src/api.ids",
+                "@validators = [Bounds()]\ntype FixedNum = u8[2]\n",
+            ),
             BOUNDS,
         ])
         .into_iter()
@@ -1290,7 +1510,10 @@ struct User {
 
         // Imported, it's found - and then its target is what's wrong.
         let messages: Vec<String> = project_messages(&[
-            ("file:///pkg/src/api.ids", "use rules::Bounds\n\n@validators = [Bounds()]\ntype FixedNum = u8[2]\n"),
+            (
+                "file:///pkg/src/api.ids",
+                "use rules::Bounds\n\n@validators = [Bounds()]\ntype FixedNum = u8[2]\n",
+            ),
             BOUNDS,
         ])
         .into_iter()
@@ -1312,16 +1535,23 @@ struct User {
                 Url::parse("file:///pkg/src/none.ids").unwrap(),
                 text.to_string(),
             )];
-            files.extend(crate::analysis::stdlib::files(&crate::analysis::stdlib::root()));
+            files.extend(crate::analysis::stdlib::files(
+                &crate::analysis::stdlib::root(),
+            ));
             let project = Project::new(files.iter());
-            project_diagnostics(&project, 0).into_iter().map(|d| d.message).collect::<Vec<_>>()
+            project_diagnostics(&project, 0)
+                .into_iter()
+                .map(|d| d.message)
+                .collect::<Vec<_>>()
         };
 
         let unimported = in_package("@validators = [StringBounds()]\ntype FixedNum = u8[2]\n");
         assert_eq!(
             unimported,
-            ["`StringBounds` is declared in `validators.ids` but not imported here — \
-              add `use std::validators::StringBounds`"]
+            [
+                "`StringBounds` is declared in `validators.ids` but not imported here — \
+              add `use std::validators::StringBounds`"
+            ]
         );
 
         let imported = in_package(
@@ -1349,7 +1579,10 @@ struct User {
         .into_iter()
         .map(|m| m.0)
         .collect();
-        assert!(messages.iter().all(|m| !m.contains("applies to")), "{messages:?}");
+        assert!(
+            messages.iter().all(|m| !m.contains("applies to")),
+            "{messages:?}"
+        );
     }
 
     #[test]
@@ -1368,7 +1601,12 @@ struct User {
     /// `use parent::*` used to be a raw parser error (core#65).
     #[test]
     fn a_bare_prefix_glob_or_list_is_not_a_syntax_error() {
-        for header in ["use parent::*", "use self::*", "use package::{Message}", "use parent::{Message, Other}"] {
+        for header in [
+            "use parent::*",
+            "use self::*",
+            "use package::{Message}",
+            "use parent::{Message, Other}",
+        ] {
             let source = format!("{header}\n\nstruct S {{\n    id: u64\n}}\n");
             assert_eq!(messages(&source), Vec::<String>::new(), "{header}");
         }
@@ -1391,7 +1629,13 @@ struct User {
 
     #[test]
     fn a_missing_import_replaces_the_unknown_type_error() {
-        let found = project_messages(&[("file:///pkg/src/chat.ids", "struct S {\n    m: Message\n}\n"), TYPES]);
+        let found = project_messages(&[
+            (
+                "file:///pkg/src/chat.ids",
+                "struct S {\n    m: Message\n}\n",
+            ),
+            TYPES,
+        ]);
         assert_eq!(
             found,
             vec![(
@@ -1416,7 +1660,10 @@ struct User {
         let chat = "use types::Message as Msg\n\nstruct S {\n    m: Message\n}\n";
         let found = project_messages(&[("file:///pkg/src/chat.ids", chat), TYPES]);
         assert_eq!(found.len(), 1, "{found:?}");
-        assert_eq!(found[0].0, "`Message` is imported here as `Msg` — write `Msg`, or add `use types::Message`");
+        assert_eq!(
+            found[0].0,
+            "`Message` is imported here as `Msg` — write `Msg`, or add `use types::Message`"
+        );
     }
 
     const MANIFEST_URI: &str = "file:///pkg/config.idp";
@@ -1430,7 +1677,8 @@ struct User {
             framing = {\n                allowed = false\n            }\n        }\n    }\n}\n";
         let chat = "@framing = \"jsonrpc\"\nprotocol Chat {\n    function ping() -> string;\n}\n";
 
-        let found = project_messages(&[(MANIFEST_URI, manifest), ("file:///pkg/src/chat.ids", chat)]);
+        let found =
+            project_messages(&[(MANIFEST_URI, manifest), ("file:///pkg/src/chat.ids", chat)]);
         assert!(
             found.iter().any(|(msg, ..)| msg.contains("framing")),
             "expected a forbidden-annotation diagnostic, got {found:?}"
@@ -1444,7 +1692,8 @@ struct User {
             framing = {\n                allowed = true\n            }\n        }\n    }\n}\n";
         let chat = "@framing = \"jsonrpc\"\nprotocol Chat {\n    function ping() -> string;\n}\n";
 
-        let found = project_messages(&[(MANIFEST_URI, manifest), ("file:///pkg/src/chat.ids", chat)]);
+        let found =
+            project_messages(&[(MANIFEST_URI, manifest), ("file:///pkg/src/chat.ids", chat)]);
         assert!(
             !found.iter().any(|(msg, ..)| msg.contains("framing")),
             "expected no forbidden-annotation diagnostic once the manifest allows it, got {found:?}"
@@ -1463,7 +1712,10 @@ struct User {
     fn a_declared_namespaced_framing_and_handshake_are_accepted() {
         let chat = "@framing = \"com.acme.frames@1\"\n@handshake = \"com.acme.hello@1\"\n\
             protocol Chat {\n    function ping() -> string;\n}\n";
-        let found = project_messages(&[(MANIFEST_URI, ENCODINGS_MANIFEST), ("file:///pkg/src/chat.ids", chat)]);
+        let found = project_messages(&[
+            (MANIFEST_URI, ENCODINGS_MANIFEST),
+            ("file:///pkg/src/chat.ids", chat),
+        ]);
         assert!(found.is_empty(), "{found:?}");
     }
 
@@ -1471,10 +1723,17 @@ struct User {
     fn an_undeclared_namespaced_framing_is_still_an_error() {
         // Declared as a handshake, not a framing; and one nothing declares.
         for written in ["com.acme.hello@1", "com.acme.nope@1"] {
-            let chat = format!("@framing = \"{written}\"\nprotocol Chat {{\n    function ping() -> string;\n}}\n");
-            let found = project_messages(&[(MANIFEST_URI, ENCODINGS_MANIFEST), ("file:///pkg/src/chat.ids", &chat)]);
+            let chat = format!(
+                "@framing = \"{written}\"\nprotocol Chat {{\n    function ping() -> string;\n}}\n"
+            );
+            let found = project_messages(&[
+                (MANIFEST_URI, ENCODINGS_MANIFEST),
+                ("file:///pkg/src/chat.ids", &chat),
+            ]);
             assert!(
-                found.iter().any(|(msg, ..)| msg.contains(&format!("framing `{written}` isn't declared"))),
+                found
+                    .iter()
+                    .any(|(msg, ..)| msg.contains(&format!("framing `{written}` isn't declared"))),
                 "{found:?}"
             );
         }
@@ -1494,7 +1753,10 @@ struct User {
         let project = Project::new(&files);
         assert_eq!(
             project.encodings,
-            vec![("com.acme.frames@1".to_string(), comline_core::encodings::EncodingKind::Framing)]
+            vec![(
+                "com.acme.frames@1".to_string(),
+                comline_core::encodings::EncodingKind::Framing
+            )]
         );
     }
 
@@ -1540,8 +1802,14 @@ mod duplicate_declaration_tests {
         let found = diagnostics(THREE_TESTS);
         assert_eq!(found.len(), 2, "one error, one linked hint: {found:?}");
 
-        let error = found.iter().find(|d| d.severity == Some(DiagnosticSeverity::ERROR)).unwrap();
-        let hint = found.iter().find(|d| d.severity == Some(DiagnosticSeverity::HINT)).unwrap();
+        let error = found
+            .iter()
+            .find(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+            .unwrap();
+        let hint = found
+            .iter()
+            .find(|d| d.severity == Some(DiagnosticSeverity::HINT))
+            .unwrap();
 
         // Both land on the name, not on the whole declaration and not at 0:0.
         assert_eq!(quoted(THREE_TESTS, &error.range), "Test");
@@ -1552,19 +1820,28 @@ mod duplicate_declaration_tests {
 
         // And they point at each other.
         assert_eq!(
-            error.related_information.as_ref().unwrap()[0].location.range,
+            error.related_information.as_ref().unwrap()[0]
+                .location
+                .range,
             hint.range,
         );
         assert_eq!(
             hint.related_information.as_ref().unwrap()[0].location.range,
             error.range,
         );
-        assert_eq!(error.code, Some(NumberOrString::String(DUPLICATE_DECLARATION.to_string())));
+        assert_eq!(
+            error.code,
+            Some(NumberOrString::String(DUPLICATE_DECLARATION.to_string()))
+        );
 
         // The hint sends you to the duplicate, not to a settings entry -
         // that wording was true of the only two-site diagnostic there was
         // when it was written.
-        assert!(hint.message.ends_with("see the error at the duplicate"), "{}", hint.message);
+        assert!(
+            hint.message.ends_with("see the error at the duplicate"),
+            "{}",
+            hint.message
+        );
     }
 
     /// A `settings` preset shares no namespace with a declaration, so the
@@ -1572,18 +1849,32 @@ mod duplicate_declaration_tests {
     #[test]
     fn the_settings_preset_is_left_alone() {
         for d in diagnostics(THREE_TESTS) {
-            assert!(d.range.start.line < 9, "the settings block was flagged: {d:?}");
+            assert!(
+                d.range.start.line < 9,
+                "the settings block was flagged: {d:?}"
+            );
         }
     }
 
     #[test]
     fn the_message_names_the_kinds() {
         let found = diagnostics(THREE_TESTS);
-        let error = found.iter().find(|d| d.severity == Some(DiagnosticSeverity::ERROR)).unwrap();
+        let error = found
+            .iter()
+            .find(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+            .unwrap();
         // Qualified by the schema's own namespace, which here is the
         // `schema.ids` the project-of-one path names the file.
-        assert!(error.message.contains("error 'schema::Test'"), "{}", error.message);
-        assert!(error.message.contains("rename this error"), "{}", error.message);
+        assert!(
+            error.message.contains("error 'schema::Test'"),
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.contains("rename this error"),
+            "{}",
+            error.message
+        );
         assert_eq!(
             error.related_information.as_ref().unwrap()[0].message,
             "struct 'schema::Test' declared here",
@@ -1624,7 +1915,10 @@ mod duplicate_declaration_tests {
         let doc = project.index_of(&chat).unwrap();
 
         let found = project_diagnostics(&project, doc);
-        let error = found.iter().find(|d| d.severity == Some(DiagnosticSeverity::ERROR)).unwrap();
+        let error = found
+            .iter()
+            .find(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+            .unwrap();
         assert!(error.message.contains("'chat::Test'"), "{}", error.message);
     }
 }
@@ -1640,7 +1934,11 @@ mod reserved_schema_name_tests {
 
     fn diagnostics_for(path: &str) -> Vec<Diagnostic> {
         let uri = Url::parse(path).unwrap();
-        let project = Project::with_active(&uri, "struct Thing {\n    id: u64\n}\n", &[] as &[SourceFile]);
+        let project = Project::with_active(
+            &uri,
+            "struct Thing {\n    id: u64\n}\n",
+            &[] as &[SourceFile],
+        );
         let doc = project.index_of(&uri).unwrap();
         project_diagnostics(&project, doc)
     }
@@ -1655,15 +1953,27 @@ mod reserved_schema_name_tests {
     fn a_target_module_name_is_flagged_at_the_top_of_the_file() {
         let d = reserved("file:///pkg/src/main.ids").expect("main.ids is reserved");
         assert_eq!(d.severity, Some(DiagnosticSeverity::ERROR));
-        assert_eq!(d.range, Range::default(), "the file's own name is what's wrong");
+        assert_eq!(
+            d.range,
+            Range::default(),
+            "the file's own name is what's wrong"
+        );
         assert!(d.message.contains("'main'"), "{}", d.message);
-        assert!(d.message.contains("module name in generated code"), "{}", d.message);
+        assert!(
+            d.message.contains("module name in generated code"),
+            "{}",
+            d.message
+        );
     }
 
     #[test]
     fn a_keyword_gets_the_other_explanation() {
         let d = reserved("file:///pkg/src/self.ids").expect("self.ids is reserved");
-        assert!(d.message.contains("keyword of the schema language"), "{}", d.message);
+        assert!(
+            d.message.contains("keyword of the schema language"),
+            "{}",
+            d.message
+        );
     }
 
     /// A directory segment is as much a module name as the filename is.

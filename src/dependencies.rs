@@ -43,13 +43,26 @@ pub fn index(package_dir: &Path, manifest: &str) -> Vec<IndexedDependency> {
         .map(|dependency| {
             // Canonical, so `../shared` matches the paths file events carry
             // and go-to-definition lands on a clean path.
-            let dir = dependency.package_dir(package_dir).map(|dir| dir.canonicalize().unwrap_or(dir));
-            let files = dir.as_ref().map(|dir| read_schemas(&dir.join(SCHEMAS_DIR))).unwrap_or_default();
+            let dir = dependency
+                .package_dir(package_dir)
+                .map(|dir| dir.canonicalize().unwrap_or(dir));
+            let files = dir
+                .as_ref()
+                .map(|dir| read_schemas(&dir.join(SCHEMAS_DIR)))
+                .unwrap_or_default();
             let manifest = dir.as_ref().and_then(|dir| {
                 let path = dir.join(MANIFEST);
-                Some((Url::from_file_path(&path).ok()?, std::fs::read_to_string(&path).ok()?))
+                Some((
+                    Url::from_file_path(&path).ok()?,
+                    std::fs::read_to_string(&path).ok()?,
+                ))
             });
-            IndexedDependency { name: dependency.name, dir, files, manifest }
+            IndexedDependency {
+                name: dependency.name,
+                dir,
+                files,
+                manifest,
+            }
         })
         .collect();
     indexed.sort_by(|a, b| a.name.cmp(&b.name));
@@ -66,7 +79,10 @@ pub fn manifest_diagnostics(package_dir: &Path, manifest: &str) -> Vec<Diagnosti
     let dependencies = match DependencyConfig::parse_dependencies(&congregation.assignments) {
         Ok(dependencies) => dependencies,
         Err(message) => {
-            let at = manifest.find("dependencies").map(|i| (i, i + "dependencies".len())).unwrap_or((0, 0));
+            let at = manifest
+                .find("dependencies")
+                .map(|i| (i, i + "dependencies".len()))
+                .unwrap_or((0, 0));
             return vec![diagnostic(manifest, at, DiagnosticSeverity::ERROR, message)];
         }
     };
@@ -84,14 +100,19 @@ pub fn manifest_diagnostics(package_dir: &Path, manifest: &str) -> Vec<Diagnosti
             }
             // On disk and resolvable: what its `@unverified` protocols give
             // up has to be accepted here.
-            let Some(dir) = dependency.package_dir(package_dir) else { return vec![] };
+            let Some(dir) = dependency.package_dir(package_dir) else {
+                return vec![];
+            };
             let unaccepted = acceptance::unaccepted(dependency, acceptance::unverified_in(&dir));
             acceptance::diagnostics(manifest, range, dependency, &unaccepted)
         })
         .collect()
 }
 
-fn problem(package_dir: &Path, dependency: &DependencyConfig) -> Option<(DiagnosticSeverity, String)> {
+fn problem(
+    package_dir: &Path,
+    dependency: &DependencyConfig,
+) -> Option<(DiagnosticSeverity, String)> {
     let dir = dependency.package_dir(package_dir);
     match (&dependency.source, dir) {
         (DependencySource::Registry { .. }, _) | (_, None) => Some((
@@ -121,7 +142,9 @@ fn declared(manifest: &str) -> Vec<DependencyConfig> {
     parser::parse_idp(manifest)
         .ok()
         .and_then(|r| r.document)
-        .and_then(|congregation| DependencyConfig::parse_dependencies(&congregation.assignments).ok())
+        .and_then(|congregation| {
+            DependencyConfig::parse_dependencies(&congregation.assignments).ok()
+        })
         .map(|dependencies| dependencies.into_values().collect())
         .unwrap_or_default()
 }
@@ -135,7 +158,10 @@ pub fn dependency_languages(package_dir: &Path, manifest: &str) -> Vec<(String, 
         .filter_map(|dependency| {
             let dir = dependency.package_dir(package_dir)?;
             let text = std::fs::read_to_string(dir.join(MANIFEST)).ok()?;
-            Some((dependency.name, crate::analysis::source::declared_languages(&text)))
+            Some((
+                dependency.name,
+                crate::analysis::source::declared_languages(&text),
+            ))
         })
         .flat_map(|(name, languages)| languages.into_iter().map(move |l| (name.clone(), l)))
         .collect()
@@ -153,7 +179,12 @@ fn entry_range(manifest: &str, name: &str) -> (usize, usize) {
         .unwrap_or((from, from))
 }
 
-fn diagnostic(source: &str, range: (usize, usize), severity: DiagnosticSeverity, message: String) -> Diagnostic {
+fn diagnostic(
+    source: &str,
+    range: (usize, usize),
+    severity: DiagnosticSeverity,
+    message: String,
+) -> Diagnostic {
     Diagnostic {
         range: byte_range_to_lsp_range(source, range.0, range.1),
         severity: Some(severity),
@@ -170,14 +201,23 @@ fn read_schemas(dir: &Path) -> Vec<(Url, String)> {
     paths.sort();
     paths
         .into_iter()
-        .filter_map(|path| Some((Url::from_file_path(&path).ok()?, std::fs::read_to_string(&path).ok()?)))
+        .filter_map(|path| {
+            Some((
+                Url::from_file_path(&path).ok()?,
+                std::fs::read_to_string(&path).ok()?,
+            ))
+        })
         .collect()
 }
 
 fn collect(dir: &Path, found: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
-        let Ok(file_type) = entry.file_type() else { continue };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
         let path = entry.path();
         if file_type.is_dir() && !entry.file_name().to_string_lossy().starts_with('.') {
             collect(&path, found);
@@ -204,17 +244,37 @@ mod tests {
     /// A consumer package next to a `shared` path dependency, with one git
     /// pin already in the deps cache and one not.
     fn workspace(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("comline-lsp-deps-{name}-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("comline-lsp-deps-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let consumer = root.join("app");
-        let fetched = git_checkout_dir(&consumer.join(".comline/deps-cache"), "https://example.test/fetched", "abc");
+        let fetched = git_checkout_dir(
+            &consumer.join(".comline/deps-cache"),
+            "https://example.test/fetched",
+            "abc",
+        );
         for (path, text) in [
             (consumer.join("config.idp"), CONSUMER),
-            (consumer.join("src/main.ids"), "struct Main {\n    id: u64\n}\n"),
-            (root.join("shared/config.idp"), "congregation shared\nspecification_version = 1\n"),
-            (root.join("shared/src/models.ids"), "struct Thing {\n    id: u64\n}\n"),
-            (fetched.join("config.idp"), "congregation fetched\nspecification_version = 1\n"),
-            (fetched.join("src/wire/frame.ids"), "struct Frame {\n    len: u32\n}\n"),
+            (
+                consumer.join("src/main.ids"),
+                "struct Main {\n    id: u64\n}\n",
+            ),
+            (
+                root.join("shared/config.idp"),
+                "congregation shared\nspecification_version = 1\n",
+            ),
+            (
+                root.join("shared/src/models.ids"),
+                "struct Thing {\n    id: u64\n}\n",
+            ),
+            (
+                fetched.join("config.idp"),
+                "congregation fetched\nspecification_version = 1\n",
+            ),
+            (
+                fetched.join("src/wire/frame.ids"),
+                "struct Frame {\n    len: u32\n}\n",
+            ),
         ] {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, text).unwrap();
@@ -227,14 +287,46 @@ mod tests {
         let root = workspace("index");
         let indexed = index(&root.join("app"), CONSUMER);
 
-        let files: Vec<(&str, usize)> = indexed.iter().map(|d| (d.name.as_str(), d.files.len())).collect();
-        assert_eq!(files, vec![("fetched", 1), ("gone", 0), ("hosted", 0), ("pending", 0), ("shared", 1)]);
-        assert!(indexed[0].files[0].0.path().ends_with("/src/wire/frame.ids"));
+        let files: Vec<(&str, usize)> = indexed
+            .iter()
+            .map(|d| (d.name.as_str(), d.files.len()))
+            .collect();
+        assert_eq!(
+            files,
+            vec![
+                ("fetched", 1),
+                ("gone", 0),
+                ("hosted", 0),
+                ("pending", 0),
+                ("shared", 1)
+            ]
+        );
+        assert!(indexed[0].files[0]
+            .0
+            .path()
+            .ends_with("/src/wire/frame.ids"));
 
         // The manifests of the packages that are on disk.
-        let manifests: Vec<(&str, bool)> = indexed.iter().map(|d| (d.name.as_str(), d.manifest.is_some())).collect();
-        assert_eq!(manifests, vec![("fetched", true), ("gone", false), ("hosted", false), ("pending", false), ("shared", true)]);
-        assert!(indexed[4].manifest.as_ref().unwrap().1.contains("congregation shared"));
+        let manifests: Vec<(&str, bool)> = indexed
+            .iter()
+            .map(|d| (d.name.as_str(), d.manifest.is_some()))
+            .collect();
+        assert_eq!(
+            manifests,
+            vec![
+                ("fetched", true),
+                ("gone", false),
+                ("hosted", false),
+                ("pending", false),
+                ("shared", true)
+            ]
+        );
+        assert!(indexed[4]
+            .manifest
+            .as_ref()
+            .unwrap()
+            .1
+            .contains("congregation shared"));
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -271,15 +363,23 @@ mod tests {
     }
     #[test]
     fn an_unaccepted_unverified_protocol_is_reported_and_fixed() {
-        use lsp_types::{CodeActionContext, CodeActionOrCommand, CodeActionParams, TextDocumentIdentifier};
+        use lsp_types::{
+            CodeActionContext, CodeActionOrCommand, CodeActionParams, TextDocumentIdentifier,
+        };
 
-        let root = std::env::temp_dir().join(format!("comline-lsp-deps-unverified-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "comline-lsp-deps-unverified-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         let manifest = "congregation app\nspecification_version = 1\n\n\
             dependencies = {\n    billing = {\n        path = \"../billing\"\n    }\n}\n";
         for (path, text) in [
             (root.join("app/config.idp"), manifest),
-            (root.join("app/src/main.ids"), "struct Main {\n    id: u64\n}\n"),
+            (
+                root.join("app/src/main.ids"),
+                "struct Main {\n    id: u64\n}\n",
+            ),
             (
                 root.join("billing/config.idp"),
                 "congregation billing\nspecification_version = 1\n\
@@ -308,16 +408,30 @@ mod tests {
         let params = CodeActionParams {
             text_document: TextDocumentIdentifier { uri: uri.clone() },
             range: found[0].range,
-            context: CodeActionContext { diagnostics: found.clone(), only: None, trigger_kind: None },
+            context: CodeActionContext {
+                diagnostics: found.clone(),
+                only: None,
+                trigger_kind: None,
+            },
             work_done_progress_params: Default::default(),
             partial_result_params: Default::default(),
         };
         let actions = acceptance::code_actions(&app, &uri, manifest, &params);
-        let [CodeActionOrCommand::CodeAction(action)] = actions.as_slice() else { panic!("{actions:?}") };
-        assert_eq!(action.title, "Accept that `Billing` gives up schema agreement and encoding agreement");
+        let [CodeActionOrCommand::CodeAction(action)] = actions.as_slice() else {
+            panic!("{actions:?}")
+        };
+        assert_eq!(
+            action.title,
+            "Accept that `Billing` gives up schema agreement and encoding agreement"
+        );
         let edit = &action.edit.as_ref().unwrap().changes.as_ref().unwrap()[&uri][0];
         let offset = |p: lsp_types::Position| {
-            manifest.split_inclusive('\n').take(p.line as usize).map(str::len).sum::<usize>() + p.character as usize
+            manifest
+                .split_inclusive('\n')
+                .take(p.line as usize)
+                .map(str::len)
+                .sum::<usize>()
+                + p.character as usize
         };
         let fixed = format!(
             "{}{}{}",
@@ -341,7 +455,10 @@ mod tests {
     /// disk, so what it gives up is still reported.
     #[test]
     fn a_dependency_importing_its_own_dependency_is_still_checked() {
-        let root = std::env::temp_dir().join(format!("comline-lsp-deps-transitive-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "comline-lsp-deps-transitive-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         let manifest = "congregation app\nspecification_version = 1\n\n\
             dependencies = {\n    billing = {\n        path = \"../billing\"\n    }\n}\n";
@@ -368,7 +485,13 @@ mod tests {
 
         let found = manifest_diagnostics(&root.join("app"), manifest);
         assert_eq!(found.len(), 1, "{found:?}");
-        assert!(found[0].message.starts_with("protocol `Billing` is unverified"), "{}", found[0].message);
+        assert!(
+            found[0]
+                .message
+                .starts_with("protocol `Billing` is unverified"),
+            "{}",
+            found[0].message
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }

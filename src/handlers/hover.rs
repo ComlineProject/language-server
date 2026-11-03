@@ -9,16 +9,18 @@ use crate::handlers::annotation_hover::AnnotationHover;
 use crate::parser;
 use crate::util::{byte_range_to_lsp_range, in_comment_or_string, position_to_offset};
 use comline_core::schema::idl::annotations;
-use comline_core::schema::idl::grammar::{Declaration, Document, Expression, Field, Settings, Type};
+use comline_core::schema::idl::grammar::{
+    Declaration, Document, Expression, Field, Settings, Type,
+};
+use comline_core::schema::idl::module_docs::summary;
+use comline_core::schema::idl::size::{self, SizeLookup, SizeTarget, WireSize};
+use comline_core::schema::idl::vocabulary;
 use comline_core::schema::ir::compiler::interpreter::incremental::IncrementalInterpreter;
 use comline_core::schema::ir::compiler::Compile;
 use comline_core::settings::catalog;
 use comline_core::settings::effective::{
     effective_declaration_settings, effective_schema_settings, schema_settings,
 };
-use comline_core::schema::idl::module_docs::summary;
-use comline_core::schema::idl::size::{self, SizeLookup, SizeTarget, WireSize};
-use comline_core::schema::idl::vocabulary;
 use lsp_types::{Hover, HoverContents, MarkedString, Position, Url};
 
 /// Get hover information at a position, considering only this file.
@@ -92,7 +94,12 @@ pub fn get_hover_info_with_project<S: ProjectSource>(
     // This only needs `other_files` directly (for the manifest's package-
     // level settings), not any parsed sibling `Document`.
     if let Some(settings) = settings_block_at(&document, offset) {
-        return Some(create_settings_hover(settings, offset, &document, other_files));
+        return Some(create_settings_hover(
+            settings,
+            offset,
+            &document,
+            other_files,
+        ));
     }
 
     // Parse every sibling file once, up front, and keep them all alive for
@@ -142,7 +149,10 @@ pub fn get_hover_info_with_project<S: ProjectSource>(
     parsed.sort_by_key(|(_, namespace)| !imports_reach(&own_imports, namespace));
     let (other_docs, origins): (Vec<Sibling>, Vec<Origin>) = parsed.into_iter().unzip();
 
-    let lookup = HoverSizeLookup { local: &document, others: &other_docs };
+    let lookup = HoverSizeLookup {
+        local: &document,
+        others: &other_docs,
+    };
 
     // A symbol in this file. The cursor sitting on a declaration's own
     // name resolves by position; anything else is a reference, resolved in
@@ -161,7 +171,11 @@ pub fn get_hover_info_with_project<S: ProjectSource>(
     let siblings: Vec<ProjectFile> = other_docs
         .iter()
         .zip(&origins)
-        .map(|((u, s, _), namespace)| ProjectFile { uri: u, source: s, namespace: namespace.clone() })
+        .map(|((u, s, _), namespace)| ProjectFile {
+            uri: u,
+            source: s,
+            namespace: namespace.clone(),
+        })
         .collect();
 
     if let Some(resolved) = imports::resolve_symbol(&word, &own_imports, &siblings) {
@@ -199,7 +213,10 @@ pub fn get_hover_info_with_project<S: ProjectSource>(
 
 /// Whether one of `uses` points into the file seen under `namespace`.
 fn imports_reach(uses: &[imports::ResolvedUse], namespace: &[String]) -> bool {
-    !namespace.is_empty() && uses.iter().any(|u| u.resolved.absolute_namespace.starts_with(namespace))
+    !namespace.is_empty()
+        && uses
+            .iter()
+            .any(|u| u.resolved.absolute_namespace.starts_with(namespace))
 }
 
 /// A parsed sibling file: its URI, text and tree.
@@ -261,7 +278,11 @@ fn fully_resolve_alias_chain(
         let Type::Named(id) = &current else { break };
         let name = id.to_string();
         let next = find_type_alias_declaration(local, &name)
-            .or_else(|| others.iter().find_map(|(_, _, doc)| find_type_alias_declaration(doc, &name)))
+            .or_else(|| {
+                others
+                    .iter()
+                    .find_map(|(_, _, doc)| find_type_alias_declaration(doc, &name))
+            })
             .map(|t| t.target_type().clone());
         match next {
             Some(t) => current = t,
@@ -281,7 +302,11 @@ fn fully_resolve_alias_chain(
 fn format_wire_size(size: WireSize) -> String {
     match size {
         WireSize::Fixed(bytes) => {
-            format!("wire size (fixed, raw-packed estimate): {} ({} bits)", byte_count(bytes), bytes * 8)
+            format!(
+                "wire size (fixed, raw-packed estimate): {} ({} bits)",
+                byte_count(bytes),
+                bytes * 8
+            )
         }
         WireSize::Variable => "wire size: variable".to_string(),
         WireSize::Unknown => "wire size: unknown".to_string(),
@@ -324,11 +349,20 @@ fn field_size(f: &Field, lookup: &HoverSizeLookup) -> WireSize {
 /// (array-form) MsgPack encoding actually keys on, and the number the
 /// append-only field discipline (see Versioning rules) protects.
 /// `- #0 name: 8 bytes` / `- #1 name: variable`.
-fn render_field_sizes(s: &comline_core::schema::idl::grammar::Struct, lookup: &HoverSizeLookup) -> String {
+fn render_field_sizes(
+    s: &comline_core::schema::idl::grammar::Struct,
+    lookup: &HoverSizeLookup,
+) -> String {
     s.fields()
         .iter()
         .enumerate()
-        .map(|(index, f)| format!("- #{index} {}: {}", f.name(), render_size_oneline(field_size(f, lookup))))
+        .map(|(index, f)| {
+            format!(
+                "- #{index} {}: {}",
+                f.name(),
+                render_size_oneline(field_size(f, lookup))
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -345,7 +379,12 @@ const LISTED: usize = 20;
 /// `None` when the cursor isn't on such a segment, when it's in a comment or
 /// string, and for a last segment that names a declaration (`StringBounds`):
 /// that's the declaration's hover.
-fn module_hover<S: ProjectSource>(source: &str, uri: &Url, offset: usize, other_files: &[S]) -> Option<Hover> {
+fn module_hover<S: ProjectSource>(
+    source: &str,
+    uri: &Url,
+    offset: usize,
+    other_files: &[S],
+) -> Option<Hover> {
     let project = Project::with_active(uri, source, other_files);
     let (namespace, range) = modules::path_module_at(source, uri, offset, &project)?;
 
@@ -369,15 +408,23 @@ fn module_contents(module: &Module) -> Vec<MarkedString> {
 
     let mut lists = Vec::new();
     if !module.modules.is_empty() {
-        let entries: Vec<(String, Option<&str>)> =
-            module.modules.iter().map(|m| (format!("`{}`", m.name), m.docs.as_deref())).collect();
+        let entries: Vec<(String, Option<&str>)> = module
+            .modules
+            .iter()
+            .map(|m| (format!("`{}`", m.name), m.docs.as_deref()))
+            .collect();
         lists.push(entries_list("Modules", &entries));
     }
     if !module.declarations.is_empty() {
         let entries: Vec<(String, Option<&str>)> = module
             .declarations
             .iter()
-            .map(|d| (format!("`{} {}`", d.kind.keyword(), d.name), d.docs.as_deref()))
+            .map(|d| {
+                (
+                    format!("`{} {}`", d.kind.keyword(), d.name),
+                    d.docs.as_deref(),
+                )
+            })
             .collect();
         lists.push(entries_list("Declares", &entries));
     }
@@ -404,7 +451,11 @@ fn entries_list(heading: &str, entries: &[(String, Option<&str>)]) -> String {
 }
 
 /// Create hover for a symbol (struct, enum, protocol, const)
-fn create_symbol_hover(symbol: &symbols::Symbol, document: &Document, lookup: &HoverSizeLookup) -> Hover {
+fn create_symbol_hover(
+    symbol: &symbols::Symbol,
+    document: &Document,
+    lookup: &HoverSizeLookup,
+) -> Hover {
     use lsp_types::SymbolKind;
 
     let mut contents = vec![];
@@ -415,7 +466,8 @@ fn create_symbol_hover(symbol: &symbols::Symbol, document: &Document, lookup: &H
         SymbolKind::STRUCT => {
             // Find the struct to get its fields
             if let Some(s) = find_struct_declaration(document, &symbol.name) {
-                let fields: Vec<String> = s.fields()
+                let fields: Vec<String> = s
+                    .fields()
                     .iter()
                     .map(|f| {
                         let opt = if f.optional() { "optional " } else { "" };
@@ -424,7 +476,11 @@ fn create_symbol_hover(symbol: &symbols::Symbol, document: &Document, lookup: &H
                     .collect();
 
                 let total = size::size_of_struct(s, lookup);
-                let size_block = format!("{}\n{}", format_wire_size(total), render_field_sizes(s, lookup));
+                let size_block = format!(
+                    "{}\n{}",
+                    format_wire_size(total),
+                    render_field_sizes(s, lookup)
+                );
 
                 (
                     format!("struct {} {{\n{}\n}}", symbol.name, fields.join("\n")),
@@ -437,7 +493,8 @@ fn create_symbol_hover(symbol: &symbols::Symbol, document: &Document, lookup: &H
         }
         SymbolKind::ENUM => {
             if let Some(e) = find_enum_declaration(document, &symbol.name) {
-                let variants: Vec<String> = e.variants()
+                let variants: Vec<String> = e
+                    .variants()
                     .iter()
                     .map(|v| format!("  {}", v.identifier().text))
                     .collect();
@@ -455,14 +512,17 @@ fn create_symbol_hover(symbol: &symbols::Symbol, document: &Document, lookup: &H
         }
         SymbolKind::INTERFACE => {
             if let Some(p) = find_protocol_declaration(document, &symbol.name) {
-                let functions: Vec<String> = p.functions()
+                let functions: Vec<String> = p
+                    .functions()
                     .iter()
                     .map(|f| {
                         let args = if let Some(args_list) = f.args() {
                             let mut arg_types = vec![format_type(args_list.first().arg_type())];
                             arg_types.extend(
-                                args_list.rest().iter()
-                                    .map(|ca| format_type(ca.arg_type().arg_type()))
+                                args_list
+                                    .rest()
+                                    .iter()
+                                    .map(|ca| format_type(ca.arg_type().arg_type())),
                             );
                             arg_types.join(", ")
                         } else {
@@ -479,14 +539,22 @@ fn create_symbol_hover(symbol: &symbols::Symbol, document: &Document, lookup: &H
                     })
                     .collect();
 
-                (format!("protocol {} {{\n{}\n}}", symbol.name, functions.join("\n")), p.docstring(), None)
+                (
+                    format!("protocol {} {{\n{}\n}}", symbol.name, functions.join("\n")),
+                    p.docstring(),
+                    None,
+                )
             } else {
                 (format!("protocol {}", symbol.name), None, None)
             }
         }
         SymbolKind::CONSTANT => {
             if let Some(c) = find_const_declaration(document, &symbol.name) {
-                (format!("const {}: {}", c.name(), format_type(c.type_def())), c.docstring(), None)
+                (
+                    format!("const {}: {}", c.name(), format_type(c.type_def())),
+                    c.docstring(),
+                    None,
+                )
             } else {
                 (format!("const {}", symbol.name), None, None)
             }
@@ -507,8 +575,11 @@ fn create_symbol_hover(symbol: &symbols::Symbol, document: &Document, lookup: &H
                     })
                     .collect();
                 let signature = format!("{annotations}type {} = {}", symbol.name, target_text);
-                let resolved_text =
-                    format_type(&fully_resolve_alias_chain(target, lookup.local, lookup.others));
+                let resolved_text = format_type(&fully_resolve_alias_chain(
+                    target,
+                    lookup.local,
+                    lookup.others,
+                ));
 
                 // Only call out the fully-resolved type when it differs from
                 // the one-level target written in the source - matching
@@ -531,36 +602,51 @@ fn create_symbol_hover(symbol: &symbols::Symbol, document: &Document, lookup: &H
         }
         SymbolKind::EVENT => {
             if let Some(e) = find_error_declaration(document, &symbol.name) {
-                let fields: Vec<String> = e.fields()
+                let fields: Vec<String> = e
+                    .fields()
                     .iter()
                     .map(|f| {
                         let opt = if f.optional() { "optional " } else { "" };
                         format!("  {}{}: {}", opt, f.name(), format_type(f.field_type()))
                     })
                     .collect();
-                (format!("error {} {{\n{}\n}}", symbol.name, fields.join("\n")), e.docstring(), None)
+                (
+                    format!("error {} {{\n{}\n}}", symbol.name, fields.join("\n")),
+                    e.docstring(),
+                    None,
+                )
             } else {
                 (format!("error {}", symbol.name), None, None)
             }
         }
         SymbolKind::FUNCTION => {
             if let Some(v) = find_validator_declaration(document, &symbol.name) {
-                let params: Vec<String> = v.properties()
+                let params: Vec<String> = v
+                    .properties()
                     .iter()
                     .map(|p| format!("{}: {}", p.name(), format_type(p.property_type())))
                     .collect();
-                (format!("validator {}({})", symbol.name, params.join(", ")), v.docstring(), None)
+                (
+                    format!("validator {}({})", symbol.name, params.join(", ")),
+                    v.docstring(),
+                    None,
+                )
             } else {
                 (format!("validator {}", symbol.name), None, None)
             }
         }
         SymbolKind::OBJECT => {
             if let Some(s) = find_settings_declaration(document, &symbol.name) {
-                let entries: Vec<String> = s.entries()
+                let entries: Vec<String> = s
+                    .entries()
                     .iter()
                     .map(|e| format!("  {} = {}", e.key(), e.value_string()))
                     .collect();
-                (format!("settings {} {{\n{}\n}}", symbol.name, entries.join("\n")), s.docstring(), None)
+                (
+                    format!("settings {} {{\n{}\n}}", symbol.name, entries.join("\n")),
+                    s.docstring(),
+                    None,
+                )
             } else {
                 (format!("settings {}", symbol.name), None, None)
             }
@@ -568,7 +654,10 @@ fn create_symbol_hover(symbol: &symbols::Symbol, document: &Document, lookup: &H
         _ => (symbol.name.clone(), None, None),
     };
 
-    contents.push(MarkedString::from_language_code("comline".to_string(), signature));
+    contents.push(MarkedString::from_language_code(
+        "comline".to_string(),
+        signature,
+    ));
     if let Some(doc) = doc {
         contents.push(MarkedString::from_markdown(doc));
     }
@@ -591,7 +680,7 @@ fn create_symbol_hover(symbol: &symbols::Symbol, document: &Document, lookup: &H
             contents.push(MarkedString::from_markdown(format!("*{}*", detail)));
         }
     }
-    
+
     Hover {
         contents: HoverContents::Array(contents),
         range: None,
@@ -624,7 +713,11 @@ fn create_settings_hover<S: ProjectSource>(
     document: &Document,
     other_files: &[S],
 ) -> Hover {
-    match settings.entries().iter().find(|e| offset >= e.span.0 && offset < e.span.1) {
+    match settings
+        .entries()
+        .iter()
+        .find(|e| offset >= e.span.0 && offset < e.span.1)
+    {
         Some(entry) => create_settings_entry_hover(settings, entry, document, other_files),
         None => create_settings_block_hover(settings),
     }
@@ -635,23 +728,48 @@ fn create_settings_hover<S: ProjectSource>(
 /// `find_settings_declaration`) — now also reachable for unnamed ones —
 /// plus a "what's recognized here" catalog listing.
 fn create_settings_block_hover(settings: &Settings) -> Hover {
-    let entries: Vec<String> =
-        settings.entries().iter().map(|e| format!("  {} = {}", e.key(), e.value_string())).collect();
+    let entries: Vec<String> = settings
+        .entries()
+        .iter()
+        .map(|e| format!("  {} = {}", e.key(), e.value_string()))
+        .collect();
     let label = settings.name().unwrap_or_default();
-    let signature = format!("settings {}{{\n{}\n}}", if label.is_empty() { String::new() } else { format!("{label} ") }, entries.join("\n"));
+    let signature = format!(
+        "settings {}{{\n{}\n}}",
+        if label.is_empty() {
+            String::new()
+        } else {
+            format!("{label} ")
+        },
+        entries.join("\n")
+    );
 
-    let mut contents = vec![MarkedString::from_language_code("comline".to_string(), signature)];
+    let mut contents = vec![MarkedString::from_language_code(
+        "comline".to_string(),
+        signature,
+    )];
     if let Some(doc) = settings.docstring() {
         contents.push(MarkedString::from_markdown(doc));
     }
 
-    let catalog_lines: Vec<String> =
-        catalog::block_summary().iter().map(|f| format!("- `{}` - {}", f.key_pattern, f.summary)).collect();
-    contents.push(MarkedString::from_markdown(format!("**recognized keys**\n{}", catalog_lines.join("\n"))));
+    let catalog_lines: Vec<String> = catalog::block_summary()
+        .iter()
+        .map(|f| format!("- `{}` - {}", f.key_pattern, f.summary))
+        .collect();
+    contents.push(MarkedString::from_markdown(format!(
+        "**recognized keys**\n{}",
+        catalog_lines.join("\n")
+    )));
 
-    contents.push(MarkedString::from_markdown(format!("*{} settings*", settings.entries().len())));
+    contents.push(MarkedString::from_markdown(format!(
+        "*{} settings*",
+        settings.entries().len()
+    )));
 
-    Hover { contents: HoverContents::Array(contents), range: None }
+    Hover {
+        contents: HoverContents::Array(contents),
+        range: None,
+    }
 }
 
 /// Entry-level: the raw as-written `key = value` (unchanged content), a
@@ -673,22 +791,27 @@ fn create_settings_entry_hover<S: ProjectSource>(
     let key_path = entry.key_path();
     let segments: Vec<&str> = key_path.iter().map(String::as_str).collect();
     if let Some(m) = catalog::match_path(&segments) {
-        contents.push(MarkedString::from_markdown(catalog::doc_for(&m).description.to_string()));
+        contents.push(MarkedString::from_markdown(
+            catalog::doc_for(&m).description.to_string(),
+        ));
     }
 
     let package_settings = other_files
         .iter()
         .find(|f| f.dependency().is_none() && source::is_manifest(f.uri()))
-        .map(|f| match source::resolve_cross_package_settings(f.text(), other_files) {
-            Some(Ok(dict)) => dict,
-            Some(Err(_)) => source::base_settings(),
-            None => source::declared_settings(f.text()),
-        })
+        .map(
+            |f| match source::resolve_cross_package_settings(f.text(), other_files) {
+                Some(Ok(dict)) => dict,
+                Some(Err(_)) => source::base_settings(),
+                None => source::declared_settings(f.text()),
+            },
+        )
         .unwrap_or_else(source::base_settings);
     let schema_units = IncrementalInterpreter::from_declarations(document.0.clone());
     let schema = schema_settings(&schema_units);
     let schema_effective = effective_schema_settings(&package_settings, &schema);
-    let effective = effective_declaration_settings(&schema_effective, &schema, settings.name().as_deref());
+    let effective =
+        effective_declaration_settings(&schema_effective, &schema, settings.name().as_deref());
 
     // `{value}`, not `{value:?}`: the latter printed `Bool(false)` where
     // the file said `false`.
@@ -697,12 +820,17 @@ fn create_settings_entry_hover<S: ProjectSource>(
         None => "effective: not set — allowed by default".to_string(),
     };
     let effective_line = match settings.name() {
-        Some(name) => format!("{effective_line} (applies to declarations using `@settings = {name}`)"),
+        Some(name) => {
+            format!("{effective_line} (applies to declarations using `@settings = {name}`)")
+        }
         None => effective_line,
     };
     contents.push(MarkedString::from_markdown(effective_line));
 
-    Hover { contents: HoverContents::Array(contents), range: None }
+    Hover {
+        contents: HoverContents::Array(contents),
+        range: None,
+    }
 }
 
 /// Create hover for a type reference
@@ -711,7 +839,7 @@ fn create_type_hover(type_name: &str, type_kind: &str) -> Hover {
         MarkedString::from_language_code("comline".to_string(), type_name.to_string()),
         MarkedString::from_markdown(format!("*{}*", type_kind)),
     ];
-    
+
     Hover {
         contents: HoverContents::Array(contents),
         range: None,
@@ -794,17 +922,29 @@ fn create_field_hover(info: &FieldHoverInfo) -> Hover {
         .map(|d| format!(" = {d}"))
         .unwrap_or_default();
     let signature = format!("{opt}{}: {}{default}", info.name, info.type_text);
-    contents.push(MarkedString::from_language_code("comline".to_string(), signature));
+    contents.push(MarkedString::from_language_code(
+        "comline".to_string(),
+        signature,
+    ));
 
     if let Some(doc) = &info.docstring {
         contents.push(MarkedString::from_markdown(doc.clone()));
     }
 
     let mut detail = vec![
-        format!("field **#{}** of `{}` ({} field{})", info.index, info.container, info.total, if info.total == 1 { "" } else { "s" }),
+        format!(
+            "field **#{}** of `{}` ({} field{})",
+            info.index,
+            info.container,
+            info.total,
+            if info.total == 1 { "" } else { "s" }
+        ),
         format!("size: {}", render_size_oneline(info.size)),
     ];
-    detail.push(format!("optional: {}", if info.optional { "yes" } else { "no" }));
+    detail.push(format!(
+        "optional: {}",
+        if info.optional { "yes" } else { "no" }
+    ));
     if !info.annotations.is_empty() {
         detail.push(format!("annotations: {}", info.annotations.join(", ")));
     }
@@ -813,6 +953,20 @@ fn create_field_hover(info: &FieldHoverInfo) -> Hover {
     Hover {
         contents: HoverContents::Array(contents),
         range: None,
+    }
+}
+
+/// A size as written: `N` (exactly N) or `max N` (at most N, a bound),
+/// N being an integer or a constant's name.
+fn format_size(size: &comline_core::schema::idl::grammar::ArraySize) -> String {
+    use comline_core::schema::idl::grammar::{ArraySize, SizeValue};
+    let value = |v: &SizeValue| match v {
+        SizeValue::Integer(i) => i.value().to_string(),
+        SizeValue::Constant(c) => c.text.clone(),
+    };
+    match size {
+        ArraySize::Max(max) => format!("max {}", value(&max.value)),
+        ArraySize::Exact(exact) => value(exact),
     }
 }
 
@@ -828,7 +982,7 @@ fn format_type(ty: &Type) -> String {
         Type::Named(name) => name.text.clone(),
         Type::Array(arr) => {
             if let Some(size) = &arr.size {
-                format!("{}[{}]", format_type(arr.elem_type()), size.value)
+                format!("{}[{}]", format_type(arr.elem_type()), format_size(size))
             } else {
                 format!("{}[]", format_type(arr.elem_type()))
             }
@@ -850,23 +1004,26 @@ fn get_word_at_offset(source: &str, offset: usize) -> Option<String> {
     if offset >= source.len() {
         return None;
     }
-    
+
     // Find word boundaries
     let start = source[..offset]
         .rfind(|c: char| !c.is_alphanumeric() && c != '_')
         .map(|i| i + 1)
         .unwrap_or(0);
-    
+
     let end = source[offset..]
         .find(|c: char| !c.is_alphanumeric() && c != '_')
         .map(|i| offset + i)
         .unwrap_or(source.len());
-    
+
     Some(source[start..end].to_string())
 }
 
 /// Find type at position
-fn find_type_at_position(document: &comline_core::schema::idl::grammar::Document, word: &str) -> Option<&'static str> {
+fn find_type_at_position(
+    document: &comline_core::schema::idl::grammar::Document,
+    word: &str,
+) -> Option<&'static str> {
     // Check if it's a primitive type — delegates to `vocabulary` so this
     // can't list a name the grammar doesn't actually have (it used to
     // hand-roll this match, independently of the one in `completion.rs`
@@ -967,7 +1124,10 @@ fn format_expression(e: &Expression) -> String {
 }
 
 // Helper functions to find declarations
-fn find_struct_declaration<'a>(document: &'a comline_core::schema::idl::grammar::Document, name: &str) -> Option<&'a comline_core::schema::idl::grammar::Struct> {
+fn find_struct_declaration<'a>(
+    document: &'a comline_core::schema::idl::grammar::Document,
+    name: &str,
+) -> Option<&'a comline_core::schema::idl::grammar::Struct> {
     for decl in &document.0 {
         if let Declaration::Struct(s) = &**decl {
             if s.name() == name {
@@ -978,7 +1138,10 @@ fn find_struct_declaration<'a>(document: &'a comline_core::schema::idl::grammar:
     None
 }
 
-fn find_enum_declaration<'a>(document: &'a comline_core::schema::idl::grammar::Document, name: &str) -> Option<&'a comline_core::schema::idl::grammar::Enum> {
+fn find_enum_declaration<'a>(
+    document: &'a comline_core::schema::idl::grammar::Document,
+    name: &str,
+) -> Option<&'a comline_core::schema::idl::grammar::Enum> {
     for decl in &document.0 {
         if let Declaration::Enum(e) = &**decl {
             if e.name() == name {
@@ -989,7 +1152,10 @@ fn find_enum_declaration<'a>(document: &'a comline_core::schema::idl::grammar::D
     None
 }
 
-fn find_protocol_declaration<'a>(document: &'a comline_core::schema::idl::grammar::Document, name: &str) -> Option<&'a comline_core::schema::idl::grammar::Protocol> {
+fn find_protocol_declaration<'a>(
+    document: &'a comline_core::schema::idl::grammar::Document,
+    name: &str,
+) -> Option<&'a comline_core::schema::idl::grammar::Protocol> {
     for decl in &document.0 {
         if let Declaration::Protocol(p) = &**decl {
             if p.name() == name {
@@ -1000,7 +1166,10 @@ fn find_protocol_declaration<'a>(document: &'a comline_core::schema::idl::gramma
     None
 }
 
-fn find_const_declaration<'a>(document: &'a comline_core::schema::idl::grammar::Document, name: &str) -> Option<&'a comline_core::schema::idl::grammar::Const> {
+fn find_const_declaration<'a>(
+    document: &'a comline_core::schema::idl::grammar::Document,
+    name: &str,
+) -> Option<&'a comline_core::schema::idl::grammar::Const> {
     for decl in &document.0 {
         if let Declaration::Const(c) = &**decl {
             if c.name() == name {
@@ -1011,7 +1180,10 @@ fn find_const_declaration<'a>(document: &'a comline_core::schema::idl::grammar::
     None
 }
 
-fn find_type_alias_declaration<'a>(document: &'a comline_core::schema::idl::grammar::Document, name: &str) -> Option<&'a comline_core::schema::idl::grammar::TypeAlias> {
+fn find_type_alias_declaration<'a>(
+    document: &'a comline_core::schema::idl::grammar::Document,
+    name: &str,
+) -> Option<&'a comline_core::schema::idl::grammar::TypeAlias> {
     for decl in &document.0 {
         if let Declaration::TypeAlias(t) = &**decl {
             if t.name() == name {
@@ -1022,7 +1194,10 @@ fn find_type_alias_declaration<'a>(document: &'a comline_core::schema::idl::gram
     None
 }
 
-fn find_error_declaration<'a>(document: &'a comline_core::schema::idl::grammar::Document, name: &str) -> Option<&'a comline_core::schema::idl::grammar::Error> {
+fn find_error_declaration<'a>(
+    document: &'a comline_core::schema::idl::grammar::Document,
+    name: &str,
+) -> Option<&'a comline_core::schema::idl::grammar::Error> {
     for decl in &document.0 {
         if let Declaration::Error(e) = &**decl {
             if e.name() == name {
@@ -1033,7 +1208,10 @@ fn find_error_declaration<'a>(document: &'a comline_core::schema::idl::grammar::
     None
 }
 
-fn find_validator_declaration<'a>(document: &'a comline_core::schema::idl::grammar::Document, name: &str) -> Option<&'a comline_core::schema::idl::grammar::Validator> {
+fn find_validator_declaration<'a>(
+    document: &'a comline_core::schema::idl::grammar::Document,
+    name: &str,
+) -> Option<&'a comline_core::schema::idl::grammar::Validator> {
     for decl in &document.0 {
         if let Declaration::Validator(v) = &**decl {
             if v.name() == name {
@@ -1044,7 +1222,10 @@ fn find_validator_declaration<'a>(document: &'a comline_core::schema::idl::gramm
     None
 }
 
-fn find_settings_declaration<'a>(document: &'a comline_core::schema::idl::grammar::Document, name: &str) -> Option<&'a comline_core::schema::idl::grammar::Settings> {
+fn find_settings_declaration<'a>(
+    document: &'a comline_core::schema::idl::grammar::Document,
+    name: &str,
+) -> Option<&'a comline_core::schema::idl::grammar::Settings> {
     for decl in &document.0 {
         if let Declaration::Settings(s) = &**decl {
             if s.name().as_deref() == Some(name) {
@@ -1059,7 +1240,7 @@ fn find_settings_declaration<'a>(document: &'a comline_core::schema::idl::gramma
 mod tests {
     use super::*;
     use crate::util::offset_to_position;
-    
+
     #[test]
     fn test_hover_on_struct() {
         let source = r#"
@@ -1071,7 +1252,7 @@ struct User {
         let uri = Url::parse("file:///test.ids").unwrap();
         // Hover over "User" on line 1
         let position = Position::new(1, 8);
-        
+
         let hover = get_hover_info(source, &uri, position);
         assert!(hover.is_some());
 
@@ -1120,7 +1301,8 @@ struct User {
 
     #[test]
     fn test_struct_hover_shows_field_indices() {
-        let source = "struct Greeting {\n    message: string\n    language: string\n    test: bool\n}\n";
+        let source =
+            "struct Greeting {\n    message: string\n    language: string\n    test: bool\n}\n";
         let uri = Url::parse("file:///test.ids").unwrap();
         // Hover over "Greeting" on line 0.
         let position = Position::new(0, 8);
@@ -1133,8 +1315,26 @@ struct User {
     }
 
     #[test]
+    fn a_bounded_field_shows_its_maximum_as_written() {
+        let source =
+            "struct Order {\n    sku: char[8]\n    note: char[max 280]\n    tags: u32[max 10]\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        for (line, written) in [
+            (1, "sku: char[8]"),
+            (2, "note: char[max 280]"),
+            (3, "tags: u32[max 10]"),
+        ] {
+            let hover =
+                get_hover_info(source, &uri, Position::new(line, 6)).expect("hover should resolve");
+            let text = hover_text(hover);
+            assert!(text.contains(written), "got: {text}");
+        }
+    }
+
+    #[test]
     fn test_hover_on_a_field_name_shows_its_own_info() {
-        let source = "struct Greeting {\n    message: string\n    language: string\n    test: bool\n}\n";
+        let source =
+            "struct Greeting {\n    message: string\n    language: string\n    test: bool\n}\n";
         let uri = Url::parse("file:///test.ids").unwrap();
         // Hover over "language" (the field name) on line 2.
         let position = Position::new(2, 6);
@@ -1151,7 +1351,8 @@ struct User {
 
     #[test]
     fn a_one_byte_field_says_1_byte_not_1_bytes() {
-        let source = "struct Greeting {\n    message: string\n    language: string\n    test: bool\n}\n";
+        let source =
+            "struct Greeting {\n    message: string\n    language: string\n    test: bool\n}\n";
         let uri = Url::parse("file:///test.ids").unwrap();
         // Hover over "test" (the `bool` field, 1 byte wide) on line 3.
         let position = Position::new(3, 6);
@@ -1334,11 +1535,11 @@ enum Status {
 "#;
         let uri = Url::parse("file:///test.ids").unwrap();
         let position = Position::new(1, 6);
-        
+
         let hover = get_hover_info(source, &uri, position);
         assert!(hover.is_some());
     }
-    
+
     #[test]
     fn test_hover_on_type() {
         let source = r#"
@@ -1372,7 +1573,10 @@ struct User {
         let hover = get_hover_info(SHARED_NAME, &uri, position).expect("hover should resolve");
         let text = hover_text(hover);
         assert!(text.contains("struct"), "got: {text}");
-        assert!(!text.contains("validators.allowed"), "settings block's tooltip: {text}");
+        assert!(
+            !text.contains("validators.allowed"),
+            "settings block's tooltip: {text}"
+        );
     }
 
     #[test]
@@ -1462,7 +1666,10 @@ protocol Chat {
             chat_source,
             &Url::parse("file:///chat.ids").unwrap(),
             Position::new(1, 37),
-            &[(Url::parse("file:///types.ids").unwrap(), types_source.to_string())],
+            &[(
+                Url::parse("file:///types.ids").unwrap(),
+                types_source.to_string(),
+            )],
         );
 
         let text = hover.map(hover_text).unwrap_or_default();
@@ -1473,10 +1680,15 @@ protocol Chat {
     /// struct's is unknown, not the unimported declaration's estimate.
     #[test]
     fn a_size_does_not_count_an_unimported_type() {
-        let types = [(Url::parse("file:///types.ids").unwrap(), "struct Message {\n    seq: u64\n}\n".to_string())];
+        let types = [(
+            Url::parse("file:///types.ids").unwrap(),
+            "struct Message {\n    seq: u64\n}\n".to_string(),
+        )];
         let uri = Url::parse("file:///chat.ids").unwrap();
         let hover_on = |source: &str, line: u32| {
-            get_hover_info_with_project(source, &uri, Position::new(line, 8), &types).map(hover_text).unwrap_or_default()
+            get_hover_info_with_project(source, &uri, Position::new(line, 8), &types)
+                .map(hover_text)
+                .unwrap_or_default()
         };
 
         let text = hover_on("struct S {\n    m: Message\n}\n", 0);
@@ -1493,7 +1705,9 @@ protocol Chat {
         let uri = Url::parse("file:///pkg/src/none.ids").unwrap();
         let body = "@validators = [StringBounds()]\ntype FixedNum = u8[2]\n";
         let hover_on = |source: &str, line: u32| {
-            get_hover_info_with_project(source, &uri, Position::new(line, 18), &std).map(hover_text).unwrap_or_default()
+            get_hover_info_with_project(source, &uri, Position::new(line, 18), &std)
+                .map(hover_text)
+                .unwrap_or_default()
         };
 
         let text = hover_on(body, 0);
@@ -1567,7 +1781,10 @@ protocol Chat {
 
         let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
         let text = hover_text(hover);
-        assert!(text.contains("type UserId") && text.contains("u64"), "got: {text}");
+        assert!(
+            text.contains("type UserId") && text.contains("u64"),
+            "got: {text}"
+        );
     }
 
     #[test]
@@ -1603,7 +1820,8 @@ protocol Chat {
 
     #[test]
     fn use_types_message_resolves_silently_no_note() {
-        let chat_source = "use types::Message\n\nprotocol Chat {\n    function send() -> Message;\n}\n";
+        let chat_source =
+            "use types::Message\n\nprotocol Chat {\n    function send() -> Message;\n}\n";
         let types_source = "struct Message {\n    text: string\n}\n";
 
         let chat_uri = Url::parse("file:///chat.ids").unwrap();
@@ -1680,8 +1898,7 @@ protocol Chat {
 
     #[test]
     fn use_glob_resolves_anything_in_the_namespace_silently() {
-        let active_source =
-            "use types::*\n\nprotocol P {\n    function f() -> Message;\n}\n";
+        let active_source = "use types::*\n\nprotocol P {\n    function f() -> Message;\n}\n";
         let types_source = "struct Message {\n    text: string\n}\n";
 
         let active_uri = Url::parse("file:///active.ids").unwrap();
@@ -1733,11 +1950,15 @@ protocol Chat {
         let position = Position::new(3, 9);
         let std = crate::analysis::stdlib::files(&crate::analysis::stdlib::root());
 
-        let hover = get_hover_info_with_project(active_source, &active_uri, position, &std).expect("std resolves");
+        let hover = get_hover_info_with_project(active_source, &active_uri, position, &std)
+            .expect("std resolves");
         let text = hover_text(hover);
 
         assert!(text.contains("struct Request"), "got: {text}");
-        assert!(text.contains("An HTTP request"), "std's docstring, got: {text}");
+        assert!(
+            text.contains("An HTTP request"),
+            "std's docstring, got: {text}"
+        );
     }
 
     fn package_with_dependency(active_uri: &str) -> Vec<crate::analysis::source::SourceFile> {
@@ -1777,7 +1998,10 @@ protocol Chat {
     use crate::analysis::source::SourceFile;
 
     fn local(path: &str, text: &str) -> SourceFile {
-        SourceFile::local(Url::parse(&format!("file:///pkg/{path}")).unwrap(), text.to_string())
+        SourceFile::local(
+            Url::parse(&format!("file:///pkg/{path}")).unwrap(),
+            text.to_string(),
+        )
     }
 
     /// The files of a package with documented modules, and std.
@@ -1787,7 +2011,9 @@ protocol Chat {
             local("src/api.ids", "//! The API.\n\nstruct Root {\n    id: u64\n}\n"),
             local("src/api/common.ids", "//! Things every API schema needs.\n\nstruct Error {\n    code: u32\n}\n"),
         ];
-        files.extend(crate::analysis::stdlib::files(&crate::analysis::stdlib::root()));
+        files.extend(crate::analysis::stdlib::files(
+            &crate::analysis::stdlib::root(),
+        ));
         files
     }
 
@@ -1804,7 +2030,10 @@ protocol Chat {
     fn a_module_segment_shows_its_docs_and_the_types_it_declares() {
         let text = hover_in("chat.ids", "use types::User\n", "types", 1).expect("module hover");
         assert!(text.contains("module types"), "{text}");
-        assert!(text.contains("The package's types.\n\nShared by everything."), "{text}");
+        assert!(
+            text.contains("The package's types.\n\nShared by everything."),
+            "{text}"
+        );
         assert!(text.contains("**Declares**"), "{text}");
         assert!(text.contains("- `struct User` — Someone."), "{text}");
     }
@@ -1815,33 +2044,62 @@ protocol Chat {
 
         let package = hover_in("chat.ids", source, "std", 0).unwrap();
         assert!(package.contains("package std"), "{package}");
-        assert!(package.contains("The Comline standard library."), "its config.idp docs: {package}");
+        assert!(
+            package.contains("The Comline standard library."),
+            "its config.idp docs: {package}"
+        );
         assert!(package.contains("**Modules**"), "{package}");
-        assert!(package.contains("- `http` — Types for talking HTTP: request methods, requests and responses."), "{package}");
-        assert!(package.contains("- `validators` — Validators to attach to fields with `@validators`."), "{package}");
+        assert!(
+            package.contains(
+                "- `http` — Types for talking HTTP: request methods, requests and responses."
+            ),
+            "{package}"
+        );
+        assert!(
+            package.contains("- `validators` — Validators to attach to fields with `@validators`."),
+            "{package}"
+        );
 
         let module = hover_in("chat.ids", source, "validators", 0).unwrap();
         assert!(module.contains("module std::validators"), "{module}");
-        assert!(module.contains("Validators to attach to fields with `@validators`."), "{module}");
+        assert!(
+            module.contains("Validators to attach to fields with `@validators`."),
+            "{module}"
+        );
         assert!(module.contains("- `validator StringBounds` — Checks a string's length is within a minimum and a maximum."), "{module}");
-        assert!(!module.contains("**Modules**"), "a schema has no modules below it: {module}");
+        assert!(
+            !module.contains("**Modules**"),
+            "a schema has no modules below it: {module}"
+        );
     }
 
     #[test]
     fn a_last_segment_that_names_a_declaration_keeps_its_own_hover() {
         let text = hover_in("chat.ids", "use std::http::Request\n", "Request", 0).unwrap();
         assert!(text.contains("struct Request"), "{text}");
-        assert!(!text.contains("module"), "the declaration, not a module: {text}");
+        assert!(
+            !text.contains("module"),
+            "the declaration, not a module: {text}"
+        );
     }
 
     #[test]
     fn a_whole_namespace_import_names_a_module_at_the_end() {
         let text = hover_in("chat.ids", "use std::http\n", "http", 0).unwrap();
         assert!(text.contains("module std::http"), "{text}");
-        assert!(text.contains("- `enum HttpMethod` — An HTTP request method."), "{text}");
-        assert!(text.contains("- `struct Response` — An HTTP response, by its status code."), "{text}");
+        assert!(
+            text.contains("- `enum HttpMethod` — An HTTP request method."),
+            "{text}"
+        );
+        assert!(
+            text.contains("- `struct Response` — An HTTP response, by its status code."),
+            "{text}"
+        );
         let lone = hover_in("chat.ids", "use types\n", "types", 0).unwrap();
-        assert!(lone.contains("module types"), "a lone word on a `use` line: {lone}");
+        assert!(
+            lone.contains("module types"),
+            "a lone word on a `use` line: {lone}"
+        );
     }
 
     #[test]
@@ -1849,14 +2107,20 @@ protocol Chat {
         let text = hover_in("chat.ids", "use api::common::Error\n", "api", 0).unwrap();
         assert!(text.contains("module api\n"), "{text}");
         assert!(text.contains("The API."), "{text}");
-        assert!(text.contains("**Modules**\n\n- `common` — Things every API schema needs."), "{text}");
+        assert!(
+            text.contains("**Modules**\n\n- `common` — Things every API schema needs."),
+            "{text}"
+        );
         assert!(text.contains("- `struct Root`"), "{text}");
     }
 
     #[test]
     fn relative_prefixes_show_the_module_they_stand_for() {
         let text = hover_in("api/b.ids", "use parent::common::Error\n", "parent", 2).unwrap();
-        assert!(text.contains("module api"), "one up from api::b is api: {text}");
+        assert!(
+            text.contains("module api"),
+            "one up from api::b is api: {text}"
+        );
         assert!(text.contains("The API."), "{text}");
         let me = hover_in("types.ids", "use self::x::Y\n", "self", 0).unwrap_or_default();
         assert!(!me.contains("package"), "{me}");
@@ -1875,11 +2139,35 @@ protocol Chat {
     fn not_for_aliases_comments_strings_or_unknown_paths() {
         // An alias hovers as what it stands for, never as a module of that name.
         let alias = hover_in("chat.ids", "use std::http::Request as types\n", "types", 0).unwrap();
-        assert!(alias.contains("struct Request") && !alias.contains("module"), "{alias}");
-        assert_eq!(hover_in("chat.ids", "// see types::User\nstruct S {\n    id: u64\n}\n", "types", 0), None, "a comment");
-        assert_eq!(hover_in("chat.ids", "use typse::User\n", "typse", 0), None, "no such module");
-        assert_eq!(hover_in("chat.ids", "use std::htp::Request\n", "htp", 0), None, "no such std module");
-        assert_eq!(hover_in("chat.ids", "struct types {\n    id: u64\n}\n", "types", 0).map(|t| t.contains("module")), Some(false));
+        assert!(
+            alias.contains("struct Request") && !alias.contains("module"),
+            "{alias}"
+        );
+        assert_eq!(
+            hover_in(
+                "chat.ids",
+                "// see types::User\nstruct S {\n    id: u64\n}\n",
+                "types",
+                0
+            ),
+            None,
+            "a comment"
+        );
+        assert_eq!(
+            hover_in("chat.ids", "use typse::User\n", "typse", 0),
+            None,
+            "no such module"
+        );
+        assert_eq!(
+            hover_in("chat.ids", "use std::htp::Request\n", "htp", 0),
+            None,
+            "no such std module"
+        );
+        assert_eq!(
+            hover_in("chat.ids", "struct types {\n    id: u64\n}\n", "types", 0)
+                .map(|t| t.contains("module")),
+            Some(false)
+        );
     }
 
     #[test]
@@ -1905,7 +2193,10 @@ protocol Chat {
 
         let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
         let text = hover_text(hover);
-        assert!(text.contains("validator StringBounds(min: u32, max: u32)"), "got: {text}");
+        assert!(
+            text.contains("validator StringBounds(min: u32, max: u32)"),
+            "got: {text}"
+        );
         assert!(text.contains("2 parameters"), "got: {text}");
     }
 
@@ -2006,12 +2297,16 @@ protocol Chat {
         );
         let hover = hover.expect("hover should resolve");
         let text = hover_text(hover);
-        assert!(text.contains("validators.StringBounds.allowed = false"), "got: {text}");
+        assert!(
+            text.contains("validators.StringBounds.allowed = false"),
+            "got: {text}"
+        );
         assert!(text.contains("@settings = Strict"), "got: {text}");
     }
 
     #[test]
-    fn settings_hover_does_not_crash_when_a_dependencys_manifest_is_also_a_cross_package_reference() {
+    fn settings_hover_does_not_crash_when_a_dependencys_manifest_is_also_a_cross_package_reference()
+    {
         // The manifest lookup here used to be `.find(|f| is_manifest(..))`
         // with no dependency filter — just the first `.idp` in `other_files`,
         // which this now fixes (`f.dependency().is_none()`). Whichever

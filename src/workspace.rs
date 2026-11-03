@@ -71,10 +71,14 @@ impl WorkspaceIndex {
     }
 
     fn refresh_path(&self, path: &Path) {
-        let Ok(uri) = Url::from_file_path(path) else { return };
+        let Ok(uri) = Url::from_file_path(path) else {
+            return;
+        };
         let is_schema = path.extension().is_some_and(|e| e == "ids")
             && layout::schemas_root_for(path).is_some()
-            && !path.components().any(|c| EXCLUDED_COMPONENTS.contains(&c.as_os_str().to_string_lossy().as_ref()));
+            && !path
+                .components()
+                .any(|c| EXCLUDED_COMPONENTS.contains(&c.as_os_str().to_string_lossy().as_ref()));
 
         match std::fs::read_to_string(path) {
             Ok(text) if is_schema => {
@@ -101,7 +105,9 @@ impl WorkspaceIndex {
         let mut roots: Vec<PathBuf> = self
             .files
             .iter()
-            .filter_map(|e| Some(layout::schemas_root_for(&e.key().to_file_path().ok()?)?.to_path_buf()))
+            .filter_map(|e| {
+                Some(layout::schemas_root_for(&e.key().to_file_path().ok()?)?.to_path_buf())
+            })
             .collect();
         roots.sort();
         roots.dedup();
@@ -112,22 +118,31 @@ impl WorkspaceIndex {
     /// from `manifest` (its `config.idp`'s text) or, when `None`, the file on
     /// disk. A package without a manifest has none.
     pub fn index_dependencies(&self, src_root: &Path, manifest: Option<&str>) {
-        let Some(package_dir) = src_root.parent() else { return };
+        let Some(package_dir) = src_root.parent() else {
+            return;
+        };
         let on_disk;
         let manifest = match manifest {
             Some(text) => text,
             None => {
-                on_disk = std::fs::read_to_string(package_dir.join(dependencies::MANIFEST)).unwrap_or_default();
+                on_disk = std::fs::read_to_string(package_dir.join(dependencies::MANIFEST))
+                    .unwrap_or_default();
                 &on_disk
             }
         };
-        self.dependencies.insert(normalize(src_root), dependencies::index(package_dir, manifest));
+        self.dependencies.insert(
+            normalize(src_root),
+            dependencies::index(package_dir, manifest),
+        );
     }
 
     /// The dependencies of `uri`'s package, indexing them first if no one
     /// has yet (a file outside the scanned workspace folders).
     pub fn dependencies_of(&self, uri: &Url) -> Vec<IndexedDependency> {
-        let Some(src_root) = uri.to_file_path().ok().and_then(|p| layout::schemas_root_for(&p).map(Path::to_path_buf))
+        let Some(src_root) = uri
+            .to_file_path()
+            .ok()
+            .and_then(|p| layout::schemas_root_for(&p).map(Path::to_path_buf))
         else {
             return vec![];
         };
@@ -135,7 +150,10 @@ impl WorkspaceIndex {
         if !self.dependencies.contains_key(&key) {
             self.index_dependencies(&src_root, None);
         }
-        self.dependencies.get(&key).map(|d| d.clone()).unwrap_or_default()
+        self.dependencies
+            .get(&key)
+            .map(|d| d.clone())
+            .unwrap_or_default()
     }
 
     /// Every package (its `src/` directory) one of whose dependencies lives
@@ -143,14 +161,21 @@ impl WorkspaceIndex {
     pub fn packages_depending_on(&self, path: &Path) -> Vec<PathBuf> {
         self.dependencies
             .iter()
-            .filter(|e| e.value().iter().any(|d| d.dir.as_ref().is_some_and(|dir| path.starts_with(dir))))
+            .filter(|e| {
+                e.value()
+                    .iter()
+                    .any(|d| d.dir.as_ref().is_some_and(|dir| path.starts_with(dir)))
+            })
             .map(|e| PathBuf::from(e.key()))
             .collect()
     }
 
     /// Every indexed file, all packages.
     pub fn all_files(&self) -> Vec<(Url, String)> {
-        self.files.iter().map(|e| (e.key().clone(), e.value().clone())).collect()
+        self.files
+            .iter()
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect()
     }
 
     pub fn len(&self) -> usize {
@@ -187,13 +212,17 @@ fn normalize(path: &Path) -> String {
 /// Every `.ids` file under `dir` that lives in some `src/` directory.
 /// Symlinked directories aren't followed (no cycles, no escaping the root).
 fn collect_schemas(dir: &Path, found: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
 
     for entry in entries.flatten() {
         if found.len() >= MAX_FILES {
             return;
         }
-        let Ok(file_type) = entry.file_type() else { continue };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
         let path = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy();
@@ -218,7 +247,8 @@ mod tests {
     /// A throwaway workspace: two packages that both have `src/types.ids`,
     /// a schema outside any `src/`, and a `target/` directory.
     fn workspace(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("comline-lsp-index-{name}-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("comline-lsp-index-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         for (path, text) in [
             ("a/config.idp", "congregation a\n"),
@@ -227,7 +257,10 @@ mod tests {
             ("b/src/types.ids", "struct B {\n    x: bool\n}\n"),
             ("loose.ids", "struct Loose {\n    x: bool\n}\n"),
             ("a/target/src/stale.ids", "struct Stale {\n    x: bool\n}\n"),
-            ("a/.comline/src/hidden.ids", "struct Hidden {\n    x: bool\n}\n"),
+            (
+                "a/.comline/src/hidden.ids",
+                "struct Hidden {\n    x: bool\n}\n",
+            ),
         ] {
             let path = root.join(path);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -237,7 +270,10 @@ mod tests {
     }
 
     fn names(files: Vec<(Url, String)>) -> Vec<String> {
-        let mut names: Vec<_> = files.into_iter().map(|(u, _)| u.path().rsplit("/src/").next().unwrap().to_string()).collect();
+        let mut names: Vec<_> = files
+            .into_iter()
+            .map(|(u, _)| u.path().rsplit("/src/").next().unwrap().to_string())
+            .collect();
         names.sort();
         names
     }
@@ -248,7 +284,12 @@ mod tests {
         let index = WorkspaceIndex::default();
         index.scan(std::slice::from_ref(&root));
 
-        assert_eq!(index.len(), 3, "a/types, a/chat/admin, b/types: {:?}", names(index.all_files()));
+        assert_eq!(
+            index.len(),
+            3,
+            "a/types, a/chat/admin, b/types: {:?}",
+            names(index.all_files())
+        );
 
         let a_types = Url::from_file_path(root.join("a/src/types.ids")).unwrap();
         assert_eq!(names(index.package_files(&a_types)), vec!["chat/admin.ids"]);

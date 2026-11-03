@@ -49,5 +49,8 @@ protocol UserService {
     assert_eq!(parser::get_declaration_count(&doc), 3);
 
     let diagnostics = diagnostics::generate_diagnostics(source, &result.errors);
-    assert!(diagnostics.is_empty(), "Should have no diagnostics for valid code");
+    assert!(
+        diagnostics.is_empty(),
+        "Should have no diagnostics for valid code"
+    );
 }

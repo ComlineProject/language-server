@@ -23,8 +23,16 @@ const VARIABLE: u32 = 7;
 
 /// The token-type names, in legend order. `backend.rs` turns these into
 /// `SemanticTokenType`s.
-pub const LEGEND_TYPES: &[&str] =
-    &["keyword", "type", "string", "comment", "number", "decorator", "namespace", "variable"];
+pub const LEGEND_TYPES: &[&str] = &[
+    "keyword",
+    "type",
+    "string",
+    "comment",
+    "number",
+    "decorator",
+    "namespace",
+    "variable",
+];
 
 pub fn get_semantic_tokens(source: &str, _uri: &Url) -> Option<SemanticTokensResult> {
     let mut data: Vec<SemanticToken> = Vec::new();
@@ -39,7 +47,11 @@ pub fn get_semantic_tokens(source: &str, _uri: &Url) -> Option<SemanticTokensRes
         let line_no = line_idx as u32;
         for (start, length, token_type) in lex_line(line, &mut in_block_comment) {
             let delta_line = line_no - prev_line;
-            let delta_start = if delta_line == 0 { start - prev_start } else { start };
+            let delta_start = if delta_line == 0 {
+                start - prev_start
+            } else {
+                start
+            };
             data.push(SemanticToken {
                 delta_line,
                 delta_start,
@@ -124,7 +136,11 @@ fn lex_line(line: &str, in_block_comment: &mut bool) -> Vec<(u32, u32, u32)> {
             continue;
         }
 
-        if c == '@' && chars.get(i + 1).is_some_and(|c| c.is_alphabetic() || *c == '_') {
+        if c == '@'
+            && chars
+                .get(i + 1)
+                .is_some_and(|c| c.is_alphabetic() || *c == '_')
+        {
             let mut j = i + 1;
             while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
                 j += 1;
@@ -162,7 +178,11 @@ fn lex_line(line: &str, in_block_comment: &mut bool) -> Vec<(u32, u32, u32)> {
                     while k < chars.len() && chars[k].is_whitespace() {
                         k += 1;
                     }
-                    if chars.get(k) == Some(&'=') { Some(KEYWORD) } else { None }
+                    if chars.get(k) == Some(&'=') {
+                        Some(KEYWORD)
+                    } else {
+                        None
+                    }
                 } else {
                     Some(KEYWORD)
                 }
@@ -258,7 +278,10 @@ mod tests {
         // f"{value.name} is {{empty}}" — the `f` belongs to the string.
         let line = r#"assert(x, f"{value.name} is {{empty}}")"#;
         let at = |s: &str| line.find(s).unwrap() as u32;
-        let toks: Vec<_> = tokens_on(line).into_iter().filter(|t| t.0 >= at("f\"")).collect();
+        let toks: Vec<_> = tokens_on(line)
+            .into_iter()
+            .filter(|t| t.0 >= at("f\""))
+            .collect();
         assert_eq!(
             toks,
             vec![
@@ -366,8 +389,14 @@ mod tests {
 
     #[test]
     fn a_block_comment_on_one_line_highlights_as_a_single_comment_token() {
-        let r = get_semantic_tokens("/* note */ struct S {}\n", &Url::parse("file:///t.ids").unwrap()).unwrap();
-        let SemanticTokensResult::Tokens(t) = r else { panic!() };
+        let r = get_semantic_tokens(
+            "/* note */ struct S {}\n",
+            &Url::parse("file:///t.ids").unwrap(),
+        )
+        .unwrap();
+        let SemanticTokensResult::Tokens(t) = r else {
+            panic!()
+        };
         // The comment token covers exactly `/* note */` (0..10), then
         // `struct`/`S` highlight normally afterward.
         assert_eq!(t.data[0].token_type, COMMENT);
@@ -385,7 +414,9 @@ mod tests {
         // never as real `error`/`message` keyword tokens.
         let src = "/*\nerror Test {\n    message = \"\"\n}\n*/\nstruct S {}\n";
         let r = get_semantic_tokens(src, &Url::parse("file:///t.ids").unwrap()).unwrap();
-        let SemanticTokensResult::Tokens(t) = r else { panic!() };
+        let SemanticTokensResult::Tokens(t) = r else {
+            panic!()
+        };
         // Every token through the closing `*/` line is COMMENT; the last
         // two (struct, S) are the real code after it.
         assert_eq!(t.data.len(), 7, "{t:?}");
@@ -413,7 +444,10 @@ mod tests {
         let SemanticTokensResult::Tokens(t) = r else {
             panic!()
         };
-        assert!(t.data.iter().any(|x| x.token_type == KEYWORD && x.length == 7));
+        assert!(t
+            .data
+            .iter()
+            .any(|x| x.token_type == KEYWORD && x.length == 7));
     }
 
     #[test]
@@ -441,7 +475,12 @@ mod tests {
         let SemanticTokensResult::Tokens(t) = r else {
             panic!()
         };
-        let second = t.data.iter().rev().find(|x| x.token_type == KEYWORD).unwrap();
+        let second = t
+            .data
+            .iter()
+            .rev()
+            .find(|x| x.token_type == KEYWORD)
+            .unwrap();
         assert_eq!(second.delta_line, 1);
         assert_eq!(second.delta_start, 0);
     }

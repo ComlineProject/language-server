@@ -66,7 +66,10 @@ pub fn parse_idp(source: &str) -> Result<IdpParseResult> {
 
     match idp_grammar::parse(source) {
         Ok(congregation) => {
-            tracing::debug!("Parse successful: congregation '{}'", congregation.name.value);
+            tracing::debug!(
+                "Parse successful: congregation '{}'",
+                congregation.name.value
+            );
             Ok(IdpParseResult {
                 document: Some(congregation),
                 errors: vec![],
@@ -105,7 +108,7 @@ struct User {
         let doc = result.document.unwrap();
         assert_eq!(get_declaration_count(&doc), 1);
     }
-    
+
     #[test]
     fn test_parse_enum() {
         let source = r#"
@@ -119,7 +122,7 @@ enum Status {
         let doc = result.document.unwrap();
         assert_eq!(get_declaration_count(&doc), 1);
     }
-    
+
     #[test]
     fn test_parse_protocol() {
         let source = r#"
@@ -132,7 +135,7 @@ protocol UserService {
         let doc = result.document.unwrap();
         assert_eq!(get_declaration_count(&doc), 1);
     }
-    
+
     #[test]
     fn test_parse_error() {
         let source = r#"
@@ -144,7 +147,7 @@ struct User {
         assert!(result.has_errors());
         assert!(result.document.is_none());
     }
-    
+
     #[test]
     fn test_parse_multiple_declarations() {
         let source = r#"

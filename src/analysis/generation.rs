@@ -36,7 +36,8 @@ pub const UNRESOLVED_TARGET: &str = "generation::unresolved-target";
 pub const BELOW_DEPENDENCY: &str = "generation::below-dependency";
 /// A declaration past what its generator has verified - the same code
 /// `comline build` warns under, and settings can raise the same way.
-pub const UNVERIFIED_VERSION: DiagnosticCode = DiagnosticCode::warning("generation::unverified-version");
+pub const UNVERIFIED_VERSION: DiagnosticCode =
+    DiagnosticCode::warning("generation::unverified-version");
 
 fn registry() -> &'static Registry {
     static REGISTRY: OnceLock<Registry> = OnceLock::new();
@@ -56,19 +57,29 @@ pub fn resolve(language: &str, version: &str) -> Result<Resolved, Unresolved> {
 /// The oldest version this build's generator for `language` handles - what
 /// `comline new` scaffolds - or `None` when this build has none.
 pub fn floor(language: &str) -> Option<&'static str> {
-    registry().targets().into_iter().find(|t| t.name.eq_ignore_ascii_case(language)).map(|t| t.version)
+    registry()
+        .targets()
+        .into_iter()
+        .find(|t| t.name.eq_ignore_ascii_case(language))
+        .map(|t| t.version)
 }
 
 /// The diagnostics for one schema's `units` (its namespace already among
 /// them, or not - it isn't read), for every language in `languages`.
-pub fn feature_diagnostics(source: &str, units: &[FrozenUnit], languages: &[DeclaredLanguage]) -> Vec<Diagnostic> {
+pub fn feature_diagnostics(
+    source: &str,
+    units: &[FrozenUnit],
+    languages: &[DeclaredLanguage],
+) -> Vec<Diagnostic> {
     // Only the schema's own features: the request options (`lib` mode,
     // `external_std`, ...) live in `comline.toml`, not here.
     let uses = features::used(&[(String::new(), units.to_vec())], &Options::default());
     let mut diagnostics = Vec::new();
 
     for declared in languages {
-        let Ok(resolved) = resolve(&declared.language, &declared.version) else { continue };
+        let Ok(resolved) = resolve(&declared.language, &declared.version) else {
+            continue;
+        };
         let target = format!("{}#{}", declared.language, declared.version);
         for u in &uses {
             let Some(span) = u.span else { continue };
@@ -114,7 +125,10 @@ fn detail(language: &str, s: &Support) -> String {
         out.push_str(&format!(": {note}"));
     }
     if let (State::Unsupported, Some(since)) = (s.state, s.since) {
-        out.push_str(&format!(" - declare `{language}#{}` or later", since.version));
+        out.push_str(&format!(
+            " - declare `{language}#{}` or later",
+            since.version
+        ));
     }
     if let Some(tracking) = s.tracking {
         out.push_str(&format!(" ({tracking} tracks it)"));
@@ -247,16 +261,27 @@ pub fn summary(language: &str, version: &str) -> Option<String> {
                 continue;
             }
         };
-        by_state.entry(rank).or_default().push(format!("- {}{}", feature.title(), detail(language, &s)));
+        by_state.entry(rank).or_default().push(format!(
+            "- {}{}",
+            feature.title(),
+            detail(language, &s)
+        ));
     }
 
     let versions = resolved.generator.versions;
-    let mut out = format!("**`{language}#{version}`** supports {supported} of {} features.", Feature::ALL.len());
+    let mut out = format!(
+        "**`{language}#{version}`** supports {supported} of {} features.",
+        Feature::ALL.len()
+    );
     out.push_str(&format!(
         "\n\nThe {language} generator handles {} or later, verified up to {}{}.",
         versions.floor,
         versions.verified_up_to,
-        if versions.forward_compatible { "; newer toolchains build its output too" } else { "" }
+        if versions.forward_compatible {
+            "; newer toolchains build its output too"
+        } else {
+            ""
+        }
     ));
     for (rank, lines) in by_state {
         let heading = match rank {
@@ -283,14 +308,23 @@ mod tests {
         );
         let files = [
             (Url::parse("file:///pkg/config.idp").unwrap(), manifest),
-            (Url::parse("file:///pkg/src/api.ids").unwrap(), schema.to_string()),
+            (
+                Url::parse("file:///pkg/src/api.ids").unwrap(),
+                schema.to_string(),
+            ),
         ];
         let project = Project::new(files.iter());
-        let doc = project.docs.iter().position(|d| d.uri.path().ends_with("api.ids")).unwrap();
+        let doc = project
+            .docs
+            .iter()
+            .position(|d| d.uri.path().ends_with("api.ids"))
+            .unwrap();
         project_diagnostics(&project, doc)
             .into_iter()
             .filter_map(|d| match d.code {
-                Some(lsp_types::NumberOrString::String(code)) if code.starts_with("generation::") => {
+                Some(lsp_types::NumberOrString::String(code))
+                    if code.starts_with("generation::") =>
+                {
                     Some((code, d.message, d.range.start.line, d.range.start.character))
                 }
                 _ => None,
@@ -306,7 +340,10 @@ mod tests {
         assert_eq!(found.len(), 1, "{found:?}");
         let (code, message, line, character) = &found[0];
         assert_eq!(code, super::UNSUPPORTED_FEATURE);
-        assert!(message.starts_with("unions can't be generated for `rust#1.85.0`: "), "{message}");
+        assert!(
+            message.starts_with("unions can't be generated for `rust#1.85.0`: "),
+            "{message}"
+        );
         assert_eq!((*line, *character), (1, 4), "at the field");
     }
 
@@ -324,19 +361,31 @@ mod tests {
         let schema = "validator NonEmpty for string {\n    validate {\n        \
                       assert(value.length > 0, f\"{value.name} is empty\")\n    }\n}\n\n\
                       @validators = [NonEmpty]\ntype Name = string\n";
-        let found = diagnostics("        typescript#5.0 = {}\n        rust#1.85.0 = {}\n", schema);
+        let found = diagnostics(
+            "        typescript#5.0 = {}\n        rust#1.85.0 = {}\n",
+            schema,
+        );
         assert_eq!(found.len(), 1, "{found:?}");
         let (code, message, line, character) = &found[0];
         assert_eq!(code, super::IGNORED_FEATURE);
-        assert!(message.starts_with("`typescript#5.0` generates this without its validators: "), "{message}");
+        assert!(
+            message.starts_with("`typescript#5.0` generates this without its validators: "),
+            "{message}"
+        );
         assert_eq!((*line, *character), (6, 15), "at the validator's name");
     }
 
     #[test]
     fn the_summary_lists_what_isnt_fully_supported() {
         let summary = super::summary("rust", "1.85.0").unwrap();
-        assert!(summary.starts_with("**`rust#1.85.0`** supports "), "{summary}");
-        assert!(summary.contains("Not supported (generation refuses a schema using these):\n- "), "{summary}");
+        assert!(
+            summary.starts_with("**`rust#1.85.0`** supports "),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("Not supported (generation refuses a schema using these):\n- "),
+            "{summary}"
+        );
         assert!(summary.contains("\n- unions: "), "{summary}");
         assert_eq!(super::summary("python", "3.11.0"), None);
     }
@@ -344,14 +393,21 @@ mod tests {
     #[test]
     fn the_summary_names_the_generators_range_or_why_it_has_none() {
         let summary = super::summary("rust", "1.88.0").unwrap();
-        assert!(summary.contains("The rust generator handles 1.85.0 or later, verified up to 1.99"), "{summary}");
+        assert!(
+            summary.contains("The rust generator handles 1.85.0 or later, verified up to 1.99"),
+            "{summary}"
+        );
         let below = super::summary("rust", "1.70.0").unwrap();
         assert!(below.contains("it needs `rust#1.85.0` or later"), "{below}");
     }
 
     /// `declaration_diagnostics` for `languages`, with `rest` after the
     /// languages block and `dependencies` declaring.
-    fn declarations(languages: &str, rest: &str, dependencies: &[(&str, &str)]) -> Vec<(String, String, String)> {
+    fn declarations(
+        languages: &str,
+        rest: &str,
+        dependencies: &[(&str, &str)],
+    ) -> Vec<(String, String, String)> {
         let manifest = format!(
             "congregation app\nspecification_version = 1\n\ncode_generation = {{\n    languages = {{\n{languages}    }}\n}}\n{rest}"
         );
@@ -361,7 +417,13 @@ mod tests {
             .iter()
             .map(|(name, target)| {
                 let (language, version) = target.split_once('#').unwrap();
-                (name.to_string(), crate::analysis::source::DeclaredLanguage { language: language.into(), version: version.into() })
+                (
+                    name.to_string(),
+                    crate::analysis::source::DeclaredLanguage {
+                        language: language.into(),
+                        version: version.into(),
+                    },
+                )
             })
             .collect();
         super::declaration_diagnostics(&manifest, &languages, &settings, &dependencies)
@@ -374,32 +436,69 @@ mod tests {
                 let at = manifest
                     .lines()
                     .nth(d.range.start.line as usize)
-                    .map(|l| l[d.range.start.character as usize..d.range.end.character as usize].to_string())
+                    .map(|l| {
+                        l[d.range.start.character as usize..d.range.end.character as usize]
+                            .to_string()
+                    })
                     .unwrap_or_default();
-                (code, format!("{:?}", d.severity.unwrap()), format!("{at}: {}", d.message))
+                (
+                    code,
+                    format!("{:?}", d.severity.unwrap()),
+                    format!("{at}: {}", d.message),
+                )
             })
             .collect()
     }
 
     #[test]
     fn a_declaration_comline_build_refuses_is_an_error_at_the_entry() {
-        let found = declarations("        rust#1.70.0 = {}\n        python#3.11 = {}\n", "", &[]);
+        let found = declarations(
+            "        rust#1.70.0 = {}\n        python#3.11 = {}\n",
+            "",
+            &[],
+        );
         assert_eq!(found.len(), 2, "{found:?}");
         assert_eq!(found[0].0, super::UNRESOLVED_TARGET);
         assert_eq!(found[0].1, "Error");
         assert!(found[0].2.starts_with("rust#1.70.0: "), "{found:?}");
-        assert!(found[0].2.contains("it needs `rust#1.85.0` or later"), "{found:?}");
+        assert!(
+            found[0].2.contains("it needs `rust#1.85.0` or later"),
+            "{found:?}"
+        );
         assert!(found[1].2.contains("has no python generator"), "{found:?}");
-        assert_eq!(declarations("        rust#1.85.0 = {}\n        typescript#5.4 = {}\n", "", &[]), []);
+        assert_eq!(
+            declarations(
+                "        rust#1.85.0 = {}\n        typescript#5.4 = {}\n",
+                "",
+                &[]
+            ),
+            []
+        );
     }
 
     #[test]
     fn a_declaration_below_a_dependencys_is_an_error() {
-        let found = declarations("        rust#1.85.0 = {}\n", "", &[("shared", "rust#1.90.0"), ("other", "rust#1.88.0")]);
+        let found = declarations(
+            "        rust#1.85.0 = {}\n",
+            "",
+            &[("shared", "rust#1.90.0"), ("other", "rust#1.88.0")],
+        );
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].0, super::BELOW_DEPENDENCY);
-        assert!(found[0].2.contains("dependency `shared` declares `rust#1.90.0`"), "{found:?}");
-        assert_eq!(declarations("        rust#1.90.0 = {}\n", "", &[("shared", "rust#1.90.0")]), []);
+        assert!(
+            found[0]
+                .2
+                .contains("dependency `shared` declares `rust#1.90.0`"),
+            "{found:?}"
+        );
+        assert_eq!(
+            declarations(
+                "        rust#1.90.0 = {}\n",
+                "",
+                &[("shared", "rust#1.90.0")]
+            ),
+            []
+        );
     }
 
     #[test]
@@ -408,12 +507,23 @@ mod tests {
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].0, super::UNVERIFIED_VERSION.id);
         assert_eq!(found[0].1, "Warning");
-        assert!(found[0].2.contains("past what the typescript generator has verified (up to 5.9)"), "{found:?}");
+        assert!(
+            found[0]
+                .2
+                .contains("past what the typescript generator has verified (up to 5.9)"),
+            "{found:?}"
+        );
 
         let raised = "settings = {\n    diagnostics = {\n        generation::unverified-version = {\n            level = \"error\"\n        }\n    }\n}\n";
-        assert_eq!(declarations("        typescript#6.0 = {}\n", raised, &[])[0].1, "Error");
+        assert_eq!(
+            declarations("        typescript#6.0 = {}\n", raised, &[])[0].1,
+            "Error"
+        );
         let allowed = raised.replace("\"error\"", "\"allow\"");
-        assert_eq!(declarations("        typescript#6.0 = {}\n", &allowed, &[]), []);
+        assert_eq!(
+            declarations("        typescript#6.0 = {}\n", &allowed, &[]),
+            []
+        );
         // Rust promises newer compilers build older code: verified.
         assert_eq!(declarations("        rust#2.5 = {}\n", "", &[]), []);
     }

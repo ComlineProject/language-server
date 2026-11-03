@@ -112,8 +112,7 @@ pub fn check(project: &Project, doc: usize) -> ImportCheck {
         .iter()
         .map(|(name, _)| name.as_str())
         .filter(|name| {
-            !name.contains("::")
-                && here.symbols.get_in(name, Namespace::Declaration).is_none()
+            !name.contains("::") && here.symbols.get_in(name, Namespace::Declaration).is_none()
         })
         .collect();
 
@@ -165,14 +164,21 @@ pub fn check(project: &Project, doc: usize) -> ImportCheck {
                     }
                     // Qualified uses of that namespace (`types::User`).
                     for (text, _) in &sites {
-                        if text.strip_prefix(&qualified(namespace, "")).is_some_and(|rest| !rest.contains("::")) {
+                        if text
+                            .strip_prefix(&qualified(namespace, ""))
+                            .is_some_and(|rest| !rest.contains("::"))
+                        {
                             scope.push(FrozenUnit::Import(text.clone(), None, use_decl.span));
                         }
                     }
                 } else {
                     // `use a::b`: read as the symbol `b` (or its alias),
                     // which core already registers.
-                    covered.insert(single_symbol_name(use_decl, &namespace[namespace.len() - 1..], &mut aliases));
+                    covered.insert(single_symbol_name(
+                        use_decl,
+                        &namespace[namespace.len() - 1..],
+                        &mut aliases,
+                    ));
                 }
             }
         }
@@ -184,7 +190,11 @@ pub fn check(project: &Project, doc: usize) -> ImportCheck {
     let named = sites
         .iter()
         .map(|site| (site, declares_type as fn(&ProjectDoc, &str) -> bool))
-        .chain(validators.iter().map(|site| (site, declares_validator as fn(&ProjectDoc, &str) -> bool)));
+        .chain(
+            validators
+                .iter()
+                .map(|site| (site, declares_validator as fn(&ProjectDoc, &str) -> bool)),
+        );
 
     let mut missing = Vec::new();
     for ((name, offset), declares) in named {
@@ -200,14 +210,21 @@ pub fn check(project: &Project, doc: usize) -> ImportCheck {
             .iter()
             .enumerate()
             .filter(|(i, d)| *i != doc && declares(d, name))
-            .map(|(_, d)| Candidate { namespace: d.namespace.clone(), file: file_name(d) })
+            .map(|(_, d)| Candidate {
+                namespace: d.namespace.clone(),
+                file: file_name(d),
+            })
             .collect();
 
         if let Some(first) = candidates.first() {
             // Core would report this as a bare "Unknown type" (or
             // validator); the missing
             // `use` is reported instead, with where the type actually is.
-            scope.push(import(&first.namespace, name, (*offset, offset + name.len())));
+            scope.push(import(
+                &first.namespace,
+                name,
+                (*offset, offset + name.len()),
+            ));
             missing.push(MissingImport {
                 name: name.clone(),
                 range: (*offset, offset + name.len()),
@@ -218,7 +235,12 @@ pub fn check(project: &Project, doc: usize) -> ImportCheck {
     }
 
     let (unresolved, unverified) = resolution(project, doc);
-    ImportCheck { scope, missing, unresolved, unverified }
+    ImportCheck {
+        scope,
+        missing,
+        unresolved,
+        unverified,
+    }
 }
 
 /// Every `use` in `docs[doc]` that doesn't resolve, by core's own rule
@@ -246,8 +268,11 @@ fn resolution(project: &Project, doc: usize) -> (Vec<UnresolvedImport>, Vec<Unve
         .chain(&project.unparsed)
         .filter_map(|namespace| namespace.first().map(String::as_str))
         .collect();
-    let declared: BTreeMap<&str, &DependencyKind> =
-        project.dependencies.iter().map(|d| (d.name.as_str(), &d.kind)).collect();
+    let declared: BTreeMap<&str, &DependencyKind> = project
+        .dependencies
+        .iter()
+        .map(|d| (d.name.as_str(), &d.kind))
+        .collect();
     let indexed: BTreeSet<&str> = project.docs.iter().filter_map(|d| d.dependency).collect();
 
     let mut unresolved = Vec::new();
@@ -263,7 +288,11 @@ fn resolution(project: &Project, doc: usize) -> (Vec<UnresolvedImport>, Vec<Unve
         let resolved = match resolver.resolve_namespace(&use_stmt.path, &here.namespace) {
             Ok(resolved) => resolved,
             Err(detail) => {
-                unresolved.push(UnresolvedImport { range: span, detail, suggestion: None });
+                unresolved.push(UnresolvedImport {
+                    range: span,
+                    detail,
+                    suggestion: None,
+                });
                 continue;
             }
         };
@@ -279,13 +308,14 @@ fn resolution(project: &Project, doc: usize) -> (Vec<UnresolvedImport>, Vec<Unve
             Target::Found(sibling, remaining) => {
                 let target = &project.docs[sibling];
                 let symbols = &use_decl.resolved.symbols;
-                let named: Vec<String> = if symbols == &["*"] || (symbols.is_empty() && remaining.is_empty()) {
-                    vec![]
-                } else if !symbols.is_empty() {
-                    symbols.clone()
-                } else {
-                    vec![remaining.join("::")]
-                };
+                let named: Vec<String> =
+                    if symbols == &["*"] || (symbols.is_empty() && remaining.is_empty()) {
+                        vec![]
+                    } else if !symbols.is_empty() {
+                        symbols.clone()
+                    } else {
+                        vec![remaining.join("::")]
+                    };
 
                 let importable = importable_names(target);
                 for name in named.iter().filter(|name| !importable.contains(*name)) {
@@ -293,20 +323,30 @@ fn resolution(project: &Project, doc: usize) -> (Vec<UnresolvedImport>, Vec<Unve
                     let range = find_in(text, span.0, item, false);
                     unresolved.push(UnresolvedImport {
                         range: range.unwrap_or(span),
-                        detail: format!("schema '{}' doesn't declare '{name}'", target.namespace.join("::")),
+                        detail: format!(
+                            "schema '{}' doesn't declare '{name}'",
+                            target.namespace.join("::")
+                        ),
                         suggestion: range.and(closest(item, importable.iter().map(String::as_str))),
                     });
                 }
             }
             Target::Outside => {
                 // A schema that exists but doesn't parse right now.
-                if project.unparsed.iter().any(|u| !u.is_empty() && namespace.starts_with(u)) {
+                if project
+                    .unparsed
+                    .iter()
+                    .any(|u| !u.is_empty() && namespace.starts_with(u))
+                {
                     continue;
                 }
 
                 if let Some(kind) = declared.get(first) {
                     if !indexed.contains(first) {
-                        unverified.push(UnverifiedImport { range: span, reason: unverified_reason(first, kind) });
+                        unverified.push(UnverifiedImport {
+                            range: span,
+                            reason: unverified_reason(first, kind),
+                        });
                         continue;
                     }
                 }
@@ -317,14 +357,21 @@ fn resolution(project: &Project, doc: usize) -> (Vec<UnresolvedImport>, Vec<Unve
                 }
 
                 let known = top_level.contains(first) || declared.contains_key(first);
-                let range = if known { None } else { find_in(text, span.0, first, true) };
+                let range = if known {
+                    None
+                } else {
+                    find_in(text, span.0, first, true)
+                };
                 unresolved.push(UnresolvedImport {
                     range: range.unwrap_or(span),
                     detail: format!(
                         "no schema in this package or its dependencies matches '{}'",
                         namespace.join("::")
                     ),
-                    suggestion: range.and(closest(first, top_level.iter().copied().chain(declared.keys().copied()))),
+                    suggestion: range.and(closest(
+                        first,
+                        top_level.iter().copied().chain(declared.keys().copied()),
+                    )),
                 });
             }
         }
@@ -336,15 +383,34 @@ fn resolution(project: &Project, doc: usize) -> (Vec<UnresolvedImport>, Vec<Unve
 /// A `std::` path no std schema matches, worded like the build's, with the
 /// closest std namespace (`std::htp` → `std::http`) as the quick fix for the
 /// two segments written.
-fn unknown_std_path(project: &Project, text: &str, span: (usize, usize), namespace: &[String]) -> UnresolvedImport {
-    let written = namespace.iter().take(2).cloned().collect::<Vec<_>>().join("::");
+fn unknown_std_path(
+    project: &Project,
+    text: &str,
+    span: (usize, usize),
+    namespace: &[String],
+) -> UnresolvedImport {
+    let written = namespace
+        .iter()
+        .take(2)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("::");
     let std_namespaces: BTreeSet<String> = project
         .docs
         .iter()
         .filter(|d| d.dependency == Some(stdlib::NAME))
-        .map(|d| d.namespace.iter().take(2).cloned().collect::<Vec<_>>().join("::"))
+        .map(|d| {
+            d.namespace
+                .iter()
+                .take(2)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("::")
+        })
         .collect();
-    let range = text.find(&written).map(|i| (span.0 + i, span.0 + i + written.len()));
+    let range = text
+        .find(&written)
+        .map(|i| (span.0 + i, span.0 + i + written.len()));
     UnresolvedImport {
         range: range.unwrap_or(span),
         detail: format!("std has no schema matching '{}'", namespace.join("::")),
@@ -354,7 +420,9 @@ fn unknown_std_path(project: &Project, text: &str, span: (usize, usize), namespa
 
 fn unverified_reason(name: &str, kind: &DependencyKind) -> String {
     match kind {
-        DependencyKind::Git => format!("dependency `{name}` isn't fetched yet — run `comline check` to fetch it"),
+        DependencyKind::Git => {
+            format!("dependency `{name}` isn't fetched yet — run `comline check` to fetch it")
+        }
         DependencyKind::Registry => {
             format!("dependency `{name}` comes from a registry, which isn't supported yet")
         }
@@ -370,7 +438,10 @@ fn find_in(text: &str, base: usize, word: &str, segment: bool) -> Option<(usize,
         .into_iter()
         .find(|&i| {
             let followed_by_path = text[i + word.len()..].starts_with("::");
-            let after_as = text[..i].trim_end().strip_suffix("as").is_some_and(|before| before.ends_with(char::is_whitespace));
+            let after_as = text[..i]
+                .trim_end()
+                .strip_suffix("as")
+                .is_some_and(|before| before.ends_with(char::is_whitespace));
             followed_by_path == segment && !after_as
         })
         .map(|i| (base + i, base + i + word.len()))
@@ -380,7 +451,12 @@ fn find_in(text: &str, base: usize, word: &str, segment: bool) -> Option<(usize,
 /// consts, plus errors (`! Name` throws), validators and settings - what
 /// core's `check_imports` accepts.
 fn importable_names(doc: &ProjectDoc) -> BTreeSet<String> {
-    let mut names: BTreeSet<String> = doc.symbols.all_symbols().iter().map(|s| s.name.clone()).collect();
+    let mut names: BTreeSet<String> = doc
+        .symbols
+        .all_symbols()
+        .iter()
+        .map(|s| s.name.clone())
+        .collect();
     names.extend(doc.document.0.iter().filter_map(|decl| match &decl.value {
         Declaration::Error(e) => Some(e.name.text.clone()),
         Declaration::Validator(v) => Some(v.name.text.clone()),
@@ -397,12 +473,18 @@ fn importable_names(doc: &ProjectDoc) -> BTreeSet<String> {
 /// A deeper file always wins: `use chat::admin::X` means `chat/admin.ids`
 /// when it's open, not `chat.ids`. The same search as
 /// [`crate::analysis::imports::resolve_symbol`].
-pub(crate) fn target_of(project: &Project, exclude: Option<usize>, use_decl: &ResolvedUse) -> Target {
+pub(crate) fn target_of(
+    project: &Project,
+    exclude: Option<usize>,
+    use_decl: &ResolvedUse,
+) -> Target {
     let namespace = &use_decl.resolved.absolute_namespace;
 
     for split_at in (1..=namespace.len()).rev() {
         let prefix = &namespace[..split_at];
-        if let Some(i) = (0..project.docs.len()).find(|&i| Some(i) != exclude && project.docs[i].namespace == prefix) {
+        if let Some(i) = (0..project.docs.len())
+            .find(|&i| Some(i) != exclude && project.docs[i].namespace == prefix)
+        {
             return Target::Found(i, namespace[split_at..].to_vec());
         }
     }
@@ -412,7 +494,11 @@ pub(crate) fn target_of(project: &Project, exclude: Option<usize>, use_decl: &Re
 
 /// The name a single-symbol `use` binds, the way core's validator registers
 /// it: the alias if there is one (recorded in `aliases`), else the symbol.
-fn single_symbol_name(use_decl: &ResolvedUse, remaining: &[String], aliases: &mut BTreeMap<String, String>) -> String {
+fn single_symbol_name(
+    use_decl: &ResolvedUse,
+    remaining: &[String],
+    aliases: &mut BTreeMap<String, String>,
+) -> String {
     let symbol = remaining.join("::");
     match &use_decl.alias {
         Some(alias) => {
@@ -454,17 +540,24 @@ fn is_importable_kind(kind: SymbolKind) -> bool {
 
 /// Whether `doc` declares `name` as something usable in a type position.
 pub(crate) fn declares_type(doc: &ProjectDoc, name: &str) -> bool {
-    doc.symbols.get_in(name, Namespace::Declaration).is_some_and(|s| is_type_kind(s.kind))
+    doc.symbols
+        .get_in(name, Namespace::Declaration)
+        .is_some_and(|s| is_type_kind(s.kind))
 }
 
 /// Whether `doc` declares a validator named `name`.
 pub(crate) fn declares_validator(doc: &ProjectDoc, name: &str) -> bool {
-    doc.symbols.get_in(name, Namespace::Declaration).is_some_and(|s| s.kind == SymbolKind::FUNCTION)
+    doc.symbols
+        .get_in(name, Namespace::Declaration)
+        .is_some_and(|s| s.kind == SymbolKind::FUNCTION)
 }
 
 /// Struct, enum and type alias - not protocols or consts.
 pub(crate) fn is_type_kind(kind: SymbolKind) -> bool {
-    matches!(kind, SymbolKind::STRUCT | SymbolKind::ENUM | SymbolKind::TYPE_PARAMETER)
+    matches!(
+        kind,
+        SymbolKind::STRUCT | SymbolKind::ENUM | SymbolKind::TYPE_PARAMETER
+    )
 }
 
 pub(crate) fn file_name(doc: &ProjectDoc) -> String {
@@ -492,7 +585,10 @@ mod tests {
     use lsp_types::Url;
 
     fn project(files: &[(&str, &str)]) -> Vec<(Url, String)> {
-        files.iter().map(|(u, s)| (Url::parse(u).unwrap(), s.to_string())).collect()
+        files
+            .iter()
+            .map(|(u, s)| (Url::parse(u).unwrap(), s.to_string()))
+            .collect()
     }
 
     fn missing_names(files: &[(Url, String)], doc: usize) -> Vec<(String, Vec<String>)> {
@@ -508,12 +604,24 @@ mod tests {
             .collect()
     }
 
-    const TYPES: (&str, &str) = ("file:///pkg/src/types.ids", "struct Message {\n    text: string\n}\n\nenum Kind {\n    A\n}\n");
+    const TYPES: (&str, &str) = (
+        "file:///pkg/src/types.ids",
+        "struct Message {\n    text: string\n}\n\nenum Kind {\n    A\n}\n",
+    );
 
     #[test]
     fn a_type_from_another_file_without_a_use_is_missing() {
-        let files = project(&[("file:///pkg/src/chat.ids", "struct S {\n    m: Message\n}\n"), TYPES]);
-        assert_eq!(missing_names(&files, 0), vec![("Message".into(), vec!["types::Message".into()])]);
+        let files = project(&[
+            (
+                "file:///pkg/src/chat.ids",
+                "struct S {\n    m: Message\n}\n",
+            ),
+            TYPES,
+        ]);
+        assert_eq!(
+            missing_names(&files, 0),
+            vec![("Message".into(), vec!["types::Message".into()])]
+        );
     }
 
     #[test]
@@ -528,7 +636,11 @@ mod tests {
         ] {
             let source = format!("{header}\n\nstruct S {{\n    m: Message\n}}\n");
             let files = project(&[("file:///pkg/src/chat.ids", &source), TYPES]);
-            assert_eq!(missing_names(&files, 0), vec![], "`{header}` imports `Message`");
+            assert_eq!(
+                missing_names(&files, 0),
+                vec![],
+                "`{header}` imports `Message`"
+            );
         }
     }
 
@@ -538,13 +650,21 @@ mod tests {
         for header in ["use parent::*", "use parent::{Message, Kind}"] {
             let source = format!("{header}\n\nstruct S {{\n    m: Message\n}}\n");
             let files = project(&[("file:///pkg/src/types/inner.ids", &source), TYPES]);
-            assert_eq!(missing_names(&files, 0), vec![], "`{header}` imports `Message`");
+            assert_eq!(
+                missing_names(&files, 0),
+                vec![],
+                "`{header}` imports `Message`"
+            );
         }
 
         let source = "use parent::{Kind}\n\nstruct S {\n    m: Message\n}\n";
         let files = project(&[("file:///pkg/src/types/inner.ids", source), TYPES]);
         let missing = missing_names(&files, 0);
-        assert_eq!(missing.len(), 1, "a list that leaves `Message` out doesn't import it: {missing:?}");
+        assert_eq!(
+            missing.len(),
+            1,
+            "a list that leaves `Message` out doesn't import it: {missing:?}"
+        );
         assert_eq!(missing[0].0, "Message");
     }
 
@@ -565,7 +685,11 @@ mod tests {
         for header in ["use types::Kind", "use types::{Kind}"] {
             let source = format!("{header}\n\nstruct S {{\n    m: Message\n}}\n");
             let files = project(&[("file:///pkg/src/chat.ids", &source), TYPES]);
-            assert_eq!(missing_names(&files, 0).len(), 1, "`{header}` doesn't import `Message`");
+            assert_eq!(
+                missing_names(&files, 0).len(),
+                1,
+                "`{header}` doesn't import `Message`"
+            );
         }
     }
 
@@ -574,24 +698,40 @@ mod tests {
         for header in ["use other::*", "use other"] {
             let source = format!("{header}\n\nstruct S {{\n    m: Message\n}}\n");
             let files = project(&[("file:///pkg/src/chat.ids", &source), TYPES]);
-            assert_eq!(missing_names(&files, 0), vec![], "`Message` may come from `{header}`");
+            assert_eq!(
+                missing_names(&files, 0),
+                vec![],
+                "`Message` may come from `{header}`"
+            );
         }
     }
 
     #[test]
     fn a_glob_of_a_project_file_that_doesnt_declare_the_name_does_not_count() {
         let files = project(&[
-            ("file:///pkg/src/chat.ids", "use other::*\n\nstruct S {\n    m: Message\n}\n"),
-            ("file:///pkg/src/other.ids", "struct Unrelated {\n    x: bool\n}\n"),
+            (
+                "file:///pkg/src/chat.ids",
+                "use other::*\n\nstruct S {\n    m: Message\n}\n",
+            ),
+            (
+                "file:///pkg/src/other.ids",
+                "struct Unrelated {\n    x: bool\n}\n",
+            ),
             TYPES,
         ]);
-        assert_eq!(missing_names(&files, 0), vec![("Message".into(), vec!["types::Message".into()])]);
+        assert_eq!(
+            missing_names(&files, 0),
+            vec![("Message".into(), vec!["types::Message".into()])]
+        );
     }
 
     #[test]
     fn a_local_declaration_needs_no_import() {
         let files = project(&[
-            ("file:///pkg/src/chat.ids", "struct Message {\n    x: bool\n}\n\nstruct S {\n    m: Message\n}\n"),
+            (
+                "file:///pkg/src/chat.ids",
+                "struct Message {\n    x: bool\n}\n\nstruct S {\n    m: Message\n}\n",
+            ),
             TYPES,
         ]);
         assert_eq!(missing_names(&files, 0), vec![]);
@@ -600,20 +740,38 @@ mod tests {
     #[test]
     fn every_open_file_declaring_the_name_is_a_candidate() {
         let files = project(&[
-            ("file:///pkg/src/chat.ids", "struct S {\n    m: Message\n    list: Message[]\n}\n"),
+            (
+                "file:///pkg/src/chat.ids",
+                "struct S {\n    m: Message\n    list: Message[]\n}\n",
+            ),
             TYPES,
-            ("file:///pkg/src/legacy/types.ids", "struct Message {\n    old: bool\n}\n"),
+            (
+                "file:///pkg/src/legacy/types.ids",
+                "struct Message {\n    old: bool\n}\n",
+            ),
         ]);
         let found = missing_names(&files, 0);
         assert_eq!(found.len(), 2, "one per occurrence: {found:?}");
-        assert_eq!(found[0].1, vec!["types::Message".to_string(), "legacy::types::Message".to_string()]);
+        assert_eq!(
+            found[0].1,
+            vec![
+                "types::Message".to_string(),
+                "legacy::types::Message".to_string()
+            ]
+        );
     }
 
     #[test]
     fn a_protocol_or_const_is_not_offered_as_a_type() {
         let files = project(&[
-            ("file:///pkg/src/chat.ids", "struct S {\n    m: Service\n}\n"),
-            ("file:///pkg/src/api.ids", "protocol Service {\n    function f();\n}\n"),
+            (
+                "file:///pkg/src/chat.ids",
+                "struct S {\n    m: Service\n}\n",
+            ),
+            (
+                "file:///pkg/src/api.ids",
+                "protocol Service {\n    function f();\n}\n",
+            ),
         ]);
         assert_eq!(missing_names(&files, 0), vec![]);
     }
@@ -635,13 +793,23 @@ mod tests {
 
     fn resolution_of(body: &str) -> (Found, Vec<String>) {
         let mut files = vec![
-            SourceFile::local(Url::parse("file:///pkg/src/chat.ids").unwrap(), body.to_string()),
+            SourceFile::local(
+                Url::parse("file:///pkg/src/chat.ids").unwrap(),
+                body.to_string(),
+            ),
             SourceFile::local(
                 Url::parse("file:///pkg/src/types.ids").unwrap(),
-                "struct User {\n    id: u64\n}\n\nerror Gone {\n    message = \"gone\"\n}\n".to_string(),
+                "struct User {\n    id: u64\n}\n\nerror Gone {\n    message = \"gone\"\n}\n"
+                    .to_string(),
             ),
-            SourceFile::local(Url::parse("file:///pkg/src/broken.ids").unwrap(), "struct {".to_string()),
-            SourceFile::local(Url::parse("file:///pkg/config.idp").unwrap(), MANIFEST.to_string()),
+            SourceFile::local(
+                Url::parse("file:///pkg/src/broken.ids").unwrap(),
+                "struct {".to_string(),
+            ),
+            SourceFile::local(
+                Url::parse("file:///pkg/config.idp").unwrap(),
+                MANIFEST.to_string(),
+            ),
             SourceFile::of_dependency(
                 Url::parse("file:///shared/src/models.ids").unwrap(),
                 "struct Thing {\n    id: u64\n}\n".to_string(),
@@ -649,15 +817,26 @@ mod tests {
                 vec!["shared".to_string(), "models".to_string()],
             ),
         ];
-        files.extend(crate::analysis::stdlib::files(&crate::analysis::stdlib::root()));
+        files.extend(crate::analysis::stdlib::files(
+            &crate::analysis::stdlib::root(),
+        ));
         let project = Project::new(files.iter());
         let check = check(&project, 0);
         let unresolved = check
             .unresolved
             .iter()
-            .map(|u| (body[u.range.0..u.range.1].to_string(), u.detail.clone(), u.suggestion.clone()))
+            .map(|u| {
+                (
+                    body[u.range.0..u.range.1].to_string(),
+                    u.detail.clone(),
+                    u.suggestion.clone(),
+                )
+            })
             .collect();
-        (unresolved, check.unverified.iter().map(|u| u.reason.clone()).collect())
+        (
+            unresolved,
+            check.unverified.iter().map(|u| u.reason.clone()).collect(),
+        )
     }
 
     #[test]
@@ -675,10 +854,15 @@ mod tests {
 
     #[test]
     fn an_item_the_schema_does_not_declare_is_unresolved() {
-        let (unresolved, _) = resolution_of("use types::{User, Usr}\n\nstruct S {\n    u: User\n}\n");
+        let (unresolved, _) =
+            resolution_of("use types::{User, Usr}\n\nstruct S {\n    u: User\n}\n");
         assert_eq!(
             unresolved,
-            vec![("Usr".to_string(), "schema 'types' doesn't declare 'Usr'".to_string(), Some("User".to_string()))]
+            vec![(
+                "Usr".to_string(),
+                "schema 'types' doesn't declare 'Usr'".to_string(),
+                Some("User".to_string())
+            )]
         );
     }
 
@@ -694,13 +878,17 @@ mod tests {
             "use shared::models::Thing\n\nstruct S {\n    t: Thing\n}\n",
         ] {
             let (unresolved, unverified) = resolution_of(body);
-            assert!(unresolved.is_empty() && unverified.is_empty(), "{body}: {unresolved:?} {unverified:?}");
+            assert!(
+                unresolved.is_empty() && unverified.is_empty(),
+                "{body}: {unresolved:?} {unverified:?}"
+            );
         }
     }
 
     #[test]
     fn std_is_checked_like_the_build_checks_it() {
-        let (unresolved, _) = resolution_of("use std::htp::Request\n\nstruct S {\n    id: u64\n}\n");
+        let (unresolved, _) =
+            resolution_of("use std::htp::Request\n\nstruct S {\n    id: u64\n}\n");
         assert_eq!(
             unresolved,
             vec![(
@@ -710,7 +898,8 @@ mod tests {
             )]
         );
 
-        let (unresolved, _) = resolution_of("use std::http::Reqest\n\nstruct S {\n    id: u64\n}\n");
+        let (unresolved, _) =
+            resolution_of("use std::http::Reqest\n\nstruct S {\n    id: u64\n}\n");
         assert_eq!(
             unresolved,
             vec![(
@@ -723,7 +912,8 @@ mod tests {
 
     #[test]
     fn a_dependency_with_files_is_checked_like_the_package() {
-        let (unresolved, _) = resolution_of("use shared::models::Thign\n\nstruct S {\n    id: u64\n}\n");
+        let (unresolved, _) =
+            resolution_of("use shared::models::Thign\n\nstruct S {\n    id: u64\n}\n");
         assert_eq!(
             unresolved,
             vec![(
@@ -733,21 +923,34 @@ mod tests {
             )]
         );
 
-        let (unresolved, _) = resolution_of("use shared::nothing::X\n\nstruct S {\n    id: u64\n}\n");
+        let (unresolved, _) =
+            resolution_of("use shared::nothing::X\n\nstruct S {\n    id: u64\n}\n");
         assert_eq!(unresolved.len(), 1, "{unresolved:?}");
-        assert_eq!(unresolved[0].1, "no schema in this package or its dependencies matches 'shared::nothing::X'");
+        assert_eq!(
+            unresolved[0].1,
+            "no schema in this package or its dependencies matches 'shared::nothing::X'"
+        );
     }
 
     #[test]
     fn a_dependency_without_files_is_not_checked_and_says_why() {
-        let (unresolved, unverified) = resolution_of("use net::wire::Frame\n\nstruct S {\n    id: u64\n}\n");
+        let (unresolved, unverified) =
+            resolution_of("use net::wire::Frame\n\nstruct S {\n    id: u64\n}\n");
         assert!(unresolved.is_empty(), "{unresolved:?}");
-        assert_eq!(unverified, vec!["dependency `net` isn't fetched yet — run `comline check` to fetch it".to_string()]);
+        assert_eq!(
+            unverified,
+            vec![
+                "dependency `net` isn't fetched yet — run `comline check` to fetch it".to_string()
+            ]
+        );
     }
 
     #[test]
     fn without_the_manifest_nothing_is_called_unresolved() {
-        let files = project(&[("file:///pkg/src/chat.ids", "use typse::User\n\nstruct S {\n    id: u64\n}\n")]);
+        let files = project(&[(
+            "file:///pkg/src/chat.ids",
+            "use typse::User\n\nstruct S {\n    id: u64\n}\n",
+        )]);
         let project = Project::new(files.iter());
         assert!(check(&project, 0).unresolved.is_empty());
     }
@@ -755,8 +958,14 @@ mod tests {
     #[test]
     fn a_type_from_a_dependency_is_a_missing_import_candidate() {
         let files = [
-            SourceFile::local(Url::parse("file:///pkg/src/chat.ids").unwrap(), "struct S {\n    t: Thing\n}\n".to_string()),
-            SourceFile::local(Url::parse("file:///pkg/config.idp").unwrap(), MANIFEST.to_string()),
+            SourceFile::local(
+                Url::parse("file:///pkg/src/chat.ids").unwrap(),
+                "struct S {\n    t: Thing\n}\n".to_string(),
+            ),
+            SourceFile::local(
+                Url::parse("file:///pkg/config.idp").unwrap(),
+                MANIFEST.to_string(),
+            ),
             SourceFile::of_dependency(
                 Url::parse("file:///shared/src/models.ids").unwrap(),
                 "struct Thing {\n    id: u64\n}\n".to_string(),
@@ -767,7 +976,9 @@ mod tests {
         let project = Project::new(files.iter());
         let missing = check(&project, 0).missing;
         assert_eq!(missing.len(), 1);
-        assert_eq!(missing[0].candidates[0].use_path("Thing"), "shared::models::Thing");
+        assert_eq!(
+            missing[0].candidates[0].use_path("Thing"),
+            "shared::models::Thing"
+        );
     }
 }
-

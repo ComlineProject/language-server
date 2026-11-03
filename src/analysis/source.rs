@@ -51,12 +51,22 @@ pub struct SourceFile {
 impl SourceFile {
     /// A file of the package itself (or its `config.idp`).
     pub fn local(uri: Url, text: String) -> Self {
-        Self { uri, text, namespace: None, dependency: None }
+        Self {
+            uri,
+            text,
+            namespace: None,
+            dependency: None,
+        }
     }
 
     /// A file of the dependency declared as `name`, seen under `namespace`.
     pub fn of_dependency(uri: Url, text: String, name: &str, namespace: Vec<String>) -> Self {
-        Self { uri, text, namespace: Some(namespace), dependency: Some(name.to_string()) }
+        Self {
+            uri,
+            text,
+            namespace: Some(namespace),
+            dependency: Some(name.to_string()),
+        }
     }
 }
 
@@ -110,7 +120,9 @@ pub fn declared_dependencies(manifest: &str) -> Vec<DeclaredDependency> {
         .into_values()
         .map(|dep| DeclaredDependency {
             kind: match &dep.source {
-                DependencySource::Path { path, .. } => DependencyKind::Path(path.to_string_lossy().into_owned()),
+                DependencySource::Path { path, .. } => {
+                    DependencyKind::Path(path.to_string_lossy().into_owned())
+                }
                 DependencySource::Git { .. } => DependencyKind::Git,
                 DependencySource::Registry { .. } => DependencyKind::Registry,
             },
@@ -154,9 +166,15 @@ pub fn declared_languages(manifest: &str) -> Vec<DeclaredLanguage> {
     units
         .iter()
         .filter_map(|u| match u {
-            FrozenUnit::CodeGeneration(details) => details.name.split_once('#').map(|(language, version)| {
-                DeclaredLanguage { language: language.to_string(), version: version.to_string() }
-            }),
+            FrozenUnit::CodeGeneration(details) => {
+                details
+                    .name
+                    .split_once('#')
+                    .map(|(language, version)| DeclaredLanguage {
+                        language: language.to_string(),
+                        version: version.to_string(),
+                    })
+            }
             _ => None,
         })
         .collect()
@@ -240,7 +258,9 @@ pub fn manifest_error(manifest: &str, path: Option<&std::path::Path>) -> Option<
     let context = match path {
         // On disk, `encodings` is checked as a build checks it: each
         // profile read from beside the manifest.
-        Some(path) => ProjectContext::with_config_from_origin(Origin::Disk(path.to_path_buf()), congregation),
+        Some(path) => {
+            ProjectContext::with_config_from_origin(Origin::Disk(path.to_path_buf()), congregation)
+        }
         // Elsewhere there is no directory to read a profile from, so the
         // entries are left to the build rather than reported as unreadable.
         None => {
@@ -248,7 +268,9 @@ pub fn manifest_error(manifest: &str, path: Option<&std::path::Path>) -> Option<
             ProjectContext::with_config(congregation)
         }
     };
-    interpret_context(&context, None).err().map(|e| e.to_string())
+    interpret_context(&context, None)
+        .err()
+        .map(|e| e.to_string())
 }
 
 /// `congregation` without its `encodings` key. Core freezes an encoding by
@@ -256,7 +278,9 @@ pub fn manifest_error(manifest: &str, path: Option<&std::path::Path>) -> Option<
 /// doesn't have, so the key is left out wherever only other keys matter.
 /// The names it declares are read by [`declared_encodings`].
 fn without_encodings(congregation: &mut comline_core::package::config::idl::grammar::Congregation) {
-    congregation.assignments.retain(|a| a.value.key.text() != "encodings");
+    congregation
+        .assignments
+        .retain(|a| a.value.key.text() != "encodings");
 }
 
 /// Every encoding `config.idp`'s text declares under `encodings`, by name
@@ -265,7 +289,10 @@ fn without_encodings(congregation: &mut comline_core::package::config::idl::gram
 /// has: an entry whose `kind` isn't one of the three is left out, and the
 /// build reports it. Empty when the manifest doesn't parse (mid-edit).
 pub fn declared_encodings(manifest: &str) -> Vec<(String, comline_core::encodings::EncodingKind)> {
-    declared_encoding_details(manifest).into_iter().map(|e| (e.name, e.kind)).collect()
+    declared_encoding_details(manifest)
+        .into_iter()
+        .map(|e| (e.name, e.kind))
+        .collect()
 }
 
 /// An encoding `config.idp` declares, with the mappings it suggests per
@@ -294,11 +321,15 @@ pub fn declared_encoding_details(manifest: &str) -> Vec<DeclaredEncoding> {
     let mut declared = vec![];
     for assignment in &congregation.assignments {
         let assignment = &assignment.value;
-        let (true, Value::Dictionary(entries)) = (assignment.key.text() == "encodings", &assignment.value) else {
+        let (true, Value::Dictionary(entries)) =
+            (assignment.key.text() == "encodings", &assignment.value)
+        else {
             continue;
         };
         for entry in &entries.assignments {
-            let Value::Dictionary(fields) = &entry.value.value else { continue };
+            let Value::Dictionary(fields) = &entry.value.value else {
+                continue;
+            };
             let mut kind = None;
             let mut map = std::collections::BTreeMap::new();
             for field in &fields.assignments {
@@ -313,14 +344,24 @@ pub fn declared_encoding_details(manifest: &str) -> Vec<DeclaredEncoding> {
                     }
                     ("map", Value::Dictionary(languages)) => {
                         for language in &languages.assignments {
-                            let Value::Dictionary(parts) = &language.value.value else { continue };
+                            let Value::Dictionary(parts) = &language.value.value else {
+                                continue;
+                            };
                             let part = |name: &str| {
-                                parts.assignments.iter().find(|p| p.value.key.text() == name).and_then(|p| text(&p.value.value))
+                                parts
+                                    .assignments
+                                    .iter()
+                                    .find(|p| p.value.key.text() == name)
+                                    .and_then(|p| text(&p.value.value))
                             };
                             if let Some(ty) = part("type") {
                                 map.insert(
                                     language.value.key.text(),
-                                    EncodingMapping { ty, package: part("package"), version: part("version") },
+                                    EncodingMapping {
+                                        ty,
+                                        package: part("package"),
+                                        version: part("version"),
+                                    },
                                 );
                             }
                         }
@@ -329,7 +370,11 @@ pub fn declared_encoding_details(manifest: &str) -> Vec<DeclaredEncoding> {
                 }
             }
             if let Some(kind) = kind {
-                declared.push(DeclaredEncoding { name: entry.value.key.text(), kind, map });
+                declared.push(DeclaredEncoding {
+                    name: entry.value.key.text(),
+                    kind,
+                    map,
+                });
             }
         }
     }
@@ -416,7 +461,10 @@ fn resolve_named_settings_block<S: ProjectSource>(
     use comline_core::schema::ir::compiler::Compile;
     use comline_core::schema::ir::frozen::unit::FrozenUnit as SchemaFrozenUnit;
 
-    if !declared_dependencies(manifest).iter().any(|d| d.name == dep_name) {
+    if !declared_dependencies(manifest)
+        .iter()
+        .any(|d| d.name == dep_name)
+    {
         return Err(format!("no dependency named `{dep_name}` is declared"));
     }
 
@@ -430,12 +478,21 @@ fn resolve_named_settings_block<S: ProjectSource>(
         };
         let units = IncrementalInterpreter::from_declarations(document.0);
         for unit in &units {
-            let SchemaFrozenUnit::Settings { name: Some(n), values, .. } = unit else { continue };
+            let SchemaFrozenUnit::Settings {
+                name: Some(n),
+                values,
+                ..
+            } = unit
+            else {
+                continue;
+            };
             if n != block_name {
                 continue;
             }
-            let here =
-                file.namespace().map(|ns| ns.join("::")).unwrap_or_else(|| file.uri().to_string());
+            let here = file
+                .namespace()
+                .map(|ns| ns.join("::"))
+                .unwrap_or_else(|| file.uri().to_string());
             if let Some((_, first)) = &found {
                 return Err(format!(
                     "settings block `{block_name}` is ambiguous: found in both `{first}` and `{here}`"
@@ -466,9 +523,18 @@ mod tests {
         assert_eq!(
             declared_dependencies(manifest),
             vec![
-                DeclaredDependency { name: "hosted".into(), kind: DependencyKind::Registry },
-                DeclaredDependency { name: "net".into(), kind: DependencyKind::Git },
-                DeclaredDependency { name: "shared".into(), kind: DependencyKind::Path("../shared".into()) },
+                DeclaredDependency {
+                    name: "hosted".into(),
+                    kind: DependencyKind::Registry
+                },
+                DeclaredDependency {
+                    name: "net".into(),
+                    kind: DependencyKind::Git
+                },
+                DeclaredDependency {
+                    name: "shared".into(),
+                    kind: DependencyKind::Path("../shared".into())
+                },
             ]
         );
     }
@@ -510,7 +576,10 @@ mod tests {
         // Not empty: a half-typed manifest tells us nothing about the
         // package's own settings, but the built-in floor still applies, and
         // claiming otherwise made the editor disagree with every build.
-        assert_eq!(declared_settings("congregation app\nsettings = {"), base_settings());
+        assert_eq!(
+            declared_settings("congregation app\nsettings = {"),
+            base_settings()
+        );
     }
 
     #[test]
@@ -527,8 +596,11 @@ mod tests {
 
     #[test]
     fn a_malformed_package_id_is_what_a_build_would_reject() {
-        let err = manifest_error("congregation app\nid = \"nope\"\nspecification_version = 1\n", None)
-            .expect("a malformed id is an error");
+        let err = manifest_error(
+            "congregation app\nid = \"nope\"\nspecification_version = 1\n",
+            None,
+        )
+        .expect("a malformed id is an error");
         assert!(err.contains("hex"), "{err}");
     }
 
@@ -545,7 +617,10 @@ mod tests {
 
     #[test]
     fn manifest_error_is_quiet_for_a_valid_or_incomplete_manifest() {
-        assert_eq!(manifest_error("congregation app\nspecification_version = 1\n", None), None);
+        assert_eq!(
+            manifest_error("congregation app\nspecification_version = 1\n", None),
+            None
+        );
         // The package id (core#159) is a key the editor knows; a malformed
         // one is what a build refuses.
         let id = "congregation app\nid = \"0123456789abcdef0123456789abcdef\"\nspecification_version = 1\n";
@@ -561,7 +636,10 @@ mod tests {
         let manifest = "congregation app\nspecification_version = 1\n\
             encodings = {\n    \"com.acme.x@1\" = { kind = \"format\" profile = \"x.json\" }\n    \
             \"com.acme.y@1\" = { kind = \"nonsense\" profile = \"y.json\" }\n}\n";
-        assert_eq!(declared_encodings(manifest), vec![("com.acme.x@1".to_string(), EncodingKind::Format)]);
+        assert_eq!(
+            declared_encodings(manifest),
+            vec![("com.acme.x@1".to_string(), EncodingKind::Format)]
+        );
         assert!(declared_encodings("congregation app\nencodings = {").is_empty());
     }
 
@@ -610,7 +688,10 @@ mod tests {
     fn a_cross_package_reference_resolves_against_the_dependencys_files() {
         use comline_core::settings::value::SettingsValue;
 
-        let files = [dep_file(&["shared", "policy"], "settings Strict {\n    max_depth = 4\n}\n")];
+        let files = [dep_file(
+            &["shared", "policy"],
+            "settings Strict {\n    max_depth = 4\n}\n",
+        )];
         let result = resolve_cross_package_settings(&consumer_manifest(), &files)
             .expect("a reference should resolve to Some")
             .expect("resolution should succeed");
@@ -624,23 +705,38 @@ mod tests {
         let err = resolve_cross_package_settings::<SourceFile>(manifest, &[])
             .expect("a reference should resolve to Some")
             .expect_err("no such dependency is declared");
-        assert!(err.contains("no dependency named `nonexistent`"), "got: {err}");
+        assert!(
+            err.contains("no dependency named `nonexistent`"),
+            "got: {err}"
+        );
     }
 
     #[test]
     fn a_reference_to_a_missing_block_is_an_error() {
-        let files = [dep_file(&["shared", "policy"], "settings Other {\n    max_depth = 4\n}\n")];
+        let files = [dep_file(
+            &["shared", "policy"],
+            "settings Other {\n    max_depth = 4\n}\n",
+        )];
         let err = resolve_cross_package_settings(&consumer_manifest(), &files)
             .expect("a reference should resolve to Some")
             .expect_err("shared has no block named Strict");
-        assert!(err.contains("no settings block named `Strict`"), "got: {err}");
+        assert!(
+            err.contains("no settings block named `Strict`"),
+            "got: {err}"
+        );
     }
 
     #[test]
     fn an_ambiguous_block_across_two_files_is_an_error() {
         let files = [
-            dep_file(&["shared", "a"], "settings Strict {\n    max_depth = 4\n}\n"),
-            dep_file(&["shared", "b"], "settings Strict {\n    max_depth = 8\n}\n"),
+            dep_file(
+                &["shared", "a"],
+                "settings Strict {\n    max_depth = 4\n}\n",
+            ),
+            dep_file(
+                &["shared", "b"],
+                "settings Strict {\n    max_depth = 8\n}\n",
+            ),
         ];
         let err = resolve_cross_package_settings(&consumer_manifest(), &files)
             .expect("a reference should resolve to Some")

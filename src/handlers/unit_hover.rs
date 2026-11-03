@@ -75,7 +75,11 @@ impl UnitHover {
             body.push(String::new());
             body.push("#### Examples".to_string());
             for (index, (name, code)) in self.examples.iter().enumerate() {
-                let heading = if name.is_empty() { format!("Example {}", index + 1) } else { name.clone() };
+                let heading = if name.is_empty() {
+                    format!("Example {}", index + 1)
+                } else {
+                    name.clone()
+                };
                 body.push(String::new());
                 body.push(format!("##### {heading}"));
                 body.push(String::new());
@@ -88,7 +92,10 @@ impl UnitHover {
         let mut contents = vec![MarkedString::from_markdown(body.join("\n"))];
         contents.extend(self.extra.into_iter().map(MarkedString::from_markdown));
 
-        Hover { contents: HoverContents::Array(contents), range: None }
+        Hover {
+            contents: HoverContents::Array(contents),
+            range: None,
+        }
     }
 }
 
@@ -118,7 +125,9 @@ mod tests {
 
     #[test]
     fn description_adds_a_heading_and_body() {
-        let hover = UnitHover::new("value: type").description("What this does.").build();
+        let hover = UnitHover::new("value: type")
+            .description("What this does.")
+            .build();
         let parts = blocks(hover);
         assert_eq!(parts.len(), 1);
         assert!(parts[0].contains("#### Description"));
@@ -127,11 +136,18 @@ mod tests {
 
     #[test]
     fn fields_render_as_their_own_fenced_block() {
-        let hover = UnitHover::new("value: type").field("foo", "string").field("bar", "int").build();
+        let hover = UnitHover::new("value: type")
+            .field("foo", "string")
+            .field("bar", "int")
+            .build();
         let parts = blocks(hover);
         assert_eq!(parts.len(), 1);
         assert!(parts[0].contains("#### Fields"));
-        assert!(parts[0].contains("```comline\nfoo: string\nbar: int\n```"), "{}", parts[0]);
+        assert!(
+            parts[0].contains("```comline\nfoo: string\nbar: int\n```"),
+            "{}",
+            parts[0]
+        );
     }
 
     #[test]
@@ -150,7 +166,9 @@ mod tests {
 
     #[test]
     fn an_unnamed_example_is_numbered() {
-        let hover = UnitHover::new("value: type").example("", "foo.bar = true").build();
+        let hover = UnitHover::new("value: type")
+            .example("", "foo.bar = true")
+            .build();
         let parts = blocks(hover);
         assert!(parts[0].contains("##### Example 1"), "{}", parts[0]);
     }
@@ -209,6 +227,9 @@ mod tests {
             ]
             .join("\n")
         );
-        assert_eq!(parts[1], "`effective:` **Bool(true)** _(applies to declarations using `@settings = Test`)_");
+        assert_eq!(
+            parts[1],
+            "`effective:` **Bool(true)** _(applies to declarations using `@settings = Test`)_"
+        );
     }
 }
