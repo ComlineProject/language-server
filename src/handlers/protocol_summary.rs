@@ -282,6 +282,7 @@ mod tests {
              | encoding agreement | **given up** | handshake `none` | by each consumer |\n\
              | encoding conformance | held |  |  |\n\
              | version honesty | held |  |  |\n\
+             | bounded size | held |  |  |\n\
              \n`@unverified`: \"the 2009 gateway\"\n"
         );
         assert_eq!(summary(&root, "api", "Missing"), None);

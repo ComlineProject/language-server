@@ -1315,6 +1315,23 @@ struct User {
     }
 
     #[test]
+    fn a_bounded_field_shows_its_maximum_as_written() {
+        let source =
+            "struct Order {\n    sku: char[8]\n    note: char[max 280]\n    tags: u32[max 10]\n}\n";
+        let uri = Url::parse("file:///test.ids").unwrap();
+        for (line, written) in [
+            (1, "sku: char[8]"),
+            (2, "note: char[max 280]"),
+            (3, "tags: u32[max 10]"),
+        ] {
+            let hover =
+                get_hover_info(source, &uri, Position::new(line, 6)).expect("hover should resolve");
+            let text = hover_text(hover);
+            assert!(text.contains(written), "got: {text}");
+        }
+    }
+
+    #[test]
     fn test_hover_on_a_field_name_shows_its_own_info() {
         let source =
             "struct Greeting {\n    message: string\n    language: string\n    test: bool\n}\n";
