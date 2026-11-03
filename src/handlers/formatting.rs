@@ -10,7 +10,7 @@ use lsp_types::{Position, Range, TextEdit};
 pub fn format_document(source: &str) -> Vec<TextEdit> {
     // Basic formatting: normalize whitespace and indentation
     let formatted = basic_format(source);
-    
+
     // Return a single edit that replaces entire document
     if formatted == source {
         vec![] // No changes needed
@@ -30,16 +30,16 @@ fn basic_format(source: &str) -> String {
     let mut result = String::new();
     let mut indent_level: u32 = 0;
     const INDENT: &str = "    "; // 4 spaces
-    
+
     for line in source.lines() {
         let trimmed = line.trim();
-        
+
         // Skip empty lines
         if trimmed.is_empty() {
             result.push('\n');
             continue;
         }
-        
+
         // A full-line comment is text: a `{` or `}` in one (a code example in a
         // `///` or `//!` doc) doesn't change the nesting.
         if trimmed.starts_with("//") {
@@ -55,29 +55,29 @@ fn basic_format(source: &str) -> String {
         if trimmed.starts_with('}') {
             indent_level = indent_level.saturating_sub(1);
         }
-        
+
         // Add indentation
         for _ in 0..indent_level {
             result.push_str(INDENT);
         }
-        
+
         // Add the line
         result.push_str(trimmed);
         result.push('\n');
-        
+
         // Increase indent after opening brace
         if trimmed.ends_with('{') {
             indent_level += 1;
         }
     }
-    
+
     result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn braces_in_full_line_comments_do_not_change_the_indentation() {
         // A doc example with a `{` at the end of a line used to indent
@@ -99,19 +99,19 @@ mod tests {
     fn test_format_struct() {
         let source = "struct User {\nname: string\nage: i32\n}";
         let formatted = basic_format(source);
-        
+
         assert!(formatted.contains("    name: string"));
         assert!(formatted.contains("    age: i32"));
     }
-    
+
     #[test]
     fn test_format_nested() {
         let source = "protocol API {\nfunction test() -> bool;\n}";
         let formatted = basic_format(source);
-        
+
         assert!(formatted.contains("    function test()"));
     }
-    
+
     #[test]
     fn test_format_no_changes() {
         let source = "struct User {\n    name: string\n}\n";
@@ -125,7 +125,8 @@ mod tests {
     fn test_format_idp() {
         // `.idp` nests with `{}` the same way `.ids` does — same formatter,
         // no `.idp`-specific logic needed.
-        let source = "congregation test\ncode_generation = {\nlanguages = {\nrust#1.85.0 = {}\n}\n}";
+        let source =
+            "congregation test\ncode_generation = {\nlanguages = {\nrust#1.85.0 = {}\n}\n}";
         let formatted = basic_format(source);
 
         assert!(formatted.contains("    languages = {"));

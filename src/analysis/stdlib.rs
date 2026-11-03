@@ -21,13 +21,24 @@ pub const NAME: &str = stdlib::NAMESPACE;
 /// whose `//!` header documents the package itself.
 pub fn files(root: &Url) -> Vec<SourceFile> {
     let schemas = stdlib::schemas().filter_map(|(namespace, source)| {
-        let uri = root.join(&format!("{}.ids", namespace[1..].join("/"))).ok()?;
-        Some(SourceFile::of_dependency(uri, source.to_string(), NAME, namespace))
+        let uri = root
+            .join(&format!("{}.ids", namespace[1..].join("/")))
+            .ok()?;
+        Some(SourceFile::of_dependency(
+            uri,
+            source.to_string(),
+            NAME,
+            namespace,
+        ))
     });
-    let manifest = root
-        .join("config.idp")
-        .ok()
-        .map(|uri| SourceFile::of_dependency(uri, stdlib::manifest().to_string(), NAME, vec![NAME.to_string()]));
+    let manifest = root.join("config.idp").ok().map(|uri| {
+        SourceFile::of_dependency(
+            uri,
+            stdlib::manifest().to_string(),
+            NAME,
+            vec![NAME.to_string()],
+        )
+    });
     schemas.chain(manifest).collect()
 }
 
@@ -53,7 +64,10 @@ pub fn source(uri: &Url) -> Option<String> {
     if !is_std(uri) {
         return None;
     }
-    files(&root()).into_iter().find(|file| file.uri.path() == uri.path()).map(|file| file.text)
+    files(&root())
+        .into_iter()
+        .find(|file| file.uri.path() == uri.path())
+        .map(|file| file.text)
 }
 
 /// How a hover or completion detail names what a file belongs to:
@@ -73,10 +87,21 @@ mod tests {
     #[test]
     fn std_files_are_named_by_their_std_namespace() {
         let files = files(&root());
-        let named: Vec<(String, Vec<String>)> =
-            files.iter().map(|f| (f.uri().to_string(), f.namespace().unwrap().to_vec())).collect();
-        assert!(named.contains(&("comline-std:/http.ids".to_string(), vec!["std".to_string(), "http".to_string()])));
-        assert!(named.contains(&("comline-std:/config.idp".to_string(), vec!["std".to_string()])), "the package's manifest");
+        let named: Vec<(String, Vec<String>)> = files
+            .iter()
+            .map(|f| (f.uri().to_string(), f.namespace().unwrap().to_vec()))
+            .collect();
+        assert!(named.contains(&(
+            "comline-std:/http.ids".to_string(),
+            vec!["std".to_string(), "http".to_string()]
+        )));
+        assert!(
+            named.contains(&(
+                "comline-std:/config.idp".to_string(),
+                vec!["std".to_string()]
+            )),
+            "the package's manifest"
+        );
         assert!(files.iter().all(|f| f.dependency() == Some(NAME)));
     }
 
@@ -85,8 +110,14 @@ mod tests {
         let http = Url::parse("comline-std:/http.ids").unwrap();
         assert!(is_std(&http));
         assert!(source(&http).unwrap().contains("struct Request"));
-        assert_eq!(source(&Url::parse("comline-std:///http.ids").unwrap()), source(&http));
-        assert_eq!(source(&Url::parse("comline-std:///nope.ids").unwrap()), None);
+        assert_eq!(
+            source(&Url::parse("comline-std:///http.ids").unwrap()),
+            source(&http)
+        );
+        assert_eq!(
+            source(&Url::parse("comline-std:///nope.ids").unwrap()),
+            None
+        );
         assert!(!is_std(&Url::parse("file:///pkg/src/http.ids").unwrap()));
     }
 }

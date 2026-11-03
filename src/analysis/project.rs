@@ -6,7 +6,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use comline_core::schema::idl::grammar::{Annotation, AnnotationValue, Declaration, Document, Type};
+use comline_core::schema::idl::grammar::{
+    Annotation, AnnotationValue, Declaration, Document, Type,
+};
 use comline_core::schema::idl::module_docs::module_docs;
 use lsp_types::{Location, Url};
 
@@ -109,26 +111,45 @@ impl<'a> Project<'a> {
 
     /// The active file first, then every other file - the shape every
     /// handler has.
-    pub fn with_active<S: ProjectSource>(uri: &'a Url, source: &'a str, other_files: &'a [S]) -> Self {
-        let active = Input { uri, text: source, namespace: None, dependency: None };
-        Self::build(std::iter::once(active).chain(other_files.iter().map(|file| Input {
-            uri: file.uri(),
-            text: file.text(),
-            namespace: file.namespace(),
-            dependency: file.dependency(),
-        })))
+    pub fn with_active<S: ProjectSource>(
+        uri: &'a Url,
+        source: &'a str,
+        other_files: &'a [S],
+    ) -> Self {
+        let active = Input {
+            uri,
+            text: source,
+            namespace: None,
+            dependency: None,
+        };
+        Self::build(
+            std::iter::once(active).chain(other_files.iter().map(|file| Input {
+                uri: file.uri(),
+                text: file.text(),
+                namespace: file.namespace(),
+                dependency: file.dependency(),
+            })),
+        )
     }
 
     /// Like [`Project::new`], from schemas the caller already parsed.
     pub fn from_parsed(files: impl IntoIterator<Item = (&'a Url, &'a str, Arc<Document>)>) -> Self {
         let docs = files
             .into_iter()
-            .map(|(uri, source, document)| ProjectDoc::new(uri, source, document, imports::namespace_of(uri), None))
+            .map(|(uri, source, document)| {
+                ProjectDoc::new(uri, source, document, imports::namespace_of(uri), None)
+            })
             .collect();
 
         Self {
-            docs, unparsed: vec![], has_manifest: false, languages: vec![], dependencies: vec![],
-            package_docs: BTreeMap::new(), settings: Default::default(), settings_error: None,
+            docs,
+            unparsed: vec![],
+            has_manifest: false,
+            languages: vec![],
+            dependencies: vec![],
+            package_docs: BTreeMap::new(),
+            settings: Default::default(),
+            settings_error: None,
             encodings: vec![],
         }
     }
@@ -143,7 +164,8 @@ impl<'a> Project<'a> {
         let mut project = Self {
             docs: vec![],
             unparsed: vec![],
-            has_manifest: false, languages: vec![],
+            has_manifest: false,
+            languages: vec![],
             dependencies: vec![],
             package_docs: BTreeMap::new(),
             settings: Default::default(),
@@ -156,14 +178,18 @@ impl<'a> Project<'a> {
                 match input.dependency {
                     // A dependency's own manifest: what its package says about itself.
                     Some(name) => {
-                        project.encodings.extend(source::declared_encodings(input.text));
+                        project
+                            .encodings
+                            .extend(source::declared_encodings(input.text));
                         if let Some(docs) = module_docs(input.text) {
                             project.package_docs.insert(name.to_string(), docs);
                         }
                     }
                     None => {
                         project.has_manifest = true;
-                        project.encodings.extend(source::declared_encodings(input.text));
+                        project
+                            .encodings
+                            .extend(source::declared_encodings(input.text));
                         project.dependencies = source::declared_dependencies(input.text);
                         project.languages = source::declared_languages(input.text);
                         match source::resolve_cross_package_settings(input.text, &inputs) {
@@ -176,11 +202,18 @@ impl<'a> Project<'a> {
                 continue;
             }
 
-            let namespace = input.namespace.map(<[String]>::to_vec).unwrap_or_else(|| imports::namespace_of(input.uri));
+            let namespace = input
+                .namespace
+                .map(<[String]>::to_vec)
+                .unwrap_or_else(|| imports::namespace_of(input.uri));
             match parse_cache::parse(input.uri, input.text) {
-                Some(document) => {
-                    project.docs.push(ProjectDoc::new(input.uri, input.text, document, namespace, input.dependency))
-                }
+                Some(document) => project.docs.push(ProjectDoc::new(
+                    input.uri,
+                    input.text,
+                    document,
+                    namespace,
+                    input.dependency,
+                )),
                 None => project.unparsed.push(namespace),
             }
         }
@@ -222,7 +255,9 @@ impl<'a> Project<'a> {
 
         let found = imports::resolve_symbol(name, &here.imports, &files)?;
         let index = indices[files.iter().position(|f| std::ptr::eq(f, found.file))?];
-        let symbol = self.docs[index].symbols.index_in(&found.real_name, namespace)?;
+        let symbol = self.docs[index]
+            .symbols
+            .index_in(&found.real_name, namespace)?;
         Some(Target { doc: index, symbol })
     }
 
@@ -233,7 +268,10 @@ impl<'a> Project<'a> {
     /// guess about which namespace the name was meant in, and holds even
     /// where two declarations do share a name.
     pub fn target_at(&self, doc: usize, offset: usize) -> Option<Target> {
-        self.docs[doc].symbols.index_at_offset(offset).map(|symbol| Target { doc, symbol })
+        self.docs[doc]
+            .symbols
+            .index_at_offset(offset)
+            .map(|symbol| Target { doc, symbol })
     }
 
     /// What the cursor at `offset` names.
@@ -247,7 +285,11 @@ impl<'a> Project<'a> {
             return Some(target);
         }
         let (start, end) = crate::util::word_range_at(source, offset)?;
-        self.resolve(doc, &source[start..end], symbols::namespace_at(source, offset))
+        self.resolve(
+            doc,
+            &source[start..end],
+            symbols::namespace_at(source, offset),
+        )
     }
 
     /// The symbol `target` names.
@@ -288,9 +330,7 @@ impl<'a> Project<'a> {
                     // symbol and must not be swept up here.
                     // In scope only: a file naming `User` without importing
                     // it doesn't refer to this one, and rename mustn't edit it.
-                    if self.resolve(index, &name, Namespace::Declaration).as_ref()
-                        != Some(target)
-                    {
+                    if self.resolve(index, &name, Namespace::Declaration).as_ref() != Some(target) {
                         continue;
                     }
                     for offset in occurrences_in(doc.source, span.0, &name) {
@@ -335,7 +375,13 @@ impl<'a> Project<'a> {
             .collect()
     }
 
-    fn reference(&self, doc: &ProjectDoc, offset: usize, name: &str, spelled_as_target: bool) -> Reference {
+    fn reference(
+        &self,
+        doc: &ProjectDoc,
+        offset: usize,
+        name: &str,
+        spelled_as_target: bool,
+    ) -> Reference {
         Reference {
             location: Location {
                 uri: doc.uri.clone(),
@@ -385,11 +431,24 @@ impl<'a> ProjectDoc<'a> {
         let symbols = symbols::build_symbol_table(&document, uri, source);
         let imports = imports::resolved_imports(&document, &namespace);
         let docs = module_docs(source);
-        Self { uri, source, document, symbols, imports, namespace, dependency, docs }
+        Self {
+            uri,
+            source,
+            document,
+            symbols,
+            imports,
+            namespace,
+            dependency,
+            docs,
+        }
     }
 
     fn as_file(&self) -> ProjectFile<'a> {
-        ProjectFile { uri: self.uri, source: self.source, namespace: self.namespace.clone() }
+        ProjectFile {
+            uri: self.uri,
+            source: self.source,
+            namespace: self.namespace.clone(),
+        }
     }
 }
 
@@ -410,9 +469,10 @@ fn occurrences_in(source: &str, span: (usize, usize), name: &str) -> Vec<usize> 
 /// Whether the word at `offset` is the alias in `... as Alias`, looking
 /// back no further than `from`.
 fn follows_as(source: &str, from: usize, offset: usize) -> bool {
-    source[from..offset].trim_end().strip_suffix("as").is_some_and(|before| {
-        before.ends_with(|c: char| c.is_whitespace())
-    })
+    source[from..offset]
+        .trim_end()
+        .strip_suffix("as")
+        .is_some_and(|before| before.ends_with(|c: char| c.is_whitespace()))
 }
 
 /// Every type position in a document, with its byte span.
@@ -422,13 +482,25 @@ fn type_spans(document: &Document) -> Vec<((usize, usize), &Type)> {
     for decl in &document.0 {
         match &**decl {
             Declaration::Struct(s) => {
-                spans.extend(s.fields().iter().map(|f| (f.field_type_span(), f.field_type())));
+                spans.extend(
+                    s.fields()
+                        .iter()
+                        .map(|f| (f.field_type_span(), f.field_type())),
+                );
             }
             Declaration::Error(e) => {
-                spans.extend(e.fields().iter().map(|f| (f.field_type_span(), f.field_type())));
+                spans.extend(
+                    e.fields()
+                        .iter()
+                        .map(|f| (f.field_type_span(), f.field_type())),
+                );
             }
             Declaration::Validator(v) => {
-                spans.extend(v.properties.iter().map(|p| (p.property_type.span, &p.property_type.value)));
+                spans.extend(
+                    v.properties
+                        .iter()
+                        .map(|p| (p.property_type.span, &p.property_type.value)),
+                );
             }
             Declaration::Protocol(p) => {
                 for func in p.functions() {
@@ -492,7 +564,10 @@ pub(crate) fn named_type_sites(doc: &ProjectDoc) -> Vec<(String, usize)> {
         }
     }
 
-    sites.into_iter().map(|(offset, name)| (name, offset)).collect()
+    sites
+        .into_iter()
+        .map(|(offset, name)| (name, offset))
+        .collect()
 }
 
 /// Every validator a file names in a `@validators = [...]` list, called or
@@ -502,8 +577,12 @@ pub(crate) fn validator_sites(doc: &ProjectDoc) -> Vec<(String, usize)> {
     let mut spans: Vec<((usize, usize), Vec<&Annotation>)> = Vec::new();
     for decl in &doc.document.0 {
         match &**decl {
-            Declaration::Struct(s) => spans.extend(s.fields().iter().map(|f| (f.span, f.annotations()))),
-            Declaration::Error(e) => spans.extend(e.fields().iter().map(|f| (f.span, f.annotations()))),
+            Declaration::Struct(s) => {
+                spans.extend(s.fields().iter().map(|f| (f.span, f.annotations())))
+            }
+            Declaration::Error(e) => {
+                spans.extend(e.fields().iter().map(|f| (f.span, f.annotations())))
+            }
             Declaration::TypeAlias(t) => spans.push((decl.span, t.annotations())),
             _ => {}
         }
@@ -515,7 +594,9 @@ pub(crate) fn validator_sites(doc: &ProjectDoc) -> Vec<(String, usize)> {
             .iter()
             .filter(|a| a.key.text == "validators")
             .filter_map(|a| match &a.assignment.as_ref()?.value {
-                AnnotationValue::List(list) => Some(list.items.iter().map(|call| call.name.text.as_str())),
+                AnnotationValue::List(list) => {
+                    Some(list.items.iter().map(|call| call.name.text.as_str()))
+                }
                 AnnotationValue::Scalar(_) | AnnotationValue::Dict(_) => None,
             })
             .flatten()
@@ -526,7 +607,9 @@ pub(crate) fn validator_sites(doc: &ProjectDoc) -> Vec<(String, usize)> {
         for name in names {
             for i in word_occurrences(text, name) {
                 // An entry in the list: `[Name(`, `, Name]`, a bare `Name,`.
-                let entry = text[i + name.len()..].trim_start().starts_with(['(', ',', ']']);
+                let entry = text[i + name.len()..]
+                    .trim_start()
+                    .starts_with(['(', ',', ']']);
                 let listed = text[..i].trim_end().ends_with(['[', ',']);
                 if entry && listed {
                     sites.insert((start + i, name.to_string()));
@@ -535,7 +618,10 @@ pub(crate) fn validator_sites(doc: &ProjectDoc) -> Vec<(String, usize)> {
         }
     }
 
-    sites.into_iter().map(|(offset, name)| (name, offset)).collect()
+    sites
+        .into_iter()
+        .map(|(offset, name)| (name, offset))
+        .collect()
 }
 
 /// Like [`collect_named`], but the full text as written (`types::User`).
@@ -545,7 +631,10 @@ fn collect_named_text(ty: &Type, names: &mut BTreeSet<String>) {
             names.insert(name.text.clone());
         }
         Type::Array(array) => collect_named_text(array.elem_type(), names),
-        Type::Union(union) => union.members().iter().for_each(|m| collect_named_text(m, names)),
+        Type::Union(union) => union
+            .members()
+            .iter()
+            .for_each(|m| collect_named_text(m, names)),
         _ => {}
     }
 }
@@ -556,15 +645,28 @@ mod tests {
     use crate::analysis::source::SourceFile;
 
     fn files(list: &[(&str, &str)]) -> Vec<(Url, String)> {
-        list.iter().map(|(u, s)| (Url::parse(u).unwrap(), s.to_string())).collect()
+        list.iter()
+            .map(|(u, s)| (Url::parse(u).unwrap(), s.to_string()))
+            .collect()
     }
 
     fn lines(refs: &[Reference]) -> Vec<(String, u32, u32)> {
         let mut out: Vec<_> = refs
             .iter()
             .map(|r| {
-                let file = r.location.uri.path().rsplit('/').next().unwrap().to_string();
-                (file, r.location.range.start.line, r.location.range.start.character)
+                let file = r
+                    .location
+                    .uri
+                    .path()
+                    .rsplit('/')
+                    .next()
+                    .unwrap()
+                    .to_string();
+                (
+                    file,
+                    r.location.range.start.line,
+                    r.location.range.start.character,
+                )
             })
             .collect();
         out.sort();
@@ -604,7 +706,10 @@ mod tests {
         let target = project.resolve(0, "User", Namespace::Declaration).unwrap();
 
         let refs = project.references(&target);
-        assert_eq!(lines(&refs), vec![("a.ids".into(), 5, 7), ("a.ids".into(), 9, 10)]);
+        assert_eq!(
+            lines(&refs),
+            vec![("a.ids".into(), 5, 7), ("a.ids".into(), 9, 10)]
+        );
     }
 
     /// A file naming `User` without importing it doesn't refer to another
@@ -618,7 +723,10 @@ mod tests {
         ]);
         let project = Project::new(all.iter());
         let target = project.resolve(0, "User", Namespace::Declaration).unwrap();
-        assert_eq!(lines(&project.references(&target)), Vec::<(String, u32, u32)>::new());
+        assert_eq!(
+            lines(&project.references(&target)),
+            Vec::<(String, u32, u32)>::new()
+        );
 
         assert_eq!(project.resolve(1, "User", Namespace::Declaration), None);
     }
@@ -632,12 +740,18 @@ mod tests {
             ("file:///unrelated.ids", "use other::Message\n\nstruct S {\n    m: Message\n}\n"),
         ]);
         let project = Project::new(all.iter());
-        let target = project.resolve(0, "Message", Namespace::Declaration).unwrap();
+        let target = project
+            .resolve(0, "Message", Namespace::Declaration)
+            .unwrap();
 
         let refs = project.references(&target);
         assert_eq!(
             lines(&refs),
-            vec![("chat.ids".into(), 0, 11), ("chat.ids".into(), 3, 18), ("chat.ids".into(), 3, 30)],
+            vec![
+                ("chat.ids".into(), 0, 11),
+                ("chat.ids".into(), 3, 18),
+                ("chat.ids".into(), 3, 30)
+            ],
             "only `chat.ids` imports `types::Message`; `unrelated.ids` imports `other`'s"
         );
     }
@@ -645,8 +759,14 @@ mod tests {
     #[test]
     fn an_alias_counts_as_a_reference_but_is_not_spelled_as_the_target() {
         let all = files(&[
-            ("file:///types.ids", "struct Message {\n    text: string\n}\n"),
-            ("file:///chat.ids", "use types::Message as Msg\n\nstruct S {\n    m: Msg\n}\n"),
+            (
+                "file:///types.ids",
+                "struct Message {\n    text: string\n}\n",
+            ),
+            (
+                "file:///chat.ids",
+                "use types::Message as Msg\n\nstruct S {\n    m: Msg\n}\n",
+            ),
         ]);
         let project = Project::new(all.iter());
         let target = project.resolve(1, "Msg", Namespace::Declaration).unwrap();
@@ -659,14 +779,24 @@ mod tests {
             .map(|r| (r.location.range.start.line, r.spelled_as_target))
             .collect();
         spelled.sort();
-        assert_eq!(spelled, vec![(0, true), (3, false)], "the `use` line's `Message`, then `m: Msg`");
+        assert_eq!(
+            spelled,
+            vec![(0, true), (3, false)],
+            "the `use` line's `Message`, then `m: Msg`"
+        );
     }
 
     #[test]
     fn a_namespace_segment_with_the_same_name_is_not_a_reference() {
         let all = files(&[
-            ("file:///pkg/src/User.ids", "struct User {\n    name: string\n}\n"),
-            ("file:///pkg/src/app.ids", "use User::User\n\nstruct S {\n    u: User\n}\n"),
+            (
+                "file:///pkg/src/User.ids",
+                "struct User {\n    name: string\n}\n",
+            ),
+            (
+                "file:///pkg/src/app.ids",
+                "use User::User\n\nstruct S {\n    u: User\n}\n",
+            ),
         ]);
         let project = Project::new(all.iter());
         let target = project.resolve(0, "User", Namespace::Declaration).unwrap();
@@ -686,7 +816,9 @@ mod tests {
             ("file:///chat.ids", "use types::Message\n\nstruct Message {\n    local: bool\n}\n\nstruct S {\n    m: Message\n}\n"),
         ]);
         let project = Project::new(all.iter());
-        let target = project.resolve(0, "Message", Namespace::Declaration).unwrap();
+        let target = project
+            .resolve(0, "Message", Namespace::Declaration)
+            .unwrap();
 
         let refs = project.references(&target);
         assert_eq!(
@@ -704,7 +836,10 @@ mod tests {
             dependencies = {\n    shared = {\n        path = \"../shared\"\n    }\n}\n\n\
             settings = shared::settings::Strict\n";
         let other = [
-            SourceFile::local(Url::parse("file:///pkg/config.idp").unwrap(), manifest.to_string()),
+            SourceFile::local(
+                Url::parse("file:///pkg/config.idp").unwrap(),
+                manifest.to_string(),
+            ),
             SourceFile::of_dependency(
                 Url::parse("file:///shared/src/policy.ids").unwrap(),
                 "settings Strict {\n    max_depth = 4\n}\n".to_string(),
@@ -714,20 +849,35 @@ mod tests {
         ];
         let project = Project::new(other.iter());
 
-        assert_eq!(project.settings.get("max_depth"), Some(&SettingsValue::Integer(4)));
-        assert!(project.settings_error.is_none(), "{:?}", project.settings_error);
+        assert_eq!(
+            project.settings.get("max_depth"),
+            Some(&SettingsValue::Integer(4))
+        );
+        assert!(
+            project.settings_error.is_none(),
+            "{:?}",
+            project.settings_error
+        );
     }
 
     #[test]
     fn an_unresolvable_cross_package_settings_reference_sets_settings_error() {
         let manifest = "congregation app\nspecification_version = 1\n\n\
             settings = nonexistent::settings::Strict\n";
-        let other = [SourceFile::local(Url::parse("file:///pkg/config.idp").unwrap(), manifest.to_string())];
+        let other = [SourceFile::local(
+            Url::parse("file:///pkg/config.idp").unwrap(),
+            manifest.to_string(),
+        )];
         let project = Project::new(other.iter());
 
         assert!(project.settings.is_empty());
-        let error = project.settings_error.expect("should carry the resolution error");
-        assert!(error.contains("no dependency named `nonexistent`"), "got: {error}");
+        let error = project
+            .settings_error
+            .expect("should carry the resolution error");
+        assert!(
+            error.contains("no dependency named `nonexistent`"),
+            "got: {error}"
+        );
     }
 
     #[test]
@@ -749,10 +899,16 @@ mod tests {
                 "shared",
                 vec!["shared".to_string(), "policy".to_string()],
             ),
-            SourceFile::local(Url::parse("file:///pkg/config.idp").unwrap(), manifest.to_string()),
+            SourceFile::local(
+                Url::parse("file:///pkg/config.idp").unwrap(),
+                manifest.to_string(),
+            ),
         ];
         let project = Project::new(other.iter());
 
-        assert_eq!(project.settings.get("max_depth"), Some(&SettingsValue::Integer(4)));
+        assert_eq!(
+            project.settings.get("max_depth"),
+            Some(&SettingsValue::Integer(4))
+        );
     }
 }

@@ -31,8 +31,9 @@ pub fn find_references_with_project<S: ProjectSource>(
         return vec![];
     };
     let project = Project::with_active(uri, source, other_files);
-    let Some(target) =
-        project.index_of(uri).and_then(|i| project.target_at_cursor(i, source, offset))
+    let Some(target) = project
+        .index_of(uri)
+        .and_then(|i| project.target_at_cursor(i, source, offset))
     else {
         return vec![];
     };
@@ -48,7 +49,7 @@ pub fn find_references_with_project<S: ProjectSource>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_find_references_struct() {
         let source = r#"
@@ -66,15 +67,19 @@ struct Response {
 }
 "#;
         let uri = Url::parse("file:///test.ids").unwrap();
-        
+
         // Find references to "User" (click on declaration)
         let position = Position::new(1, 8);
         let refs = find_references(source, &uri, position, true);
-        
+
         // Should find: declaration + 2 usages
-        assert!(refs.len() >= 2, "Expected at least 2 references (declaration + 1 usage), got {}", refs.len());
+        assert!(
+            refs.len() >= 2,
+            "Expected at least 2 references (declaration + 1 usage), got {}",
+            refs.len()
+        );
     }
-    
+
     #[test]
     fn test_find_references_exclude_declaration() {
         let source = r#"
@@ -87,15 +92,15 @@ struct Request {
 }
 "#;
         let uri = Url::parse("file:///test.ids").unwrap();
-        
+
         // Find references excluding declaration
         let position = Position::new(1, 8);
         let refs = find_references(source, &uri, position, false);
-        
+
         // Should find only usages, not declaration
         assert!(!refs.is_empty(), "Expected at least 1 reference");
     }
-    
+
     #[test]
     fn test_find_references_enum() {
         let source = r#"
@@ -109,13 +114,13 @@ struct Task {
 }
 "#;
         let uri = Url::parse("file:///test.ids").unwrap();
-        
+
         let position = Position::new(1, 6);
         let refs = find_references(source, &uri, position, true);
-        
+
         assert!(!refs.is_empty(), "Should find references to enum");
     }
-    
+
     #[test]
     fn test_find_references_not_defined() {
         let source = r#"
@@ -124,13 +129,16 @@ struct User {
 }
 "#;
         let uri = Url::parse("file:///test.ids").unwrap();
-        
+
         // Click on "string" (primitive - not user-defined)
         let position = Position::new(2, 11);
         let refs = find_references(source, &uri, position, true);
-        
+
         // Should return empty for primitives
-        assert!(refs.is_empty(), "Should not find references for primitive types");
+        assert!(
+            refs.is_empty(),
+            "Should not find references for primitive types"
+        );
     }
 
     #[test]
@@ -139,11 +147,16 @@ struct User {
         let uri = Url::parse("file:///test.ids").unwrap();
 
         let refs = find_references(source, &uri, Position::new(0, 8), true);
-        let mut starts: Vec<_> = refs.iter().map(|l| (l.range.start.line, l.range.start.character)).collect();
+        let mut starts: Vec<_> = refs
+            .iter()
+            .map(|l| (l.range.start.line, l.range.start.character))
+            .collect();
         starts.sort();
 
         assert_eq!(starts, vec![(0, 7), (5, 10), (9, 10)]);
-        assert!(refs.iter().all(|l| l.range.end.character == l.range.start.character + 4));
+        assert!(refs
+            .iter()
+            .all(|l| l.range.end.character == l.range.start.character + 4));
     }
 
     #[test]
@@ -163,6 +176,8 @@ struct User {
         );
 
         assert_eq!(refs.len(), 3, "declaration + `use` line + field: {refs:?}");
-        assert!(refs.iter().any(|l| l.uri == types_uri && l.range.start.line == 0));
+        assert!(refs
+            .iter()
+            .any(|l| l.uri == types_uri && l.range.start.line == 0));
     }
 }

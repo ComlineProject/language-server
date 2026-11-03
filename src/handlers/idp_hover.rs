@@ -15,9 +15,9 @@
 use crate::parser;
 use crate::util::{in_comment_or_string, position_to_offset};
 use comline_core::package::config::idl::grammar::{Assignment, Key, Value};
-use rust_sitter::Spanned;
 use comline_core::settings::catalog;
 use lsp_types::{Hover, HoverContents, MarkedString, Position};
+use rust_sitter::Spanned;
 
 pub fn get_idp_hover_info(source: &str, position: Position) -> Option<Hover> {
     let offset = position_to_offset(source, position)?;
@@ -40,7 +40,11 @@ pub fn get_idp_hover_info(source: &str, position: Position) -> Option<Hover> {
     let mut path = vec!["settings".to_string()];
     let mut current = top;
     while let Value::Dictionary(dict) = &current.value.value {
-        match dict.assignments.iter().find(|a| offset >= a.span.0 && offset < a.span.1) {
+        match dict
+            .assignments
+            .iter()
+            .find(|a| offset >= a.span.0 && offset < a.span.1)
+        {
             Some(child) => {
                 path.push(key_text(&child.value.key));
                 current = child;
@@ -66,14 +70,25 @@ fn language_hover(assignments: &[Spanned<Assignment>], offset: usize) -> Option<
     let key = key_text(&entry.key);
     let (language, version) = key.split_once('#')?;
     let summary = crate::analysis::generation::summary(language, version)?;
-    Some(Hover { contents: HoverContents::Array(vec![MarkedString::from_markdown(summary)]), range: None })
+    Some(Hover {
+        contents: HoverContents::Array(vec![MarkedString::from_markdown(summary)]),
+        range: None,
+    })
 }
 
 /// The assignment in `assignments` the cursor is in - named `key`, if given.
-fn containing<'a>(assignments: &'a [Spanned<Assignment>], offset: usize, key: Option<&str>) -> Option<&'a Assignment> {
+fn containing<'a>(
+    assignments: &'a [Spanned<Assignment>],
+    offset: usize,
+    key: Option<&str>,
+) -> Option<&'a Assignment> {
     assignments
         .iter()
-        .find(|a| offset >= a.span.0 && offset < a.span.1 && key.is_none_or(|k| key_text(&a.value.key) == k))
+        .find(|a| {
+            offset >= a.span.0
+                && offset < a.span.1
+                && key.is_none_or(|k| key_text(&a.value.key) == k)
+        })
         .map(|a| &a.value)
 }
 
@@ -129,10 +144,15 @@ fn entry_hover(path: &[String], value: &Value) -> Hover {
     // at four.
     let segments: Vec<&str> = path.iter().skip(1).map(String::as_str).collect();
     if let Some(m) = catalog::match_path(&segments) {
-        contents.push(MarkedString::from_markdown(catalog::doc_for(&m).description.to_string()));
+        contents.push(MarkedString::from_markdown(
+            catalog::doc_for(&m).description.to_string(),
+        ));
     }
 
-    Hover { contents: HoverContents::Array(contents), range: None }
+    Hover {
+        contents: HoverContents::Array(contents),
+        range: None,
+    }
 }
 
 /// Cursor on `settings` itself or on any intermediate group key (e.g.
@@ -140,15 +160,20 @@ fn entry_hover(path: &[String], value: &Value) -> Hover {
 /// catalog, the same listing `.ids`'s block-level settings hover shows.
 fn group_hover(path: &[String]) -> Hover {
     let signature = path.join(".");
-    let catalog_lines: Vec<String> =
-        catalog::block_summary().iter().map(|f| format!("- `{}` - {}", f.key_pattern, f.summary)).collect();
+    let catalog_lines: Vec<String> = catalog::block_summary()
+        .iter()
+        .map(|f| format!("- `{}` - {}", f.key_pattern, f.summary))
+        .collect();
 
     let contents = vec![
         MarkedString::from_language_code("comline".to_string(), signature),
         MarkedString::from_markdown(format!("**recognized keys**\n{}", catalog_lines.join("\n"))),
     ];
 
-    Hover { contents: HoverContents::Array(contents), range: None }
+    Hover {
+        contents: HoverContents::Array(contents),
+        range: None,
+    }
 }
 
 #[cfg(test)]
@@ -157,9 +182,14 @@ mod tests {
     #[test]
     fn hovering_a_declared_language_shows_what_its_generator_supports() {
         let source = "congregation app\nspecification_version = 1\n\ncode_generation = {\n    languages = {\n        rust#1.85.0 = {}\n    }\n}\n";
-        let hover = get_idp_hover_info(source, Position::new(5, 10)).expect("a hover on `rust#1.85.0`");
-        let HoverContents::Array(parts) = hover.contents else { panic!("an array") };
-        let MarkedString::String(text) = &parts[0] else { panic!("markdown") };
+        let hover =
+            get_idp_hover_info(source, Position::new(5, 10)).expect("a hover on `rust#1.85.0`");
+        let HoverContents::Array(parts) = hover.contents else {
+            panic!("an array")
+        };
+        let MarkedString::String(text) = &parts[0] else {
+            panic!("markdown")
+        };
         assert!(text.contains("**`rust#1.85.0`** supports"), "{text}");
         assert!(text.contains("- unions: "), "{text}");
 
@@ -218,7 +248,10 @@ mod tests {
 
         let hover = get_idp_hover_info(source, position).expect("hover should resolve");
         let text = hover_text(hover);
-        assert!(text.contains("settings.validators.allowed = false"), "got: {text}");
+        assert!(
+            text.contains("settings.validators.allowed = false"),
+            "got: {text}"
+        );
         assert!(text.contains("permitted"), "got: {text}");
     }
 

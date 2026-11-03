@@ -1,8 +1,8 @@
 // Symbol provider for LSP document symbols
 
+use crate::analysis::project::Project;
 use crate::analysis::symbols;
 use crate::parser;
-use crate::analysis::project::Project;
 use lsp_types::{DocumentSymbol, Range, SymbolInformation, SymbolKind, Url};
 
 /// Get document symbols for outline view
@@ -13,15 +13,15 @@ pub fn get_document_symbols(source: &str, uri: &Url) -> Vec<DocumentSymbol> {
         Ok(result) => result,
         Err(_) => return vec![],
     };
-    
+
     let document = match parse_result.document {
         Some(doc) => doc,
         None => return vec![],
     };
-    
+
     // Build symbol table
     let symbol_table = symbols::build_symbol_table(&document, uri, source);
-    
+
     // Convert to LSP DocumentSymbols
     symbol_table
         .all_symbols()
@@ -37,10 +37,10 @@ pub fn get_document_symbols(source: &str, uri: &Url) -> Vec<DocumentSymbol> {
                         SymbolKind::INTERFACE => SymbolKind::METHOD,
                         _ => SymbolKind::PROPERTY,
                     };
-                    
+
                     // Try to find the child's position in source
                     let child_range = find_child_range(source, child_name, &symbol.name);
-                    
+
                     DocumentSymbol {
                         name: child_name.clone(),
                         detail: None,
@@ -53,7 +53,7 @@ pub fn get_document_symbols(source: &str, uri: &Url) -> Vec<DocumentSymbol> {
                     }
                 })
                 .collect();
-            
+
             DocumentSymbol {
                 name: symbol.name.clone(),
                 detail: Some(format_symbol_detail(symbol.kind, &symbol.children)),
@@ -77,15 +77,33 @@ fn format_symbol_detail(kind: SymbolKind, children: &[String]) -> String {
     if children.is_empty() {
         return String::new();
     }
-    
+
     let count = children.len();
     let item_type = match kind {
-        SymbolKind::STRUCT => if count == 1 { "field" } else { "fields" },
-        SymbolKind::INTERFACE => if count == 1 { "function" } else { "functions" },
-        SymbolKind::ENUM => if count == 1 { "variant" } else { "variants" },
+        SymbolKind::STRUCT => {
+            if count == 1 {
+                "field"
+            } else {
+                "fields"
+            }
+        }
+        SymbolKind::INTERFACE => {
+            if count == 1 {
+                "function"
+            } else {
+                "functions"
+            }
+        }
+        SymbolKind::ENUM => {
+            if count == 1 {
+                "variant"
+            } else {
+                "variants"
+            }
+        }
         _ => "items",
     };
-    
+
     format!("{} {}", count, item_type)
 }
 
@@ -98,7 +116,7 @@ fn find_child_range(source: &str, child_name: &str, parent_name: &str) -> Range 
             return byte_offset_to_range(source, pos, child_name.len());
         }
     }
-    
+
     // Fallback
     Range::default()
 }
@@ -106,11 +124,11 @@ fn find_child_range(source: &str, child_name: &str, parent_name: &str) -> Range 
 /// Convert byte offset to LSP Range
 fn byte_offset_to_range(source: &str, offset: usize, length: usize) -> Range {
     use lsp_types::Position;
-    
+
     let line_starts: Vec<usize> = std::iter::once(0)
         .chain(source.match_indices('\n').map(|(i, _)| i + 1))
         .collect();
-    
+
     let line = line_starts
         .iter()
         .position(|&start| start > offset)
@@ -118,10 +136,10 @@ fn byte_offset_to_range(source: &str, offset: usize, length: usize) -> Range {
         - 1;
     let line_start = line_starts[line];
     let column = source[line_start..offset].chars().count();
-    
+
     let start = Position::new(line as u32, column as u32);
     let end = Position::new(line as u32, (column + length) as u32);
-    
+
     Range { start, end }
 }
 
@@ -157,13 +175,16 @@ pub fn get_workspace_symbols(files: &[(Url, String)], query: &str) -> Vec<Symbol
 /// Whether `query`'s characters all appear in `name`, in order, ignoring case.
 fn fuzzy_matches(name: &str, query: &str) -> bool {
     let mut name = name.chars().flat_map(char::to_lowercase);
-    query.chars().flat_map(char::to_lowercase).all(|q| name.any(|c| c == q))
+    query
+        .chars()
+        .flat_map(char::to_lowercase)
+        .all(|q| name.any(|c| c == q))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn same_named_units_each_get_their_own_outline_entry() {
         // The symbol table kept one entry per name, so these two collapsed
@@ -197,21 +218,21 @@ enum Role {
 "#;
         let uri = Url::parse("file:///test.ids").unwrap();
         let symbols = get_document_symbols(source, &uri);
-        
+
         assert_eq!(symbols.len(), 2);
-        
+
         // Check struct
         assert_eq!(symbols[0].name, "User");
         assert_eq!(symbols[0].kind, SymbolKind::STRUCT);
         assert_eq!(symbols[0].detail, Some("2 fields".to_string()));
         assert!(symbols[0].children.is_some());
         assert_eq!(symbols[0].children.as_ref().unwrap().len(), 2);
-        
+
         // Check enum
         assert_eq!(symbols[1].name, "Role");
         assert_eq!(symbols[1].kind, SymbolKind::ENUM);
     }
-    
+
     #[test]
     fn test_document_symbols_with_protocol() {
         let source = r#"
@@ -222,12 +243,12 @@ protocol UserService {
 "#;
         let uri = Url::parse("file:///test.ids").unwrap();
         let symbols = get_document_symbols(source, &uri);
-        
+
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "UserService");
         assert_eq!(symbols[0].kind, SymbolKind::INTERFACE);
         assert_eq!(symbols[0].detail, Some("2 functions".to_string()));
-        
+
         let children = symbols[0].children.as_ref().unwrap();
         assert_eq!(children.len(), 2);
         assert_eq!(children[0].kind, SymbolKind::METHOD);
@@ -236,14 +257,26 @@ protocol UserService {
     #[test]
     fn workspace_symbols_search_every_file_fuzzily() {
         let files = vec![
-            (Url::parse("file:///pkg/src/types.ids").unwrap(), "struct UserRecord {\n    x: bool\n}\n\nenum Role {\n    A\n}\n".to_string()),
-            (Url::parse("file:///pkg/src/chat/admin.ids").unwrap(), "protocol UserService {\n    function f();\n}\n".to_string()),
+            (
+                Url::parse("file:///pkg/src/types.ids").unwrap(),
+                "struct UserRecord {\n    x: bool\n}\n\nenum Role {\n    A\n}\n".to_string(),
+            ),
+            (
+                Url::parse("file:///pkg/src/chat/admin.ids").unwrap(),
+                "protocol UserService {\n    function f();\n}\n".to_string(),
+            ),
         ];
 
         let found = get_workspace_symbols(&files, "usr");
-        let mut names: Vec<_> = found.iter().map(|s| (s.name.as_str(), s.container_name.as_deref().unwrap())).collect();
+        let mut names: Vec<_> = found
+            .iter()
+            .map(|s| (s.name.as_str(), s.container_name.as_deref().unwrap()))
+            .collect();
         names.sort();
-        assert_eq!(names, vec![("UserRecord", "types"), ("UserService", "chat::admin")]);
+        assert_eq!(
+            names,
+            vec![("UserRecord", "types"), ("UserService", "chat::admin")]
+        );
 
         assert_eq!(get_workspace_symbols(&files, "").len(), 3);
         assert!(get_workspace_symbols(&files, "zzz").is_empty());
@@ -258,7 +291,8 @@ protocol UserService {
         let uri = Url::parse("file:///test.ids").unwrap();
         let symbols = get_document_symbols(source, &uri);
 
-        let names: Vec<(&str, SymbolKind)> = symbols.iter().map(|s| (s.name.as_str(), s.kind)).collect();
+        let names: Vec<(&str, SymbolKind)> =
+            symbols.iter().map(|s| (s.name.as_str(), s.kind)).collect();
         assert_eq!(
             names,
             vec![

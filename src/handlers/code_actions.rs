@@ -19,7 +19,11 @@ use serde_json::json;
 use std::collections::HashMap;
 
 /// Get code actions for a given range, considering only this file.
-pub fn get_code_actions(source: &str, uri: &Url, params: &CodeActionParams) -> Vec<CodeActionOrCommand> {
+pub fn get_code_actions(
+    source: &str,
+    uri: &Url,
+    params: &CodeActionParams,
+) -> Vec<CodeActionOrCommand> {
     get_code_actions_with_project::<(Url, String)>(source, uri, params, &[])
 }
 
@@ -43,7 +47,9 @@ pub fn get_code_actions_with_project<S: ProjectSource>(
     let check = import_check::check(&project, doc);
 
     for unresolved in &check.unresolved {
-        let Some(suggestion) = &unresolved.suggestion else { continue };
+        let Some(suggestion) = &unresolved.suggestion else {
+            continue;
+        };
         let range = byte_range_to_lsp_range(source, unresolved.range.0, unresolved.range.1);
         if !overlaps(range, params.range) {
             continue;
@@ -54,7 +60,13 @@ pub fn get_code_actions_with_project<S: ProjectSource>(
             kind: Some(CodeActionKind::QUICKFIX),
             diagnostics: matching_diagnostics(params, range, UNRESOLVED_IMPORT),
             edit: Some(WorkspaceEdit {
-                changes: Some(HashMap::from([(uri.clone(), vec![TextEdit { range, new_text: suggestion.clone() }])])),
+                changes: Some(HashMap::from([(
+                    uri.clone(),
+                    vec![TextEdit {
+                        range,
+                        new_text: suggestion.clone(),
+                    }],
+                )])),
                 document_changes: None,
                 change_annotations: None,
             }),
@@ -90,12 +102,21 @@ pub fn get_code_actions_with_project<S: ProjectSource>(
         }
     }
 
-    actions.extend(duplicate_name_actions(source, uri, params, &project, doc, other_files));
+    actions.extend(duplicate_name_actions(
+        source,
+        uri,
+        params,
+        &project,
+        doc,
+        other_files,
+    ));
     actions.extend(f_string_actions(source, uri, params));
 
     // Several uses of the same name in range: one fix per candidate is enough.
     actions.dedup_by(|a, b| match (a, b) {
-        (CodeActionOrCommand::CodeAction(a), CodeActionOrCommand::CodeAction(b)) => a.title == b.title,
+        (CodeActionOrCommand::CodeAction(a), CodeActionOrCommand::CodeAction(b)) => {
+            a.title == b.title
+        }
         _ => false,
     });
     actions
@@ -127,7 +148,9 @@ fn duplicate_name_actions<S: ProjectSource>(
 
     for group in symbols.duplicate_groups() {
         for index in group {
-            let Some(symbol) = symbols.by_index(index) else { continue };
+            let Some(symbol) = symbols.by_index(index) else {
+                continue;
+            };
             let range = byte_range_to_lsp_range(source, symbol.name_span.0, symbol.name_span.1);
             if !overlaps(range, params.range) {
                 continue;
@@ -234,14 +257,22 @@ fn free_name(project: &Project, symbol: &Symbol) -> String {
     let suffix = keyword_of(symbol.kind);
     let mut capitalized = suffix.chars();
     let base = match capitalized.next() {
-        Some(first) => format!("{}{}{}", symbol.name, first.to_uppercase(), capitalized.as_str()),
+        Some(first) => format!(
+            "{}{}{}",
+            symbol.name,
+            first.to_uppercase(),
+            capitalized.as_str()
+        ),
         None => symbol.name.clone(),
     };
 
     if !taken(&base) {
         return base;
     }
-    (2..).map(|n| format!("{base}{n}")).find(|c| !taken(c)).expect("the range is unbounded")
+    (2..)
+        .map(|n| format!("{base}{n}"))
+        .find(|c| !taken(c))
+        .expect("the range is unbounded")
 }
 
 /// The text a "delete this declaration" fix removes: the declaration, the
@@ -250,10 +281,16 @@ fn free_name(project: &Project, symbol: &Symbol) -> String {
 /// line between the survivors, not three.
 fn delete_range(source: &str, span: (usize, usize)) -> (usize, usize) {
     let line_start = source[..span.0].rfind('\n').map_or(0, |i| i + 1);
-    let start = if source[line_start..span.0].trim().is_empty() { line_start } else { span.0 };
+    let start = if source[line_start..span.0].trim().is_empty() {
+        line_start
+    } else {
+        span.0
+    };
 
     let mut end = span.1;
-    end += source[end..].find('\n').map_or(source.len() - end, |i| i + 1);
+    end += source[end..]
+        .find('\n')
+        .map_or(source.len() - end, |i| i + 1);
     // One following blank line, if there is one.
     let after = &source[end..];
     if let Some(newline) = after.find('\n') {
@@ -267,7 +304,11 @@ fn delete_range(source: &str, span: (usize, usize)) -> (usize, usize) {
 /// "Make it an f-string" for a message with `{...}` that won't interpolate,
 /// since only `f"..."` does. The diagnostic's range is the message itself,
 /// so the fix is an `f` at its opening quote.
-fn f_string_actions(source: &str, uri: &Url, params: &CodeActionParams) -> Vec<CodeActionOrCommand> {
+fn f_string_actions(
+    source: &str,
+    uri: &Url,
+    params: &CodeActionParams,
+) -> Vec<CodeActionOrCommand> {
     let code = Some(NumberOrString::String(MESSAGE_NOT_INTERPOLATED.to_string()));
     params
         .context
@@ -275,7 +316,8 @@ fn f_string_actions(source: &str, uri: &Url, params: &CodeActionParams) -> Vec<C
         .iter()
         .filter(|d| d.code == code && overlaps(d.range, params.range))
         .filter(|d| {
-            position_to_offset(source, d.range.start).is_some_and(|at| source[at..].starts_with('"'))
+            position_to_offset(source, d.range.start)
+                .is_some_and(|at| source[at..].starts_with('"'))
         })
         .map(|d| {
             CodeActionOrCommand::CodeAction(CodeAction {
@@ -285,7 +327,10 @@ fn f_string_actions(source: &str, uri: &Url, params: &CodeActionParams) -> Vec<C
                 edit: Some(WorkspaceEdit {
                     changes: Some(HashMap::from([(
                         uri.clone(),
-                        vec![TextEdit { range: Range::new(d.range.start, d.range.start), new_text: "f".into() }],
+                        vec![TextEdit {
+                            range: Range::new(d.range.start, d.range.start),
+                            new_text: "f".into(),
+                        }],
                     )])),
                     document_changes: None,
                     change_annotations: None,
@@ -299,7 +344,11 @@ fn f_string_actions(source: &str, uri: &Url, params: &CodeActionParams) -> Vec<C
 
 /// The client's own copies of the diagnostic (with `code`, at `range`) a fix
 /// answers to, so it can show the fix alongside it.
-fn matching_diagnostics(params: &CodeActionParams, range: Range, code: &str) -> Option<Vec<Diagnostic>> {
+fn matching_diagnostics(
+    params: &CodeActionParams,
+    range: Range,
+    code: &str,
+) -> Option<Vec<Diagnostic>> {
     let found: Vec<Diagnostic> = params
         .context
         .diagnostics
@@ -324,7 +373,11 @@ mod tests {
         CodeActionParams {
             text_document: TextDocumentIdentifier { uri: uri.clone() },
             range,
-            context: CodeActionContext { diagnostics: vec![], only: None, trigger_kind: None },
+            context: CodeActionContext {
+                diagnostics: vec![],
+                only: None,
+                trigger_kind: None,
+            },
             work_done_progress_params: Default::default(),
             partial_result_params: Default::default(),
         }
@@ -335,7 +388,15 @@ mod tests {
             .into_iter()
             .map(|a| match a {
                 CodeActionOrCommand::CodeAction(a) => {
-                    let edit = a.edit.unwrap().changes.unwrap().into_values().next().unwrap().remove(0);
+                    let edit = a
+                        .edit
+                        .unwrap()
+                        .changes
+                        .unwrap()
+                        .into_values()
+                        .next()
+                        .unwrap()
+                        .remove(0);
                     (a.title, edit.new_text, edit.range.start.line)
                 }
                 other => panic!("expected a code action, got {other:?}"),
@@ -354,13 +415,21 @@ mod tests {
     fn a_missing_import_gets_an_add_use_fix() {
         let chat = "use other::Thing\n\nstruct S {\n    m: Message\n}\n";
         let chat_uri = Url::parse("file:///pkg/src/chat.ids").unwrap();
-        let others = [(Url::parse("file:///pkg/src/types.ids").unwrap(), "struct Message {\n    t: string\n}\n".to_string())];
+        let others = [(
+            Url::parse("file:///pkg/src/types.ids").unwrap(),
+            "struct Message {\n    t: string\n}\n".to_string(),
+        )];
 
         let cursor = Range::new(Position::new(3, 9), Position::new(3, 9));
-        let actions = get_code_actions_with_project(chat, &chat_uri, &params(&chat_uri, cursor), &others);
+        let actions =
+            get_code_actions_with_project(chat, &chat_uri, &params(&chat_uri, cursor), &others);
         assert_eq!(
             titles_and_edits(actions),
-            vec![("Add `use types::Message`".to_string(), "use types::Message\n".to_string(), 1)]
+            vec![(
+                "Add `use types::Message`".to_string(),
+                "use types::Message\n".to_string(),
+                1
+            )]
         );
     }
 
@@ -368,11 +437,17 @@ mod tests {
     fn a_missing_validator_import_gets_an_add_use_fix() {
         let api = "@validators = [StringBounds()]\ntype FixedNum = string\n";
         let api_uri = Url::parse("file:///pkg/src/api.ids").unwrap();
-        let mut files = vec![crate::analysis::source::SourceFile::local(api_uri.clone(), api.to_string())];
-        files.extend(crate::analysis::stdlib::files(&crate::analysis::stdlib::root()));
+        let mut files = vec![crate::analysis::source::SourceFile::local(
+            api_uri.clone(),
+            api.to_string(),
+        )];
+        files.extend(crate::analysis::stdlib::files(
+            &crate::analysis::stdlib::root(),
+        ));
 
         let cursor = Range::new(Position::new(0, 18), Position::new(0, 18));
-        let actions = get_code_actions_with_project(api, &api_uri, &params(&api_uri, cursor), &files);
+        let actions =
+            get_code_actions_with_project(api, &api_uri, &params(&api_uri, cursor), &files);
         assert_eq!(
             titles_and_edits(actions),
             vec![(
@@ -387,15 +462,24 @@ mod tests {
     fn a_bare_validator_name_gets_the_same_fix() {
         let api = "@validators = [StringBounds]\ntype FixedNum = string\n";
         let api_uri = Url::parse("file:///pkg/src/api.ids").unwrap();
-        let mut files = vec![crate::analysis::source::SourceFile::local(api_uri.clone(), api.to_string())];
-        files.extend(crate::analysis::stdlib::files(&crate::analysis::stdlib::root()));
+        let mut files = vec![crate::analysis::source::SourceFile::local(
+            api_uri.clone(),
+            api.to_string(),
+        )];
+        files.extend(crate::analysis::stdlib::files(
+            &crate::analysis::stdlib::root(),
+        ));
 
         let cursor = Range::new(Position::new(0, 18), Position::new(0, 18));
-        let titles: Vec<String> =
-            titles_and_edits(get_code_actions_with_project(api, &api_uri, &params(&api_uri, cursor), &files))
-                .into_iter()
-                .map(|(t, _, _)| t)
-                .collect();
+        let titles: Vec<String> = titles_and_edits(get_code_actions_with_project(
+            api,
+            &api_uri,
+            &params(&api_uri, cursor),
+            &files,
+        ))
+        .into_iter()
+        .map(|(t, _, _)| t)
+        .collect();
         assert_eq!(titles, ["Add `use std::validators::StringBounds`"]);
     }
 
@@ -403,10 +487,19 @@ mod tests {
     fn no_fix_away_from_the_missing_name() {
         let chat = "struct S {\n    m: Message\n    n: bool\n}\n";
         let chat_uri = Url::parse("file:///pkg/src/chat.ids").unwrap();
-        let others = [(Url::parse("file:///pkg/src/types.ids").unwrap(), "struct Message {\n    t: string\n}\n".to_string())];
+        let others = [(
+            Url::parse("file:///pkg/src/types.ids").unwrap(),
+            "struct Message {\n    t: string\n}\n".to_string(),
+        )];
 
         let elsewhere = Range::new(Position::new(2, 4), Position::new(2, 5));
-        assert!(get_code_actions_with_project(chat, &chat_uri, &params(&chat_uri, elsewhere), &others).is_empty());
+        assert!(get_code_actions_with_project(
+            chat,
+            &chat_uri,
+            &params(&chat_uri, elsewhere),
+            &others
+        )
+        .is_empty());
     }
 
     #[test]
@@ -414,17 +507,30 @@ mod tests {
         let chat = "struct S {\n    m: Message\n}\n";
         let chat_uri = Url::parse("file:///pkg/src/chat.ids").unwrap();
         let others = [
-            (Url::parse("file:///pkg/src/types.ids").unwrap(), "struct Message {\n    t: string\n}\n".to_string()),
-            (Url::parse("file:///pkg/src/legacy.ids").unwrap(), "struct Message {\n    o: bool\n}\n".to_string()),
+            (
+                Url::parse("file:///pkg/src/types.ids").unwrap(),
+                "struct Message {\n    t: string\n}\n".to_string(),
+            ),
+            (
+                Url::parse("file:///pkg/src/legacy.ids").unwrap(),
+                "struct Message {\n    o: bool\n}\n".to_string(),
+            ),
         ];
 
         let cursor = Range::new(Position::new(1, 8), Position::new(1, 8));
-        let titles: Vec<String> =
-            titles_and_edits(get_code_actions_with_project(chat, &chat_uri, &params(&chat_uri, cursor), &others))
-                .into_iter()
-                .map(|(t, _, _)| t)
-                .collect();
-        assert_eq!(titles, vec!["Add `use types::Message`", "Add `use legacy::Message`"]);
+        let titles: Vec<String> = titles_and_edits(get_code_actions_with_project(
+            chat,
+            &chat_uri,
+            &params(&chat_uri, cursor),
+            &others,
+        ))
+        .into_iter()
+        .map(|(t, _, _)| t)
+        .collect();
+        assert_eq!(
+            titles,
+            vec!["Add `use types::Message`", "Add `use legacy::Message`"]
+        );
     }
 
     fn package_with_dependency(active_uri: &str) -> Vec<crate::analysis::source::SourceFile> {
@@ -452,8 +558,16 @@ mod tests {
         let others = package_with_dependency("file:///pkg/src/chat.ids");
 
         let cursor = Range::new(Position::new(0, 6), Position::new(0, 6));
-        let actions = get_code_actions_with_project(chat, &chat_uri, &params(&chat_uri, cursor), &others);
-        assert_eq!(titles_and_edits(actions), vec![("Change `typse` to `types`".to_string(), "types".to_string(), 0)]);
+        let actions =
+            get_code_actions_with_project(chat, &chat_uri, &params(&chat_uri, cursor), &others);
+        assert_eq!(
+            titles_and_edits(actions),
+            vec![(
+                "Change `typse` to `types`".to_string(),
+                "types".to_string(),
+                0
+            )]
+        );
     }
 }
 
@@ -473,8 +587,15 @@ mod duplicate_name_tests {
     fn at(line: u32, character: u32) -> CodeActionParams {
         CodeActionParams {
             text_document: TextDocumentIdentifier { uri: uri() },
-            range: Range::new(Position::new(line, character), Position::new(line, character)),
-            context: CodeActionContext { diagnostics: vec![], only: None, trigger_kind: None },
+            range: Range::new(
+                Position::new(line, character),
+                Position::new(line, character),
+            ),
+            context: CodeActionContext {
+                diagnostics: vec![],
+                only: None,
+                trigger_kind: None,
+            },
             work_done_progress_params: Default::default(),
             partial_result_params: Default::default(),
         }
@@ -543,7 +664,10 @@ mod duplicate_name_tests {
 
     #[test]
     fn nothing_away_from_either_name() {
-        assert!(titles(THREE_TESTS, &at(1, 6)).is_empty(), "inside the struct body");
+        assert!(
+            titles(THREE_TESTS, &at(1, 6)).is_empty(),
+            "inside the struct body"
+        );
     }
 
     /// The applied rename is the real project-wide one, not a local edit:
@@ -570,7 +694,11 @@ mod duplicate_name_tests {
 
         let changes = action.edit.unwrap().changes.unwrap();
         let other = Url::parse("file:///pkg/src/other.ids").unwrap();
-        assert_eq!(changes[&other].len(), 2, "the `use` line and the field type");
+        assert_eq!(
+            changes[&other].len(),
+            2,
+            "the `use` line and the field type"
+        );
         assert!(changes[&other].iter().all(|e| e.new_text == "TestStruct"));
     }
 
@@ -581,7 +709,9 @@ mod duplicate_name_tests {
         let source = "struct Test {\n    a: string\n}\n\n\
                       error Test {\n    message = \"\"\n}\n\n\
                       struct TestError {\n    b: string\n}\n";
-        assert!(titles(source, &at(4, 7)).contains(&"Rename error `Test` to `TestError2`".to_string()));
+        assert!(
+            titles(source, &at(4, 7)).contains(&"Rename error `Test` to `TestError2`".to_string())
+        );
     }
 
     /// The interactive one carries no edit - just the client's rename box,
@@ -602,7 +732,15 @@ mod duplicate_name_tests {
     #[test]
     fn delete_removes_the_declaration_and_tidies_up() {
         let action = only(THREE_TESTS, &at(4, 7), "Delete");
-        let edit = action.edit.unwrap().changes.unwrap().into_values().next().unwrap().remove(0);
+        let edit = action
+            .edit
+            .unwrap()
+            .changes
+            .unwrap()
+            .into_values()
+            .next()
+            .unwrap()
+            .remove(0);
         assert_eq!(edit.new_text, "");
 
         let start = crate::util::position_to_offset(THREE_TESTS, edit.range.start).unwrap();
@@ -625,7 +763,15 @@ mod duplicate_name_tests {
         let source = "/// The first one.\nerror Test {\n    message = \"a\"\n}\n\n\
                       error Test {\n    message = \"b\"\n}\n";
         let action = only(source, &at(1, 7), "Delete");
-        let edit = action.edit.unwrap().changes.unwrap().into_values().next().unwrap().remove(0);
+        let edit = action
+            .edit
+            .unwrap()
+            .changes
+            .unwrap()
+            .into_values()
+            .next()
+            .unwrap()
+            .remove(0);
 
         let start = crate::util::position_to_offset(source, edit.range.start).unwrap();
         let end = crate::util::position_to_offset(source, edit.range.end).unwrap();
@@ -661,7 +807,10 @@ mod duplicate_name_tests {
         let fix = only(source, &at, "f-string");
         assert_eq!(fix.is_preferred, Some(true));
         let edit = &fix.edit.unwrap().changes.unwrap()[&uri()][0];
-        assert_eq!((edit.new_text.as_str(), edit.range.start, edit.range.end), ("f", Position::new(2, 33), Position::new(2, 33)));
+        assert_eq!(
+            (edit.new_text.as_str(), edit.range.start, edit.range.end),
+            ("f", Position::new(2, 33), Position::new(2, 33))
+        );
 
         at.range = Range::new(Position::new(0, 0), Position::new(0, 0));
         assert!(titles(source, &at).iter().all(|t| !t.contains("f-string")));

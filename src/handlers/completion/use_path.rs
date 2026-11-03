@@ -11,8 +11,8 @@
 
 use comline_core::schema::idl::vocabulary::{self, KeywordKind};
 use lsp_types::{
-    Command, CompletionItem, CompletionItemKind, CompletionTextEdit, Documentation, InsertTextFormat, MarkupContent,
-    MarkupKind, Range, TextEdit, Url,
+    Command, CompletionItem, CompletionItemKind, CompletionTextEdit, Documentation,
+    InsertTextFormat, MarkupContent, MarkupKind, Range, TextEdit, Url,
 };
 
 use crate::analysis::modules::{self, ChildModule, DeclKind, Declared};
@@ -68,7 +68,8 @@ fn statement_before(source: &str, offset: usize) -> Option<(String, bool)> {
         if let Some(legacy) = keyword(line) {
             let statement = lines.iter().rev().copied().collect::<Vec<_>>().join("\n");
             let open_list = statement.contains('{') && !statement.contains('}');
-            return (lines.len() == 1 || open_list).then(|| (statement.trim_start().to_string(), legacy));
+            return (lines.len() == 1 || open_list)
+                .then(|| (statement.trim_start().to_string(), legacy));
         }
         if start == 0 || !is_list_line(line) {
             return None;
@@ -86,7 +87,10 @@ fn parse_statement(statement: &str, legacy: bool, offset: usize) -> UseContext {
 
     if let Some(brace) = body.find('{') {
         let inside = &body[brace + 1..];
-        let base = body[..brace].trim_end().strip_suffix("::").and_then(segments_of);
+        let base = body[..brace]
+            .trim_end()
+            .strip_suffix("::")
+            .and_then(segments_of);
         // `import` takes no list; a closed list is a finished path.
         let Some(segments) = base.filter(|_| !legacy && !inside.contains('}')) else {
             return UseContext::Nothing;
@@ -96,9 +100,19 @@ fn parse_statement(statement: &str, legacy: bool, offset: usize) -> UseContext {
         if !is_partial_identifier(partial) {
             return UseContext::Nothing;
         }
-        let listed = items.into_iter().map(str::trim).filter(|i| !i.is_empty()).map(String::from).collect();
+        let listed = items
+            .into_iter()
+            .map(str::trim)
+            .filter(|i| !i.is_empty())
+            .map(String::from)
+            .collect();
         let partial_start = offset - partial.len();
-        return UseContext::Path(UsePrefix { legacy, segments, listed: Some(listed), partial_start });
+        return UseContext::Path(UsePrefix {
+            legacy,
+            segments,
+            listed: Some(listed),
+            partial_start,
+        });
     }
 
     // Whitespace ends the path: what follows is `as`, or nothing.
@@ -106,25 +120,37 @@ fn parse_statement(statement: &str, legacy: bool, offset: usize) -> UseContext {
         return UseContext::Nothing;
     }
     let (finished, partial) = body.rsplit_once("::").unwrap_or(("", body));
-    let segments = if finished.is_empty() { Some(vec![]) } else { segments_of(finished) };
+    let segments = if finished.is_empty() {
+        Some(vec![])
+    } else {
+        segments_of(finished)
+    };
     match segments {
-        Some(segments) if is_partial_identifier(partial) => {
-            UseContext::Path(UsePrefix { legacy, segments, listed: None, partial_start: offset - partial.len() })
-        }
+        Some(segments) if is_partial_identifier(partial) => UseContext::Path(UsePrefix {
+            legacy,
+            segments,
+            listed: None,
+            partial_start: offset - partial.len(),
+        }),
         _ => UseContext::Nothing,
     }
 }
 
 /// `Some(legacy)` when `line` starts with `use` or `import` and a space.
 fn keyword(line: &str) -> Option<bool> {
-    [("use", false), ("import", true)].into_iter().find_map(|(word, legacy)| {
-        line.strip_prefix(word).filter(|rest| rest.starts_with(char::is_whitespace)).map(|_| legacy)
-    })
+    [("use", false), ("import", true)]
+        .into_iter()
+        .find_map(|(word, legacy)| {
+            line.strip_prefix(word)
+                .filter(|rest| rest.starts_with(char::is_whitespace))
+                .map(|_| legacy)
+        })
 }
 
 /// A line that can sit inside a `{ ... }` list: names, commas, blanks.
 fn is_list_line(line: &str) -> bool {
-    line.chars().all(|c| c.is_alphanumeric() || c == '_' || c == ',' || c.is_whitespace())
+    line.chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == ',' || c.is_whitespace())
 }
 
 /// `line` without its `//` comment. A `use` statement has no strings, so a
@@ -134,7 +160,9 @@ fn cut_comment(line: &str) -> &str {
 }
 
 fn segments_of(path: &str) -> Option<Vec<String>> {
-    path.split("::").map(|s| is_identifier(s).then(|| s.to_string())).collect()
+    path.split("::")
+        .map(|s| is_identifier(s).then(|| s.to_string()))
+        .collect()
 }
 
 fn is_identifier(s: &str) -> bool {
@@ -166,7 +194,10 @@ pub(super) fn completions<S: ProjectSource>(
         return vec![]; // `parent::` above the top
     };
     // A relative path stays inside the package.
-    let schema = project.docs.iter().find(|d| d.namespace == base && (!relative || d.dependency.is_none()));
+    let schema = project
+        .docs
+        .iter()
+        .find(|d| d.namespace == base && (!relative || d.dependency.is_none()));
     let declared = || schema.map(modules::declarations).unwrap_or_default();
 
     if let Some(listed) = &prefix.listed {
@@ -180,8 +211,10 @@ pub(super) fn completions<S: ProjectSource>(
             .collect();
     }
 
-    let mut items: Vec<CompletionItem> =
-        modules::children(&project, &base, relative).iter().map(|child| child_item(child, range)).collect();
+    let mut items: Vec<CompletionItem> = modules::children(&project, &base, relative)
+        .iter()
+        .map(|child| child_item(child, range))
+        .collect();
     if schema.is_some() {
         items.extend(declared().iter().map(|d| declared_item(d, range)));
         if !prefix.legacy {
@@ -203,26 +236,55 @@ fn path_starts(project: &Project, legacy: bool, range: Range) -> Vec<CompletionI
         if items.iter().any(|item| item.label == dependency.name) {
             continue;
         }
-        let indexed = project.docs.iter().any(|d| d.dependency == Some(dependency.name.as_str()));
+        let indexed = project
+            .docs
+            .iter()
+            .any(|d| d.dependency == Some(dependency.name.as_str()));
         let detail = match (&dependency.kind, indexed) {
             (DependencyKind::Path(path), true) => format!("dependency, path `{path}`"),
-            (DependencyKind::Path(path), false) => format!("dependency, path `{path}` — no schemas there"),
+            (DependencyKind::Path(path), false) => {
+                format!("dependency, path `{path}` — no schemas there")
+            }
             (DependencyKind::Git, true) => "dependency, git".to_string(),
             (DependencyKind::Git, false) => "dependency, git — not fetched yet".to_string(),
             (DependencyKind::Registry, _) => "dependency, registry — not supported yet".to_string(),
         };
-        let mut item = segment_item(&dependency.name, detail, CompletionItemKind::MODULE, true, range);
-        item.documentation = project.package_docs.get(&dependency.name).map(|docs| markdown(docs));
+        let mut item = segment_item(
+            &dependency.name,
+            detail,
+            CompletionItemKind::MODULE,
+            true,
+            range,
+        );
+        item.documentation = project
+            .package_docs
+            .get(&dependency.name)
+            .map(|docs| markdown(docs));
         items.push(sorted(item, '1'));
     }
 
     if !legacy {
         for prefix in vocabulary::keywords_of_kind(KeywordKind::PathPrefix) {
-            let item = segment_item(prefix.text, prefix.description.to_string(), CompletionItemKind::KEYWORD, true, range);
+            let item = segment_item(
+                prefix.text,
+                prefix.description.to_string(),
+                CompletionItemKind::KEYWORD,
+                true,
+                range,
+            );
             items.push(sorted(item, '2'));
         }
-        let mut std = segment_item(stdlib::NAME, "the standard library".to_string(), CompletionItemKind::MODULE, true, range);
-        std.documentation = project.package_docs.get(stdlib::NAME).map(|docs| markdown(docs));
+        let mut std = segment_item(
+            stdlib::NAME,
+            "the standard library".to_string(),
+            CompletionItemKind::MODULE,
+            true,
+            range,
+        );
+        std.documentation = project
+            .package_docs
+            .get(stdlib::NAME)
+            .map(|docs| markdown(docs));
         items.push(sorted(std, '3'));
     }
     items
@@ -239,7 +301,13 @@ fn child_item(child: &ChildModule, range: Range) -> CompletionItem {
     if let Some(dependency) = &child.dependency {
         detail.push_str(&format!(" ({})", stdlib::owner(dependency)));
     }
-    let mut item = segment_item(name, detail, CompletionItemKind::MODULE, !child.schema, range);
+    let mut item = segment_item(
+        name,
+        detail,
+        CompletionItemKind::MODULE,
+        !child.schema,
+        range,
+    );
     item.documentation = child.docs.as_deref().map(markdown);
     item
 }
@@ -256,13 +324,22 @@ fn declared_item(declared: &Declared, range: Range) -> CompletionItem {
         DeclKind::Validator => CompletionItemKind::FUNCTION,
         DeclKind::Settings => CompletionItemKind::PROPERTY,
     };
-    let mut item = segment_item(&declared.name, declared.kind.keyword().to_string(), kind, false, range);
+    let mut item = segment_item(
+        &declared.name,
+        declared.kind.keyword().to_string(),
+        kind,
+        false,
+        range,
+    );
     item.documentation = declared.docs.as_deref().map(markdown);
     item
 }
 
 fn markdown(docs: &str) -> Documentation {
-    Documentation::MarkupContent(MarkupContent { kind: MarkupKind::Markdown, value: docs.to_string() })
+    Documentation::MarkupContent(MarkupContent {
+        kind: MarkupKind::Markdown,
+        value: docs.to_string(),
+    })
 }
 
 /// `*` and `{…}` after a schema's path.
@@ -293,7 +370,13 @@ fn glob_and_list(base: &[String], range: Range) -> [CompletionItem; 2] {
 
 /// A path segment or a declaration's name. `continues`: the path must go on,
 /// so `::` is inserted too and the next suggestions shown right away.
-fn segment_item(label: &str, detail: String, kind: CompletionItemKind, continues: bool, range: Range) -> CompletionItem {
+fn segment_item(
+    label: &str,
+    detail: String,
+    kind: CompletionItemKind,
+    continues: bool,
+    range: Range,
+) -> CompletionItem {
     let new_text = match continues {
         true => format!("{label}::"),
         false => label.to_string(),
@@ -315,11 +398,18 @@ fn sorted(mut item: CompletionItem, group: char) -> CompletionItem {
 
 /// Replaces the segment being typed, whatever the client counts as a word.
 fn edit(range: Range, new_text: &str) -> CompletionTextEdit {
-    CompletionTextEdit::Edit(TextEdit { range, new_text: new_text.to_string() })
+    CompletionTextEdit::Edit(TextEdit {
+        range,
+        new_text: new_text.to_string(),
+    })
 }
 
 pub(super) fn trigger_suggest() -> Command {
-    Command { title: "Suggest".to_string(), command: "editor.action.triggerSuggest".to_string(), arguments: None }
+    Command {
+        title: "Suggest".to_string(),
+        command: "editor.action.triggerSuggest".to_string(),
+        arguments: None,
+    }
 }
 
 #[cfg(test)]
@@ -329,7 +419,11 @@ mod tests {
     use crate::handlers::completion::get_completions_with_project;
     use crate::util::offset_to_position;
 
-    fn path(segments: &[&str], listed: Option<&[&str]>, partial_start: usize) -> Option<UseContext> {
+    fn path(
+        segments: &[&str],
+        listed: Option<&[&str]>,
+        partial_start: usize,
+    ) -> Option<UseContext> {
         Some(UseContext::Path(UsePrefix {
             legacy: false,
             segments: segments.iter().map(|s| s.to_string()).collect(),
@@ -347,21 +441,41 @@ mod tests {
         assert_eq!(at_end("use "), path(&[], None, 4));
         assert_eq!(at_end("use sh"), path(&[], None, 4));
         assert_eq!(at_end("use shared::"), path(&["shared"], None, 12));
-        assert_eq!(at_end("use shared::models::Th"), path(&["shared", "models"], None, 20));
-        assert_eq!(at_end("struct A {}\n\nuse parent::c"), path(&["parent"], None, 25));
+        assert_eq!(
+            at_end("use shared::models::Th"),
+            path(&["shared", "models"], None, 20)
+        );
+        assert_eq!(
+            at_end("struct A {}\n\nuse parent::c"),
+            path(&["parent"], None, 25)
+        );
     }
 
     #[test]
     fn reads_a_brace_list_on_one_line_or_several() {
-        assert_eq!(at_end("use a::b::{X, Y"), path(&["a", "b"], Some(&["X"]), 14));
+        assert_eq!(
+            at_end("use a::b::{X, Y"),
+            path(&["a", "b"], Some(&["X"]), 14)
+        );
         assert_eq!(at_end("use a::b::{"), path(&["a", "b"], Some(&[]), 11));
         let source = "use a::b::{ // pick\n    X,\n    Y, // why\n    Z";
-        assert_eq!(at_end(source), path(&["a", "b"], Some(&["X", "Y"]), source.len() - 1));
+        assert_eq!(
+            at_end(source),
+            path(&["a", "b"], Some(&["X", "Y"]), source.len() - 1)
+        );
     }
 
     #[test]
     fn nothing_to_offer_after_the_path_or_mid_separator() {
-        for source in ["use a::B ", "use a::B as ", "use a::B as Al", "use a:", "use a::{B} ", "use a::{B C", "use {"] {
+        for source in [
+            "use a::B ",
+            "use a::B as ",
+            "use a::B as Al",
+            "use a:",
+            "use a::{B} ",
+            "use a::{B C",
+            "use {",
+        ] {
             assert_eq!(at_end(source), Some(UseContext::Nothing), "{source:?}");
         }
     }
@@ -382,7 +496,9 @@ mod tests {
 
     #[test]
     fn the_legacy_import_takes_a_plain_path() {
-        let Some(UseContext::Path(prefix)) = at_end("import types::") else { panic!() };
+        let Some(UseContext::Path(prefix)) = at_end("import types::") else {
+            panic!()
+        };
         assert!(prefix.legacy);
         assert_eq!(at_end("import types::{"), Some(UseContext::Nothing));
     }
@@ -425,12 +541,24 @@ mod tests {
     /// Like [`complete`], for any package and any file in it.
     fn complete_in(files: &[SourceFile], uri: &str, source: &str) -> Vec<(String, String, String)> {
         let uri = Url::parse(uri).unwrap();
-        let mut items = get_completions_with_project(source, &uri, offset_to_position(source, source.len()), files);
-        items.sort_by(|a, b| a.sort_text.as_ref().unwrap_or(&a.label).cmp(b.sort_text.as_ref().unwrap_or(&b.label)));
+        let mut items = get_completions_with_project(
+            source,
+            &uri,
+            offset_to_position(source, source.len()),
+            files,
+        );
+        items.sort_by(|a, b| {
+            a.sort_text
+                .as_ref()
+                .unwrap_or(&a.label)
+                .cmp(b.sort_text.as_ref().unwrap_or(&b.label))
+        });
         items
             .into_iter()
             .map(|c| {
-                let Some(CompletionTextEdit::Edit(edit)) = c.text_edit else { panic!("no edit on {}", c.label) };
+                let Some(CompletionTextEdit::Edit(edit)) = c.text_edit else {
+                    panic!("no edit on {}", c.label)
+                };
                 (c.label, c.detail.unwrap_or_default(), edit.new_text)
             })
             .collect()
@@ -443,11 +571,22 @@ mod tests {
     #[test]
     fn a_path_starts_with_the_packages_namespaces_its_dependencies_and_the_prefixes() {
         let items = complete("use ");
-        assert_eq!(labels(&items), ["api", "types", "net", "shared", "package", "parent", "self", "std"]);
+        assert_eq!(
+            labels(&items),
+            ["api", "types", "net", "shared", "package", "parent", "self", "std"]
+        );
 
         let find = |label: &str| items.iter().find(|(l, _, _)| l == label).unwrap();
-        assert_eq!(find("api"), &("api".into(), "`api/`".into(), "api::".into()), "a directory goes on");
-        assert_eq!(find("types"), &("types".into(), "`types.ids`".into(), "types".into()), "a schema can end a path");
+        assert_eq!(
+            find("api"),
+            &("api".into(), "`api/`".into(), "api::".into()),
+            "a directory goes on"
+        );
+        assert_eq!(
+            find("types"),
+            &("types".into(), "`types.ids`".into(), "types".into()),
+            "a schema can end a path"
+        );
         assert_eq!(find("shared").1, "dependency, path `../shared`");
         assert_eq!(find("net").1, "dependency, git — not fetched yet");
         assert_eq!(find("parent").1, "In a `use` path, one namespace level up.");
@@ -476,10 +615,25 @@ mod tests {
     #[test]
     fn relative_paths_resolve_like_the_build_and_stay_in_the_package() {
         // From `api/b.ids`, `parent::` is `api`.
-        assert_eq!(labels(&complete("use parent::")), ["common", "v1"], "`api` has no schema of its own to glob");
-        assert_eq!(labels(&complete("use parent::common::")), ["Error", "Other", "*", "{…}"]);
-        assert_eq!(labels(&complete("use package::")), ["api", "types"], "not the dependencies");
-        assert_eq!(labels(&complete("use self::")), Vec::<&str>::new(), "`api::b` has nothing under it");
+        assert_eq!(
+            labels(&complete("use parent::")),
+            ["common", "v1"],
+            "`api` has no schema of its own to glob"
+        );
+        assert_eq!(
+            labels(&complete("use parent::common::")),
+            ["Error", "Other", "*", "{…}"]
+        );
+        assert_eq!(
+            labels(&complete("use package::")),
+            ["api", "types"],
+            "not the dependencies"
+        );
+        assert_eq!(
+            labels(&complete("use self::")),
+            Vec::<&str>::new(),
+            "`api::b` has nothing under it"
+        );
     }
 
     /// `use parent::*` and `use parent::{A}` parse, so a bare prefix that lands
@@ -488,62 +642,135 @@ mod tests {
     fn a_bare_prefix_on_a_schema_offers_glob_and_list() {
         let file = |path: &str| Url::parse(&format!("file:///pkg/{path}")).unwrap();
         let files = vec![
-            SourceFile::local(file("config.idp"), "congregation app\nspecification_version = 1\n".to_string()),
-            SourceFile::local(file("src/api.ids"), "struct Shared {\n    id: u64\n}\n".to_string()),
-            SourceFile::local(file("src/api/child.ids"), "struct Child {\n    id: u64\n}\n".to_string()),
+            SourceFile::local(
+                file("config.idp"),
+                "congregation app\nspecification_version = 1\n".to_string(),
+            ),
+            SourceFile::local(
+                file("src/api.ids"),
+                "struct Shared {\n    id: u64\n}\n".to_string(),
+            ),
+            SourceFile::local(
+                file("src/api/child.ids"),
+                "struct Child {\n    id: u64\n}\n".to_string(),
+            ),
         ];
-        let complete_child = |source: &str| complete_in(&files, "file:///pkg/src/api/other.ids", source);
+        let complete_child =
+            |source: &str| complete_in(&files, "file:///pkg/src/api/other.ids", source);
 
-        assert_eq!(labels(&complete_child("use parent::")), ["Shared", "child", "*", "{…}"]);
+        assert_eq!(
+            labels(&complete_child("use parent::")),
+            ["Shared", "child", "*", "{…}"]
+        );
         assert_eq!(labels(&complete_child("use parent::{")), ["Shared"]);
     }
 
     #[test]
     fn a_dependency_offers_its_schemas() {
-        assert_eq!(complete("use shared::"), [("models".into(), "`models.ids` (dependency `shared`)".into(), "models".into())]);
-        assert_eq!(labels(&complete("use shared::models::")), ["Gadget", "Thing", "*", "{…}"]);
-        assert!(complete("use net::").is_empty(), "not fetched: nothing to list");
+        assert_eq!(
+            complete("use shared::"),
+            [(
+                "models".into(),
+                "`models.ids` (dependency `shared`)".into(),
+                "models".into()
+            )]
+        );
+        assert_eq!(
+            labels(&complete("use shared::models::")),
+            ["Gadget", "Thing", "*", "{…}"]
+        );
+        assert!(
+            complete("use net::").is_empty(),
+            "not fetched: nothing to list"
+        );
     }
 
     #[test]
     fn a_brace_list_offers_what_isnt_listed_yet() {
-        assert_eq!(labels(&complete("use shared::models::{Thing, ")), ["Gadget"]);
-        assert_eq!(labels(&complete("use parent::common::{\n    Other,\n    E")), ["Error"]);
+        assert_eq!(
+            labels(&complete("use shared::models::{Thing, ")),
+            ["Gadget"]
+        );
+        assert_eq!(
+            labels(&complete("use parent::common::{\n    Other,\n    E")),
+            ["Error"]
+        );
     }
 
     #[test]
     fn an_unknown_path_offers_nothing() {
         assert!(complete("use typse::").is_empty());
-        assert!(complete("use parent::parent::parent::").is_empty(), "above the package root");
+        assert!(
+            complete("use parent::parent::parent::").is_empty(),
+            "above the package root"
+        );
     }
 
     #[test]
     fn the_typed_segment_is_what_gets_replaced() {
         let source = "use shared::mo";
         let uri = Url::parse("file:///pkg/src/api/b.ids").unwrap();
-        let items = get_completions_with_project(source, &uri, offset_to_position(source, source.len()), &package());
-        let Some(CompletionTextEdit::Edit(edit)) = &items[0].text_edit else { panic!() };
-        assert_eq!((edit.range.start.character, edit.range.end.character), (12, 14));
-        assert_eq!(items[0].command.as_ref().map(|c| c.command.as_str()), None, "`models` can end the path");
+        let items = get_completions_with_project(
+            source,
+            &uri,
+            offset_to_position(source, source.len()),
+            &package(),
+        );
+        let Some(CompletionTextEdit::Edit(edit)) = &items[0].text_edit else {
+            panic!()
+        };
+        assert_eq!(
+            (edit.range.start.character, edit.range.end.character),
+            (12, 14)
+        );
+        assert_eq!(
+            items[0].command.as_ref().map(|c| c.command.as_str()),
+            None,
+            "`models` can end the path"
+        );
     }
 
     #[test]
     fn std_completes_like_a_dependency() {
         let uri = Url::parse("file:///pkg/src/api/b.ids").unwrap();
         let mut files = package();
-        files.extend(crate::analysis::stdlib::files(&crate::analysis::stdlib::root()));
+        files.extend(crate::analysis::stdlib::files(
+            &crate::analysis::stdlib::root(),
+        ));
         let at = |source: &str| {
-            let mut items = get_completions_with_project(source, &uri, offset_to_position(source, source.len()), &files);
-            items.sort_by(|a, b| a.sort_text.as_ref().unwrap_or(&a.label).cmp(b.sort_text.as_ref().unwrap_or(&b.label)));
-            items.into_iter().map(|c| (c.label, c.detail.unwrap_or_default())).collect::<Vec<_>>()
+            let mut items = get_completions_with_project(
+                source,
+                &uri,
+                offset_to_position(source, source.len()),
+                &files,
+            );
+            items.sort_by(|a, b| {
+                a.sort_text
+                    .as_ref()
+                    .unwrap_or(&a.label)
+                    .cmp(b.sort_text.as_ref().unwrap_or(&b.label))
+            });
+            items
+                .into_iter()
+                .map(|c| (c.label, c.detail.unwrap_or_default()))
+                .collect::<Vec<_>>()
         };
 
         assert!(at("use ").contains(&("std".to_string(), "the standard library".to_string())));
         assert_eq!(
             at("use std::"),
-            [("http".to_string(), "`http.ids` (std)".to_string()), ("validators".to_string(), "`validators.ids` (std)".to_string())]
+            [
+                ("http".to_string(), "`http.ids` (std)".to_string()),
+                (
+                    "validators".to_string(),
+                    "`validators.ids` (std)".to_string()
+                )
+            ]
         );
-        let http: Vec<String> = at("use std::http::").into_iter().map(|(label, _)| label).collect();
+        let http: Vec<String> = at("use std::http::")
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect();
         assert_eq!(http, ["HttpMethod", "Request", "Response", "*", "{…}"]);
     }
 
@@ -555,15 +782,18 @@ mod tests {
             SourceFile::local(file("config.idp"), MANIFEST.to_string()),
             SourceFile::local(
                 file("src/types.ids"),
-                "//! The package's types.\n\n/// Someone.\nstruct User {\n    id: u64\n}\n".to_string(),
+                "//! The package's types.\n\n/// Someone.\nstruct User {\n    id: u64\n}\n"
+                    .to_string(),
             ),
             SourceFile::local(
                 file("src/api/common.ids"),
-                "//! Things every API schema needs.\n\nstruct Error {\n    code: u32\n}\n".to_string(),
+                "//! Things every API schema needs.\n\nstruct Error {\n    code: u32\n}\n"
+                    .to_string(),
             ),
             SourceFile::of_dependency(
                 Url::parse("file:///shared/config.idp").unwrap(),
-                "//! A shared package.\ncongregation shared\nspecification_version = 1\n".to_string(),
+                "//! A shared package.\ncongregation shared\nspecification_version = 1\n"
+                    .to_string(),
                 "shared",
                 vec!["shared".to_string()],
             ),
@@ -574,7 +804,9 @@ mod tests {
                 vec!["shared".to_string(), "models".to_string()],
             ),
         ];
-        files.extend(crate::analysis::stdlib::files(&crate::analysis::stdlib::root()));
+        files.extend(crate::analysis::stdlib::files(
+            &crate::analysis::stdlib::root(),
+        ));
         files
     }
 
@@ -595,15 +827,31 @@ mod tests {
     }
 
     fn docs_for(items: &[(String, Option<String>)], label: &str) -> Option<String> {
-        items.iter().find(|(l, _)| l == label).unwrap_or_else(|| panic!("no {label} in {items:?}")).1.clone()
+        items
+            .iter()
+            .find(|(l, _)| l == label)
+            .unwrap_or_else(|| panic!("no {label} in {items:?}"))
+            .1
+            .clone()
     }
 
     #[test]
     fn a_path_start_carries_each_modules_and_packages_docs() {
         let items = documented("use ");
-        assert_eq!(docs_for(&items, "types").as_deref(), Some("The package's types."));
-        assert_eq!(docs_for(&items, "api"), None, "a directory with no schema of its own");
-        assert_eq!(docs_for(&items, "shared").as_deref(), Some("A shared package."), "the dependency's config.idp");
+        assert_eq!(
+            docs_for(&items, "types").as_deref(),
+            Some("The package's types.")
+        );
+        assert_eq!(
+            docs_for(&items, "api"),
+            None,
+            "a directory with no schema of its own"
+        );
+        assert_eq!(
+            docs_for(&items, "shared").as_deref(),
+            Some("A shared package."),
+            "the dependency's config.idp"
+        );
         let std = docs_for(&items, "std").unwrap();
         assert!(std.starts_with("The Comline standard library."), "{std}");
     }
@@ -615,24 +863,52 @@ mod tests {
             docs_for(&items, "http").as_deref(),
             Some("Types for talking HTTP: request methods, requests and responses.\n\nPlain data types: use them as fields and arguments in your own schemas.")
         );
-        assert!(docs_for(&items, "validators").unwrap().starts_with("Validators to attach to fields"));
-        assert_eq!(docs_for(&documented("use api::"), "common").as_deref(), Some("Things every API schema needs."));
-        assert_eq!(docs_for(&documented("use shared::"), "models").as_deref(), Some("Shared models."));
+        assert!(docs_for(&items, "validators")
+            .unwrap()
+            .starts_with("Validators to attach to fields"));
+        assert_eq!(
+            docs_for(&documented("use api::"), "common").as_deref(),
+            Some("Things every API schema needs.")
+        );
+        assert_eq!(
+            docs_for(&documented("use shared::"), "models").as_deref(),
+            Some("Shared models.")
+        );
     }
 
     #[test]
     fn declarations_carry_their_docstrings() {
         let validators = documented("use std::validators::");
         let bounds = docs_for(&validators, "StringBounds").unwrap();
-        assert!(bounds.starts_with("Checks a string's length is within a minimum and a maximum."), "{bounds}");
-        assert_eq!(docs_for(&documented("use shared::models::"), "Thing").as_deref(), Some("A thing."));
-        assert_eq!(docs_for(&documented("use types::{"), "User").as_deref(), Some("Someone."), "in a brace list");
-        assert_eq!(docs_for(&documented("use std::http::"), "*"), None, "glob and list have none");
+        assert!(
+            bounds.starts_with("Checks a string's length is within a minimum and a maximum."),
+            "{bounds}"
+        );
+        assert_eq!(
+            docs_for(&documented("use shared::models::"), "Thing").as_deref(),
+            Some("A thing.")
+        );
+        assert_eq!(
+            docs_for(&documented("use types::{"), "User").as_deref(),
+            Some("Someone."),
+            "in a brace list"
+        );
+        assert_eq!(
+            docs_for(&documented("use std::http::"), "*"),
+            None,
+            "glob and list have none"
+        );
     }
 
     #[test]
     fn the_legacy_import_offers_plain_paths_only() {
-        assert_eq!(labels(&complete("import ")), ["api", "types", "net", "shared"]);
-        assert_eq!(labels(&complete("import types::")), ["Kind", "NotFound", "User"]);
+        assert_eq!(
+            labels(&complete("import ")),
+            ["api", "types", "net", "shared"]
+        );
+        assert_eq!(
+            labels(&complete("import types::")),
+            ["Kind", "NotFound", "User"]
+        );
     }
 }

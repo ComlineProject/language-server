@@ -199,7 +199,9 @@ pub fn path_at(text: &str, offset: usize) -> Option<PathAt> {
     let mut at = start;
     while text[..at].ends_with("::") {
         let before = &text[..at - 2];
-        let segment_start = before.rfind(|c: char| !is_ident_char(c)).map_or(0, |i| i + 1);
+        let segment_start = before
+            .rfind(|c: char| !is_ident_char(c))
+            .map_or(0, |i| i + 1);
         let segment = &before[segment_start..];
         if segment.is_empty() || !segment.starts_with(|c: char| c.is_alphabetic() || c == '_') {
             break;
@@ -208,7 +210,11 @@ pub fn path_at(text: &str, offset: usize) -> Option<PathAt> {
         at = segment_start;
     }
 
-    Some(PathAt { segments, range: (start, end), continues: text[end..].starts_with("::") })
+    Some(PathAt {
+        segments,
+        range: (start, end),
+        continues: text[end..].starts_with("::"),
+    })
 }
 
 #[cfg(test)]
@@ -238,7 +244,11 @@ mod tests {
         let text = "user: User[]";
         assert_eq!(word_range_at(text, 8), Some((6, 10)));
         assert_eq!(word_range_at(text, 0), Some((0, 4)));
-        assert_eq!(word_range_at(text, 4), Some((0, 4)), "just past a word still counts");
+        assert_eq!(
+            word_range_at(text, 4),
+            Some((0, 4)),
+            "just past a word still counts"
+        );
         assert_eq!(word_range_at(text, 5), None);
     }
 
@@ -250,10 +260,20 @@ mod tests {
 
     #[test]
     fn closest_suggests_plausible_typos_only() {
-        assert_eq!(closest("typse", ["types", "chat"]), Some("types".to_string()));
-        assert_eq!(closest("Thign", ["Thing", "Other"]), Some("Thing".to_string()));
+        assert_eq!(
+            closest("typse", ["types", "chat"]),
+            Some("types".to_string())
+        );
+        assert_eq!(
+            closest("Thign", ["Thing", "Other"]),
+            Some("Thing".to_string())
+        );
         assert_eq!(closest("zzzz", ["types", "chat"]), None);
-        assert_eq!(closest("types", ["types"]), None, "an exact match isn't a suggestion");
+        assert_eq!(
+            closest("types", ["types"]),
+            None,
+            "an exact match isn't a suggestion"
+        );
     }
 
     #[test]
@@ -280,7 +300,10 @@ mod tests {
     fn in_comment_or_string_handles_a_block_comment_on_one_line() {
         let text = "/* note */ struct M {";
         assert!(in_comment_or_string(text, 5));
-        assert!(!in_comment_or_string(text, text.find("struct").unwrap() + 1));
+        assert!(!in_comment_or_string(
+            text,
+            text.find("struct").unwrap() + 1
+        ));
     }
 
     #[test]
@@ -296,7 +319,10 @@ mod tests {
         let at = |needle: &str| path_at(text, text.find(needle).unwrap() + 1).unwrap();
 
         let std = at("std");
-        assert_eq!((std.segments.as_slice(), std.continues), (&["std".to_string()][..], true));
+        assert_eq!(
+            (std.segments.as_slice(), std.continues),
+            (&["std".to_string()][..], true)
+        );
         let validators = at("validators");
         assert_eq!(validators.segments, ["std", "validators"]);
         assert!(validators.continues);
@@ -310,9 +336,17 @@ mod tests {
     fn path_at_stops_at_anything_but_an_adjacent_separator() {
         let text = "use a::{B, C}\nx: parent::common::*\nuse t as T\n";
         let seg = |needle: &str| path_at(text, text.find(needle).unwrap()).unwrap().segments;
-        assert_eq!(seg("B,"), ["B"], "inside a brace list there's no path before it");
+        assert_eq!(
+            seg("B,"),
+            ["B"],
+            "inside a brace list there's no path before it"
+        );
         assert_eq!(seg("common"), ["parent", "common"]);
-        assert_eq!(path_at("a ::b", 4).unwrap().segments, ["b"], "a space breaks the path");
+        assert_eq!(
+            path_at("a ::b", 4).unwrap().segments,
+            ["b"],
+            "a space breaks the path"
+        );
         assert_eq!(path_at("9lives::x", 1), None, "not an identifier");
         assert_eq!(path_at("a::b", 4), None, "past the end");
     }

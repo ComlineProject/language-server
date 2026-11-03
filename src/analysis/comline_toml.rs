@@ -106,34 +106,58 @@ impl Context {
     /// schemas, and its dependencies' manifests (as `Backend::package_view`
     /// gives them).
     pub fn from_files<S: ProjectSource>(files: &[S], base_dir: Option<PathBuf>) -> Self {
-        let mut context = Context { base_dir, ..Default::default() };
+        let mut context = Context {
+            base_dir,
+            ..Default::default()
+        };
         let mut wire_format = annotations::DEFAULT_FORMAT.to_string();
         let mut schemas = Vec::new();
         let mut complete = true;
         for file in files {
             let (uri, text) = (file.uri(), file.text());
             if source::is_manifest(uri) {
-                let package = file.dependency().map(str::to_string).unwrap_or_else(|| THIS_PACKAGE.to_string());
+                let package = file
+                    .dependency()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| THIS_PACKAGE.to_string());
                 if file.dependency().is_none() {
                     context.has_manifest = true;
                     context.languages = source::declared_languages(text);
                     wire_format = source::declared_wire_format(text);
                 }
-                context.encodings.extend(source::declared_encoding_details(text).into_iter().map(|e| KnownEncoding {
-                    name: e.name,
-                    kind: e.kind,
-                    package: package.clone(),
-                    map: e.map,
-                }));
+                context
+                    .encodings
+                    .extend(
+                        source::declared_encoding_details(text)
+                            .into_iter()
+                            .map(|e| KnownEncoding {
+                                name: e.name,
+                                kind: e.kind,
+                                package: package.clone(),
+                                map: e.map,
+                            }),
+                    );
                 continue;
             }
-            if file.dependency().is_some() || crate::analysis::stdlib::is_std(uri) || !uri.path().ends_with(".ids") {
+            if file.dependency().is_some()
+                || crate::analysis::stdlib::is_std(uri)
+                || !uri.path().ends_with(".ids")
+            {
                 continue;
             }
-            match crate::parser::parse(text).ok().and_then(|r| if r.errors.is_empty() { r.document } else { None }) {
+            match crate::parser::parse(text).ok().and_then(|r| {
+                if r.errors.is_empty() {
+                    r.document
+                } else {
+                    None
+                }
+            }) {
                 Some(document) => {
                     let units = IncrementalInterpreter::from_declarations(document.0.clone());
-                    schemas.push((crate::analysis::imports::namespace_of(uri).join("::"), units));
+                    schemas.push((
+                        crate::analysis::imports::namespace_of(uri).join("::"),
+                        units,
+                    ));
                 }
                 None => complete = false,
             }
@@ -149,7 +173,9 @@ impl Context {
         let mut all: Vec<KnownEncoding> = official::units()
             .iter()
             .filter_map(|unit| match unit {
-                ConfigUnit::Encoding { name, kind, map, .. } => Some(KnownEncoding {
+                ConfigUnit::Encoding {
+                    name, kind, map, ..
+                } => Some(KnownEncoding {
                     name: name.clone(),
                     kind: *kind,
                     package: OFFICIAL.to_string(),
@@ -171,7 +197,9 @@ impl Context {
     }
 
     fn declares(&self, language: &str) -> Option<&DeclaredLanguage> {
-        self.languages.iter().find(|d| d.language.eq_ignore_ascii_case(language))
+        self.languages
+            .iter()
+            .find(|d| d.language.eq_ignore_ascii_case(language))
     }
 }
 
@@ -218,7 +246,10 @@ impl Analysis {
         self.entries
             .iter()
             .filter(|e| within(e.key) || e.value.is_some_and(within))
-            .min_by_key(|e| e.value.map_or(e.key.1 - e.key.0, |v| v.1.max(e.key.1) - e.key.0))
+            .min_by_key(|e| {
+                e.value
+                    .map_or(e.key.1 - e.key.0, |v| v.1.max(e.key.1) - e.key.0)
+            })
     }
 
     /// The string value of `key` in target block `target`.
@@ -231,8 +262,13 @@ impl Analysis {
 
 /// Read `text`, collecting every key and every shape problem.
 pub fn analyse(text: &str) -> Analysis {
-    let mut analysis =
-        Analysis { entries: vec![], blocks: vec![], generate_header: None, problems: vec![], parsed: false };
+    let mut analysis = Analysis {
+        entries: vec![],
+        blocks: vec![],
+        generate_header: None,
+        problems: vec![],
+        parsed: false,
+    };
     let document = match ImDocument::parse(text) {
         Ok(document) => document,
         Err(e) => {
@@ -249,8 +285,17 @@ pub fn analyse(text: &str) -> Analysis {
     };
     analysis.parsed = true;
     let root = document.as_table();
-    let mut walk = Walk { analysis: &mut analysis, text };
-    walk.table(root, root.span().map(range).unwrap_or((0, 0)), schema(), &[], None);
+    let mut walk = Walk {
+        analysis: &mut analysis,
+        text,
+    };
+    walk.table(
+        root,
+        root.span().map(range).unwrap_or((0, 0)),
+        schema(),
+        &[],
+        None,
+    );
     analysis
 }
 
@@ -331,7 +376,9 @@ fn value_node(value: &Value) -> Node<'_> {
         Value::Boolean(_) => Node::Bool,
         Value::Datetime(_) => Node::Datetime,
         Value::Array(a) => Node::Array(
-            a.iter().map(|v| (value_node(v), v.span().map(range).unwrap_or((0, 0)))).collect(),
+            a.iter()
+                .map(|v| (value_node(v), v.span().map(range).unwrap_or((0, 0))))
+                .collect(),
         ),
         Value::InlineTable(t) => Node::Table(t),
     }
@@ -343,7 +390,11 @@ pub fn deref(mut node: &Json) -> &Json {
         if let Some(reference) = node.get("$ref").and_then(Json::as_str) {
             let name = reference.rsplit('/').next().unwrap_or_default();
             node = &schema()["definitions"][name];
-        } else if let Some([only]) = node.get("allOf").and_then(Json::as_array).map(Vec::as_slice) {
+        } else if let Some([only]) = node
+            .get("allOf")
+            .and_then(Json::as_array)
+            .map(Vec::as_slice)
+        {
             node = only;
         } else {
             return node;
@@ -379,12 +430,17 @@ pub fn schema_at(path: &[String]) -> Option<&'static Json> {
 /// The description of the key at `path`: its own, else its type's.
 pub fn description(path: &[String]) -> Option<String> {
     let node = schema_at(path)?;
-    node.get("description").or_else(|| deref(node).get("description")).and_then(Json::as_str).map(str::to_string)
+    node.get("description")
+        .or_else(|| deref(node).get("description"))
+        .and_then(Json::as_str)
+        .map(str::to_string)
 }
 
 /// The keys a table at `path` has, with their descriptions.
 pub fn keys_at(path: &[String]) -> Vec<(String, String)> {
-    let Some(node) = schema_at(path) else { return vec![] };
+    let Some(node) = schema_at(path) else {
+        return vec![];
+    };
     let node = deref(node);
     let node = node.get("items").map(deref).unwrap_or(node);
     node.get("properties")
@@ -394,7 +450,10 @@ pub fn keys_at(path: &[String]) -> Vec<(String, String)> {
                 .iter()
                 .map(|(k, v)| {
                     let doc = v.get("description").or_else(|| deref(v).get("description"));
-                    (k.clone(), doc.and_then(Json::as_str).unwrap_or_default().to_string())
+                    (
+                        k.clone(),
+                        doc.and_then(Json::as_str).unwrap_or_default().to_string(),
+                    )
                 })
                 .collect()
         })
@@ -403,10 +462,16 @@ pub fn keys_at(path: &[String]) -> Vec<(String, String)> {
 
 /// The values the key at `path` takes, when it's an enum or a boolean.
 pub fn values_at(path: &[String]) -> Vec<String> {
-    let Some(node) = schema_at(path) else { return vec![] };
+    let Some(node) = schema_at(path) else {
+        return vec![];
+    };
     let node = deref(node);
     if let Some(values) = node.get("enum").and_then(Json::as_array) {
-        return values.iter().filter_map(Json::as_str).map(|v| format!("\"{v}\"")).collect();
+        return values
+            .iter()
+            .filter_map(Json::as_str)
+            .map(|v| format!("\"{v}\""))
+            .collect();
     }
     if node.get("type").and_then(Json::as_str) == Some("boolean") {
         return vec!["true".into(), "false".into()];
@@ -420,16 +485,37 @@ struct Walk<'a, 'b> {
 }
 
 impl Walk<'_, '_> {
-    fn problem(&mut self, span: (usize, usize), code: &'static str, message: String, data: Option<Json>) {
-        self.analysis.problems.push(Problem { span, code, severity: DiagnosticSeverity::ERROR, message, data });
+    fn problem(
+        &mut self,
+        span: (usize, usize),
+        code: &'static str,
+        message: String,
+        data: Option<Json>,
+    ) {
+        self.analysis.problems.push(Problem {
+            span,
+            code,
+            severity: DiagnosticSeverity::ERROR,
+            message,
+            data,
+        });
     }
 
-    fn table(&mut self, table: &dyn TableLike, span: (usize, usize), node: &Json, path: &[String], target: Option<usize>) {
+    fn table(
+        &mut self,
+        table: &dyn TableLike,
+        span: (usize, usize),
+        node: &Json,
+        path: &[String],
+        target: Option<usize>,
+    ) {
         let node = deref(node);
         let properties = node.get("properties").and_then(Json::as_object);
         let additional = node.get("additionalProperties").filter(|a| a.is_object());
         for (key, item) in table.iter() {
-            let Some((key_ref, _)) = table.get_key_value(key) else { continue };
+            let Some((key_ref, _)) = table.get_key_value(key) else {
+                continue;
+            };
             let key_span = key_ref.span().map(range).unwrap_or(span);
             let mut here = path.to_vec();
             here.push(key.to_string());
@@ -438,7 +524,9 @@ impl Walk<'_, '_> {
                 self.unknown(key, key_span, &here, properties, item, target);
                 continue;
             };
-            let Some((value, value_span)) = node_of(item) else { continue };
+            let Some((value, value_span)) = node_of(item) else {
+                continue;
+            };
             let text = match &value {
                 Node::Str(s) => Some(s.to_string()),
                 _ => None,
@@ -447,7 +535,8 @@ impl Walk<'_, '_> {
                 path: here.clone(),
                 target,
                 key: key_span,
-                value: value_span.filter(|_| !matches!(item, Item::Table(_) | Item::ArrayOfTables(_))),
+                value: value_span
+                    .filter(|_| !matches!(item, Item::Table(_) | Item::ArrayOfTables(_))),
                 text,
             });
             if here == ["generate"] {
@@ -491,7 +580,9 @@ impl Walk<'_, '_> {
             );
             return;
         }
-        let names: Vec<&str> = properties.map(|p| p.keys().map(String::as_str).collect()).unwrap_or_default();
+        let names: Vec<&str> = properties
+            .map(|p| p.keys().map(String::as_str).collect())
+            .unwrap_or_default();
         let candidates = closest(key, &names);
         let place = if parent.is_empty() {
             "at the top level".to_string()
@@ -503,19 +594,38 @@ impl Walk<'_, '_> {
         let mut message = format!("unknown key `{key}` {place}");
         match candidates.first() {
             Some(best) => message.push_str(&format!(" - did you mean `{best}`?")),
-            None if !names.is_empty() => {
-                message.push_str(&format!(" - expected one of {}", names.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ")))
-            }
+            None if !names.is_empty() => message.push_str(&format!(
+                " - expected one of {}",
+                names
+                    .iter()
+                    .map(|n| format!("`{n}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
             None => {}
         }
-        self.problem(span, UNKNOWN_KEY, message, Some(json!({ "fix": FIX_REPLACE, "candidates": candidates })));
+        self.problem(
+            span,
+            UNKNOWN_KEY,
+            message,
+            Some(json!({ "fix": FIX_REPLACE, "candidates": candidates })),
+        );
     }
 
-    fn value(&mut self, value: Node<'_>, span: (usize, usize), node: &Json, path: &[String], target: Option<usize>) {
+    fn value(
+        &mut self,
+        value: Node<'_>,
+        span: (usize, usize),
+        node: &Json,
+        path: &[String],
+        target: Option<usize>,
+    ) {
         let node = deref(node);
         let key = path.last().map(String::as_str).unwrap_or_default();
         if let Some(branches) = node.get("anyOf").and_then(Json::as_array) {
-            let matching = branches.iter().find(|b| deref(b).get("type").and_then(Json::as_str) == Some(value.type_name()));
+            let matching = branches
+                .iter()
+                .find(|b| deref(b).get("type").and_then(Json::as_str) == Some(value.type_name()));
             match matching {
                 Some(branch) => self.value(value, span, branch, path, target),
                 None => {
@@ -527,7 +637,11 @@ impl Walk<'_, '_> {
                     self.problem(
                         span,
                         WRONG_TYPE,
-                        format!("`{key}` should be {}, not {}", expected.join(" or "), value.shown()),
+                        format!(
+                            "`{key}` should be {}, not {}",
+                            expected.join(" or "),
+                            value.shown()
+                        ),
                         None,
                     );
                 }
@@ -536,7 +650,16 @@ impl Walk<'_, '_> {
         }
         if let Some(expected) = node.get("type").and_then(Json::as_str) {
             if expected != value.type_name() {
-                self.problem(span, WRONG_TYPE, format!("`{key}` should be {}, not {}", shown_type(expected), value.shown()), None);
+                self.problem(
+                    span,
+                    WRONG_TYPE,
+                    format!(
+                        "`{key}` should be {}, not {}",
+                        shown_type(expected),
+                        value.shown()
+                    ),
+                    None,
+                );
                 return;
             }
         }
@@ -545,13 +668,20 @@ impl Walk<'_, '_> {
                 if let Some(allowed) = node.get("enum").and_then(Json::as_array) {
                     let allowed: Vec<&str> = allowed.iter().filter_map(Json::as_str).collect();
                     if !allowed.contains(&s) {
-                        let candidates: Vec<String> = closest(s, &allowed).into_iter().map(|c| format!("\"{c}\"")).collect();
+                        let candidates: Vec<String> = closest(s, &allowed)
+                            .into_iter()
+                            .map(|c| format!("\"{c}\""))
+                            .collect();
                         self.problem(
                             span,
                             BAD_VALUE,
                             format!(
                                 "`{key} = \"{s}\"` - expected one of {}",
-                                allowed.iter().map(|a| format!("`{a}`")).collect::<Vec<_>>().join(", ")
+                                allowed
+                                    .iter()
+                                    .map(|a| format!("`{a}`"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
                             ),
                             Some(json!({ "fix": FIX_REPLACE, "candidates": candidates })),
                         );
@@ -575,7 +705,9 @@ impl Walk<'_, '_> {
                 let item_schema = node.get("items").cloned().unwrap_or(Json::Null);
                 for (index, (item, item_span)) in items.into_iter().enumerate() {
                     let target = if path == ["generate", "target"] {
-                        self.analysis.blocks.push(Block { header: header_span(self.text, item_span) });
+                        self.analysis.blocks.push(Block {
+                            header: header_span(self.text, item_span),
+                        });
                         Some(index)
                     } else {
                         target
@@ -619,7 +751,11 @@ pub fn closest(written: &str, names: &[&str]) -> Vec<String> {
         .filter(|(d, _)| *d <= threshold)
         .collect();
     scored.sort();
-    scored.into_iter().take(3).map(|(_, n)| n.to_string()).collect()
+    scored
+        .into_iter()
+        .take(3)
+        .map(|(_, n)| n.to_string())
+        .collect()
 }
 
 /// Optimal string alignment distance: insertions, deletions, substitutions
@@ -636,7 +772,9 @@ pub fn distance(a: &str, b: &str) -> usize {
     for i in 1..=a.len() {
         for j in 1..=b.len() {
             let cost = usize::from(a[i - 1] != b[j - 1]);
-            d[i][j] = (d[i - 1][j] + 1).min(d[i][j - 1] + 1).min(d[i - 1][j - 1] + cost);
+            d[i][j] = (d[i - 1][j] + 1)
+                .min(d[i][j - 1] + 1)
+                .min(d[i - 1][j - 1] + cost);
             if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
                 d[i][j] = d[i][j].min(d[i - 2][j - 2] + 1);
             }
@@ -684,25 +822,53 @@ pub fn diagnostics(text: &str, context: &Context) -> Vec<Diagnostic> {
 fn semantic(analysis: &mut Analysis, context: &Context) {
     let mut problems = Vec::new();
     let mut push = |span, code, severity, message: String, data: Option<Json>| {
-        problems.push(Problem { span, code, severity, message, data });
+        problems.push(Problem {
+            span,
+            code,
+            severity,
+            message,
+            data,
+        });
     };
     let error = DiagnosticSeverity::ERROR;
-    let declared_names: Vec<&str> = context.languages.iter().map(|d| d.language.as_str()).collect();
+    let declared_names: Vec<&str> = context
+        .languages
+        .iter()
+        .map(|d| d.language.as_str())
+        .collect();
     let check_declared = context.has_manifest && !context.languages.is_empty();
 
-    let undeclared = |language: &str, span: (usize, usize), message: String, push: &mut dyn FnMut((usize, usize), &'static str, DiagnosticSeverity, String, Option<Json>)| {
-        let candidates: Vec<String> = closest(language, &declared_names).into_iter().map(|c| format!("\"{c}\"")).collect();
+    let undeclared = |language: &str,
+                      span: (usize, usize),
+                      message: String,
+                      push: &mut dyn FnMut(
+        (usize, usize),
+        &'static str,
+        DiagnosticSeverity,
+        String,
+        Option<Json>,
+    )| {
+        let candidates: Vec<String> = closest(language, &declared_names)
+            .into_iter()
+            .map(|c| format!("\"{c}\""))
+            .collect();
         push(
             span,
             UNDECLARED_LANGUAGE,
             error,
             message,
-            Some(json!({ "fix": FIX_DECLARE_LANGUAGE, "language": language, "candidates": candidates })),
+            Some(
+                json!({ "fix": FIX_DECLARE_LANGUAGE, "language": language, "candidates": candidates }),
+            ),
         );
     };
 
     // `[generate] only`.
-    for entry in analysis.entries.iter().filter(|e| e.path == ["generate", "only"] && e.text.is_some()) {
+    for entry in analysis
+        .entries
+        .iter()
+        .filter(|e| e.path == ["generate", "only"] && e.text.is_some())
+    {
         let language = entry.text.as_deref().unwrap_or_default();
         if check_declared && context.declares(language).is_none() {
             undeclared(
@@ -722,7 +888,13 @@ fn semantic(analysis: &mut Analysis, context: &Context) {
         let language_text = language.and_then(|e| e.text.clone()).unwrap_or_default();
 
         if language_text.is_empty() && generator.is_none() {
-            push(block.header, INVALID, error, "a `[[generate.target]]` sets no `language`".to_string(), None);
+            push(
+                block.header,
+                INVALID,
+                error,
+                "a `[[generate.target]]` sets no `language`".to_string(),
+                None,
+            );
         }
         if let (Some(entry), true) = (language, !language_text.is_empty()) {
             if check_declared && context.declares(&language_text).is_none() {
@@ -743,10 +915,16 @@ fn semantic(analysis: &mut Analysis, context: &Context) {
         if generator.is_none() && !language_text.is_empty() {
             let declared = context.declares(&language_text);
             let raised = lang_version.and_then(|e| e.text.clone());
-            let at = lang_version.or(language).map(|e| e.value.unwrap_or(e.key)).unwrap_or(block.header);
+            let at = lang_version
+                .or(language)
+                .map(|e| e.value.unwrap_or(e.key))
+                .unwrap_or(block.header);
             if let (Some(raised), Some(declared)) = (&raised, declared) {
                 use comline_codegen::versions::LangVersion;
-                if let (Some(r), Some(d)) = (LangVersion::parse(raised), LangVersion::parse(&declared.version)) {
+                if let (Some(r), Some(d)) = (
+                    LangVersion::parse(raised),
+                    LangVersion::parse(&declared.version),
+                ) {
                     if r < d {
                         push(
                             at,
@@ -774,7 +952,11 @@ fn semantic(analysis: &mut Analysis, context: &Context) {
         }
 
         // `timeout` limits an external generator.
-        if let Some(timeout) = analysis.entries.iter().find(|e| e.target == Some(index) && e.path == ["generate", "target", "timeout"]) {
+        if let Some(timeout) = analysis
+            .entries
+            .iter()
+            .find(|e| e.target == Some(index) && e.path == ["generate", "target", "timeout"])
+        {
             if generator.is_none() {
                 push(
                     timeout.key,
@@ -803,18 +985,31 @@ fn semantic(analysis: &mut Analysis, context: &Context) {
                 )),
             };
             if let Some(message) = message {
-                push(entry.value.unwrap_or(entry.key), GENERATOR_PATH, error, message, None);
+                push(
+                    entry.value.unwrap_or(entry.key),
+                    GENERATOR_PATH,
+                    error,
+                    message,
+                    None,
+                );
             }
         }
     }
 
     // `encodings` keys: declared somewhere in view.
-    let known: Vec<String> = context.all_encodings().into_iter().map(|e| e.name).collect();
+    let known: Vec<String> = context
+        .all_encodings()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
     let known_refs: Vec<&str> = known.iter().map(String::as_str).collect();
     for entry in analysis.entries.iter().filter(|e| is_encoding_key(&e.path)) {
         let name = entry.path.last().map(String::as_str).unwrap_or_default();
         if context.encoding(name).is_none() {
-            let candidates: Vec<String> = closest(name, &known_refs).into_iter().map(|c| format!("\"{c}\"")).collect();
+            let candidates: Vec<String> = closest(name, &known_refs)
+                .into_iter()
+                .map(|c| format!("\"{c}\""))
+                .collect();
             push(
                 entry.key,
                 UNDECLARED_ENCODING,
@@ -850,7 +1045,11 @@ fn semantic(analysis: &mut Analysis, context: &Context) {
                 .filter(|e| is_encoding_key(&e.path) && (e.target.is_none() || e.target == target))
                 .map(|e| {
                     let name = e.path.last().cloned().unwrap_or_default();
-                    let mapping = EncodingMapping { type_path: e.text.clone().unwrap_or_default(), package: None, version: None };
+                    let mapping = EncodingMapping {
+                        type_path: e.text.clone().unwrap_or_default(),
+                        package: None,
+                        version: None,
+                    };
                     (comline_codegen::encodings::canonical(&name), mapping)
                 })
                 .collect::<BTreeMap<_, _>>()
@@ -863,8 +1062,12 @@ fn semantic(analysis: &mut Analysis, context: &Context) {
             .collect();
         // (language, block) for every target `comline generate` would build.
         let mut targets: Vec<(String, Option<usize>)> = Vec::new();
-        let block_language =
-            |i: usize| analysis.target_value(i, "language").and_then(|e| e.text.clone()).unwrap_or_default();
+        let block_language = |i: usize| {
+            analysis
+                .target_value(i, "language")
+                .and_then(|e| e.text.clone())
+                .unwrap_or_default()
+        };
         if context.languages.is_empty() {
             targets.extend((0..analysis.blocks.len()).map(|i| (block_language(i), Some(i))));
         } else {
@@ -872,8 +1075,9 @@ fn semantic(analysis: &mut Analysis, context: &Context) {
                 if !only.is_empty() && !only.iter().any(|l| l.eq_ignore_ascii_case(&d.language)) {
                     continue;
                 }
-                let blocks: Vec<usize> =
-                    (0..analysis.blocks.len()).filter(|i| block_language(*i).eq_ignore_ascii_case(&d.language)).collect();
+                let blocks: Vec<usize> = (0..analysis.blocks.len())
+                    .filter(|i| block_language(*i).eq_ignore_ascii_case(&d.language))
+                    .collect();
                 if blocks.is_empty() {
                     targets.push((d.language.clone(), None));
                 } else {
@@ -896,13 +1100,17 @@ fn semantic(analysis: &mut Analysis, context: &Context) {
                     .unwrap_or((0, 0));
                 for line in e.to_string().lines() {
                     let name = line.split('`').nth(1).unwrap_or_default().to_string();
-                    let suggested = context.encoding(&name).and_then(|enc| enc.map.get(&language).cloned());
+                    let suggested = context
+                        .encoding(&name)
+                        .and_then(|enc| enc.map.get(&language).cloned());
                     push(
                         at,
                         UNMAPPED_ENCODING,
                         error,
                         line.to_string(),
-                        Some(json!({ "encoding": name, "language": language, "suggested": suggested.map(|s| s.ty) })),
+                        Some(
+                            json!({ "encoding": name, "language": language, "suggested": suggested.map(|s| s.ty) }),
+                        ),
                     );
                 }
             }
@@ -927,7 +1135,10 @@ pub fn describe_encoding(encoding: &KnownEncoding) -> String {
         EncodingKind::Framing => "framing",
         EncodingKind::Handshake => "handshake",
     };
-    let mut out = format!("**`{}`** - a {kind}, declared by {}", encoding.name, encoding.package);
+    let mut out = format!(
+        "**`{}`** - a {kind}, declared by {}",
+        encoding.name, encoding.package
+    );
     if encoding.map.is_empty() {
         out.push_str("\n\nNo suggested mapping: map it here for each target.");
     } else {
@@ -962,14 +1173,21 @@ mod tests {
     fn rust_package() -> Context {
         Context {
             has_manifest: true,
-            languages: vec![DeclaredLanguage { language: "rust".into(), version: "1.85.0".into() }],
+            languages: vec![DeclaredLanguage {
+                language: "rust".into(),
+                version: "1.85.0".into(),
+            }],
             encodings: vec![KnownEncoding {
                 name: "com.acme.lines@1".into(),
                 kind: EncodingKind::Framing,
                 package: "acme".into(),
                 map: BTreeMap::from([(
                     "rust".to_string(),
-                    Suggested { ty: "acme::Lines".into(), package: Some("acme".into()), version: Some("^1".into()) },
+                    Suggested {
+                        ty: "acme::Lines".into(),
+                        package: Some("acme".into()),
+                        version: Some("^1".into()),
+                    },
                 )]),
             }],
             used: Some(BTreeSet::new()),
@@ -996,57 +1214,141 @@ mod tests {
         let text = "colour = 1\n[generate]\nmdoe = \"code\"\nmode = \"libb\"\nout = 3\nvalidate_on_decode = \"frist\"\n\n[[generate.target]]\nlanguage = \"rust\"\ntimeout = 0\ngenerator = \"g.wasm\"\nflaten = true\n";
         let found = codes(text, &Context::default());
         let got: Vec<&str> = found.iter().map(|(c, _)| c.as_str()).collect();
-        assert_eq!(got.iter().filter(|c| **c == UNKNOWN_KEY).count(), 3, "{found:?}");
-        assert_eq!(got.iter().filter(|c| **c == BAD_VALUE).count(), 3, "{found:?}");
-        assert_eq!(got.iter().filter(|c| **c == WRONG_TYPE).count(), 1, "{found:?}");
-        assert!(found.iter().any(|(_, m)| m.contains("did you mean `mode`")), "{found:?}");
-        assert!(found.iter().any(|(_, m)| m.contains("did you mean `flatten`")), "{found:?}");
-        assert!(found.iter().any(|(_, m)| m.contains("`timeout = 0` - it's in seconds")), "{found:?}");
-        assert!(found.iter().any(|(_, m)| m == "`out` should be a string, not an integer"), "{found:?}");
+        assert_eq!(
+            got.iter().filter(|c| **c == UNKNOWN_KEY).count(),
+            3,
+            "{found:?}"
+        );
+        assert_eq!(
+            got.iter().filter(|c| **c == BAD_VALUE).count(),
+            3,
+            "{found:?}"
+        );
+        assert_eq!(
+            got.iter().filter(|c| **c == WRONG_TYPE).count(),
+            1,
+            "{found:?}"
+        );
+        assert!(
+            found.iter().any(|(_, m)| m.contains("did you mean `mode`")),
+            "{found:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .any(|(_, m)| m.contains("did you mean `flatten`")),
+            "{found:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .any(|(_, m)| m.contains("`timeout = 0` - it's in seconds")),
+            "{found:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .any(|(_, m)| m == "`out` should be a string, not an integer"),
+            "{found:?}"
+        );
     }
 
     #[test]
     fn a_typo_carries_its_replacements() {
         let d = diagnostics("[generate]\nmode = \"cod\"\n", &Context::default());
-        assert_eq!(d[0].data.as_ref().unwrap()["candidates"], json!(["\"code\""]));
-        assert_eq!((d[0].range.start.character, d[0].range.end.character), (7, 12));
+        assert_eq!(
+            d[0].data.as_ref().unwrap()["candidates"],
+            json!(["\"code\""])
+        );
+        assert_eq!(
+            (d[0].range.start.character, d[0].range.end.character),
+            (7, 12)
+        );
         let d = diagnostics("[generate]\nlayuot = \"x\"\n", &Context::default());
         assert_eq!(d[0].data.as_ref().unwrap()["candidates"], json!(["layout"]));
-        assert_eq!((d[0].range.start.character, d[0].range.end.character), (0, 6));
+        assert_eq!(
+            (d[0].range.start.character, d[0].range.end.character),
+            (0, 6)
+        );
     }
 
     #[test]
     fn timeout_without_a_generator_is_refused() {
-        let found = codes("[[generate.target]]\nlanguage = \"rust\"\ntimeout = 5\n", &rust_package());
+        let found = codes(
+            "[[generate.target]]\nlanguage = \"rust\"\ntimeout = 5\n",
+            &rust_package(),
+        );
         assert_eq!(found.len(), 1, "{found:?}");
-        assert!(found[0].1.contains("`timeout` limits an external `generator`"));
+        assert!(found[0]
+            .1
+            .contains("`timeout` limits an external `generator`"));
     }
 
     #[test]
     fn default_framing_says_where_it_went() {
-        let found = codes("[generate]\ndefault_framing = \"datagram\"\n", &Context::default());
+        let found = codes(
+            "[generate]\ndefault_framing = \"datagram\"\n",
+            &Context::default(),
+        );
         assert_eq!(found[0].0, MOVED_KEY);
-        assert!(found[0].1.starts_with("`default_framing` moved from comline.toml to config.idp"), "{found:?}");
-        assert!(found[0].1.contains("wire = { framing = \"datagram@1\" }") || found[0].1.contains("wire = { framing = \""), "{found:?}");
+        assert!(
+            found[0]
+                .1
+                .starts_with("`default_framing` moved from comline.toml to config.idp"),
+            "{found:?}"
+        );
+        assert!(
+            found[0].1.contains("wire = { framing = \"datagram@1\" }")
+                || found[0].1.contains("wire = { framing = \""),
+            "{found:?}"
+        );
     }
 
     #[test]
     fn an_undeclared_language_is_an_error_with_its_fix_data() {
-        let d = diagnostics("[generate]\nonly = [\"rsut\"]\n\n[[generate.target]]\nlanguage = \"typescript\"\n", &rust_package());
-        let undeclared: Vec<&Diagnostic> =
-            d.iter().filter(|d| d.code == Some(NumberOrString::String(UNDECLARED_LANGUAGE.into()))).collect();
+        let d = diagnostics(
+            "[generate]\nonly = [\"rsut\"]\n\n[[generate.target]]\nlanguage = \"typescript\"\n",
+            &rust_package(),
+        );
+        let undeclared: Vec<&Diagnostic> = d
+            .iter()
+            .filter(|d| d.code == Some(NumberOrString::String(UNDECLARED_LANGUAGE.into())))
+            .collect();
         assert_eq!(undeclared.len(), 2, "{d:?}");
-        assert_eq!(undeclared[0].data.as_ref().unwrap()["candidates"], json!(["\"rust\""]));
-        assert_eq!(undeclared[1].data.as_ref().unwrap()["language"], json!("typescript"));
-        assert!(undeclared[1].message.contains("which config.idp does not declare"));
+        assert_eq!(
+            undeclared[0].data.as_ref().unwrap()["candidates"],
+            json!(["\"rust\""])
+        );
+        assert_eq!(
+            undeclared[1].data.as_ref().unwrap()["language"],
+            json!("typescript")
+        );
+        assert!(undeclared[1]
+            .message
+            .contains("which config.idp does not declare"));
     }
 
     #[test]
     fn a_version_no_builtin_handles_is_an_error_but_not_for_an_external_generator() {
-        let found = codes("[[generate.target]]\nlanguage = \"rust\"\nlang_version = \"1.10\"\n", &rust_package());
-        assert_eq!(found.iter().filter(|(c, _)| c == LANG_VERSION).count(), 2, "{found:?}");
-        let found = codes("[[generate.target]]\nlanguage = \"rust\"\nlang_version = \"nightly\"\n", &rust_package());
-        assert!(found.iter().any(|(c, m)| c == LANG_VERSION && m.contains("isn't a version")), "{found:?}");
+        let found = codes(
+            "[[generate.target]]\nlanguage = \"rust\"\nlang_version = \"1.10\"\n",
+            &rust_package(),
+        );
+        assert_eq!(
+            found.iter().filter(|(c, _)| c == LANG_VERSION).count(),
+            2,
+            "{found:?}"
+        );
+        let found = codes(
+            "[[generate.target]]\nlanguage = \"rust\"\nlang_version = \"nightly\"\n",
+            &rust_package(),
+        );
+        assert!(
+            found
+                .iter()
+                .any(|(c, m)| c == LANG_VERSION && m.contains("isn't a version")),
+            "{found:?}"
+        );
         let found = codes(
             "[[generate.target]]\nlanguage = \"rust\"\nlang_version = \"nightly\"\ngenerator = \"g.wasm\"\n",
             &rust_package(),
@@ -1056,10 +1358,16 @@ mod tests {
 
     #[test]
     fn an_undeclared_encoding_key_is_a_warning() {
-        let d = diagnostics("[generate]\nencodings = { \"com.acme.lnes@1\" = \"x\", \"json-rpc\" = \"y\" }\n", &rust_package());
+        let d = diagnostics(
+            "[generate]\nencodings = { \"com.acme.lnes@1\" = \"x\", \"json-rpc\" = \"y\" }\n",
+            &rust_package(),
+        );
         assert_eq!(d.len(), 1, "{d:?}");
         assert_eq!(d[0].severity, Some(DiagnosticSeverity::WARNING));
-        assert_eq!(d[0].data.as_ref().unwrap()["candidates"], json!(["\"com.acme.lines@1\""]));
+        assert_eq!(
+            d[0].data.as_ref().unwrap()["candidates"],
+            json!(["\"com.acme.lines@1\""])
+        );
     }
 
     #[test]
@@ -1070,7 +1378,9 @@ mod tests {
         let found = codes("[generate]\nout = \"g\"\n", &context);
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].0, UNMAPPED_ENCODING);
-        assert!(found[0].1.starts_with("encoding `com.acme.lines@1` has no rust mapping"));
+        assert!(found[0]
+            .1
+            .starts_with("encoding `com.acme.lines@1` has no rust mapping"));
         let mapped = "[[generate.target]]\nlanguage = \"rust\"\nencodings = { \"com.acme.lines@1\" = \"mine::Lines\" }\n";
         assert_eq!(codes(mapped, &context), vec![]);
         // Unknown use (a schema mid-edit): nothing is called unmapped.
@@ -1085,19 +1395,33 @@ mod tests {
         std::fs::write(dir.join("g.wasm"), b"").unwrap();
         let mut context = rust_package();
         context.base_dir = Some(dir.clone());
-        let block = |g: &str| format!("[[generate.target]]\nlanguage = \"rust\"\ngenerator = \"{g}\"\n");
+        let block =
+            |g: &str| format!("[[generate.target]]\nlanguage = \"rust\"\ngenerator = \"{g}\"\n");
         assert_eq!(codes(&block("g.wasm"), &context), vec![]);
         let found = codes(&block("missing.wasm"), &context);
-        assert!(found.iter().any(|(c, m)| c == GENERATOR_PATH && m.contains("doesn't exist")), "{found:?}");
+        assert!(
+            found
+                .iter()
+                .any(|(c, m)| c == GENERATOR_PATH && m.contains("doesn't exist")),
+            "{found:?}"
+        );
         let found = codes(&block("gens"), &context);
-        assert!(found.iter().any(|(c, m)| c == GENERATOR_PATH && m.contains("isn't a file")), "{found:?}");
+        assert!(
+            found
+                .iter()
+                .any(|(c, m)| c == GENERATOR_PATH && m.contains("isn't a file")),
+            "{found:?}"
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
     fn closest_has_a_threshold() {
         assert_eq!(closest("mdoe", &["mode", "out"]), vec!["mode"]);
-        assert_eq!(closest("completely", &["mode", "out"]), Vec::<String>::new());
+        assert_eq!(
+            closest("completely", &["mode", "out"]),
+            Vec::<String>::new()
+        );
         assert_eq!(distance("flaten", "flatten"), 1);
     }
 
@@ -1122,6 +1446,9 @@ mod tests {
         assert_eq!(context.languages[0].language, "rust");
         assert_eq!(context.encodings[0].package, "d");
         assert_eq!(context.encodings[0].map["rust"].ty, "acme::X");
-        assert_eq!(context.used, Some(BTreeSet::from([annotations::DEFAULT_FORMAT.to_string()])));
+        assert_eq!(
+            context.used,
+            Some(BTreeSet::from([annotations::DEFAULT_FORMAT.to_string()]))
+        );
     }
 }

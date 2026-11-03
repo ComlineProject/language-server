@@ -7,7 +7,11 @@ use crate::util::{byte_range_to_lsp_range, position_to_offset};
 use lsp_types::{GotoDefinitionResponse, Location, Position, Url};
 
 /// Find the definition of a symbol at a position, considering only this file.
-pub fn find_definition(source: &str, uri: &Url, position: Position) -> Option<GotoDefinitionResponse> {
+pub fn find_definition(
+    source: &str,
+    uri: &Url,
+    position: Position,
+) -> Option<GotoDefinitionResponse> {
     find_definition_with_project::<(Url, String)>(source, uri, position, &[])
 }
 
@@ -42,7 +46,9 @@ pub fn find_definition_with_project<S: ProjectSource>(
     let active = project.index_of(uri)?;
     let target = project.target_at_cursor(active, source, offset)?;
 
-    project.declaration(&target).map(GotoDefinitionResponse::Scalar)
+    project
+        .declaration(&target)
+        .map(GotoDefinitionResponse::Scalar)
 }
 
 /// The definition of a module path segment at `offset`: the start of its
@@ -59,13 +65,16 @@ fn module_definition<S: ProjectSource>(
     let project = Project::with_active(uri, source, other_files);
     let (namespace, _) = modules::path_module_at(source, uri, offset, &project)?;
     let doc = project.docs.iter().find(|d| d.namespace == namespace)?;
-    Some(Location { uri: doc.uri.clone(), range: byte_range_to_lsp_range(doc.source, 0, 0) })
+    Some(Location {
+        uri: doc.uri.clone(),
+        range: byte_range_to_lsp_range(doc.source, 0, 0),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn a_type_reference_goes_to_the_declaration_not_a_settings_preset() {
         // Keyed by name, a `Target` could not tell the two apart, so this
@@ -98,19 +107,19 @@ struct Request {
 }
 "#;
         let uri = Url::parse("file:///test.ids").unwrap();
-        
+
         // Click on "User" in "user: User" (line 6, around column 11)
         let position = Position::new(6, 11);
-        
+
         let result = find_definition(source, &uri, position);
         assert!(result.is_some());
-        
+
         if let Some(GotoDefinitionResponse::Scalar(location)) = result {
             // Should point to the User struct definition on line 1
             assert_eq!(location.range.start.line, 1);
         }
     }
-    
+
     #[test]
     fn test_goto_definition_enum() {
         let source = r#"
@@ -124,14 +133,14 @@ struct Task {
 }
 "#;
         let uri = Url::parse("file:///test.ids").unwrap();
-        
+
         // Click on "Status" in "status: Status"
         let position = Position::new(7, 13);
-        
+
         let result = find_definition(source, &uri, position);
         assert!(result.is_some());
     }
-    
+
     #[test]
     fn test_goto_definition_on_declaration() {
         let source = r#"
@@ -140,14 +149,17 @@ struct User {
 }
 "#;
         let uri = Url::parse("file:///test.ids").unwrap();
-        
+
         // Click on "User" in the declaration itself
         let position = Position::new(1, 8);
-        
+
         let result = find_definition(source, &uri, position);
-        assert!(result.is_some(), "Should return definition even when clicking on declaration itself");
+        assert!(
+            result.is_some(),
+            "Should return definition even when clicking on declaration itself"
+        );
     }
-    
+
     #[test]
     fn test_goto_definition_not_found() {
         let source = r#"
@@ -156,15 +168,15 @@ struct User {
 }
 "#;
         let uri = Url::parse("file:///test.ids").unwrap();
-        
+
         // Click on "string" (primitive type - no definition)
         let position = Position::new(2, 11);
-        
+
         let result = find_definition(source, &uri, position);
         // Should return None for primitive types
         assert!(result.is_none());
     }
-    
+
     fn scalar(result: Option<GotoDefinitionResponse>) -> lsp_types::Location {
         match result.expect("should resolve a definition") {
             GotoDefinitionResponse::Scalar(location) => location,
@@ -174,7 +186,8 @@ struct User {
 
     #[test]
     fn test_goto_definition_in_another_file_via_use() {
-        let chat_source = "use types::Message\n\nprotocol Chat {\n    function send() -> Message;\n}\n";
+        let chat_source =
+            "use types::Message\n\nprotocol Chat {\n    function send() -> Message;\n}\n";
         let types_source = "struct Message {\n    text: string\n}\n";
 
         let chat_uri = Url::parse("file:///chat.ids").unwrap();
@@ -207,7 +220,10 @@ struct User {
             active_source,
             &active_uri,
             Position::new(3, 20),
-            &[(a_uri, a_source.to_string()), (b_uri.clone(), b_source.to_string())],
+            &[
+                (a_uri, a_source.to_string()),
+                (b_uri.clone(), b_source.to_string()),
+            ],
         ));
 
         assert_eq!(location.uri, b_uri);
@@ -215,8 +231,10 @@ struct User {
 
     #[test]
     fn test_goto_definition_through_an_as_alias() {
-        let active_source = "use types::Message as Msg\n\nprotocol P {\n    function f() -> Msg;\n}\n";
-        let types_source = "struct Other {\n    x: bool\n}\n\nstruct Message {\n    text: string\n}\n";
+        let active_source =
+            "use types::Message as Msg\n\nprotocol P {\n    function f() -> Msg;\n}\n";
+        let types_source =
+            "struct Other {\n    x: bool\n}\n\nstruct Message {\n    text: string\n}\n";
 
         let active_uri = Url::parse("file:///active.ids").unwrap();
         let types_uri = Url::parse("file:///types.ids").unwrap();
@@ -229,7 +247,10 @@ struct User {
         ));
 
         assert_eq!(location.uri, types_uri);
-        assert_eq!(location.range.start.line, 4, "should land on `Message`, not `Other`");
+        assert_eq!(
+            location.range.start.line, 4,
+            "should land on `Message`, not `Other`"
+        );
     }
 
     #[test]
@@ -313,7 +334,12 @@ struct User {
         let chat_uri = Url::parse("file:///pkg/src/chat.ids").unwrap();
         let others = package_with_dependency("file:///pkg/src/chat.ids");
 
-        let location = scalar(find_definition_with_project(chat, &chat_uri, Position::new(3, 8), &others));
+        let location = scalar(find_definition_with_project(
+            chat,
+            &chat_uri,
+            Position::new(3, 8),
+            &others,
+        ));
         assert_eq!(location.uri.as_str(), "file:///shared/src/models.ids");
         assert_eq!(location.range.start.line, 1);
     }
@@ -321,7 +347,10 @@ struct User {
     // ---- go-to-definition on a module path segment ----
 
     fn local(path: &str, text: &str) -> crate::analysis::source::SourceFile {
-        crate::analysis::source::SourceFile::local(Url::parse(&format!("file:///pkg/{path}")).unwrap(), text.to_string())
+        crate::analysis::source::SourceFile::local(
+            Url::parse(&format!("file:///pkg/{path}")).unwrap(),
+            text.to_string(),
+        )
     }
 
     /// The files of a multi-schema package, plus std.
@@ -331,7 +360,9 @@ struct User {
             local("src/api.ids", "struct Root {\n    id: u64\n}\n"),
             local("src/api/common.ids", "struct Error {\n    code: u32\n}\n"),
         ];
-        files.extend(crate::analysis::stdlib::files(&crate::analysis::stdlib::root()));
+        files.extend(crate::analysis::stdlib::files(
+            &crate::analysis::stdlib::root(),
+        ));
         files
     }
 
@@ -349,7 +380,8 @@ struct User {
 
     #[test]
     fn a_module_segment_jumps_to_its_own_schema_file() {
-        let location = definition_in("chat.ids", "use types::User\n", "types").expect("module definition");
+        let location =
+            definition_in("chat.ids", "use types::User\n", "types").expect("module definition");
         assert_eq!(location.uri.as_str(), "file:///pkg/src/types.ids");
         assert_eq!(location.range.start, Position::new(0, 0));
     }
@@ -357,7 +389,8 @@ struct User {
     #[test]
     fn a_std_module_segment_jumps_to_its_virtual_file() {
         let source = "use std::validators::StringBounds\n";
-        let location = definition_in("chat.ids", source, "validators").expect("std module definition");
+        let location =
+            definition_in("chat.ids", source, "validators").expect("std module definition");
         assert_eq!(location.uri.as_str(), "comline-std:/validators.ids");
     }
 
@@ -373,7 +406,8 @@ struct User {
     fn a_directory_with_its_own_schema_jumps_to_it() {
         // `api` has both a schema (`api.ids`) and a deeper module
         // (`api::common`) - the schema is what a jump lands on.
-        let location = definition_in("chat.ids", "use api::common::Error\n", "api").expect("api.ids exists");
+        let location =
+            definition_in("chat.ids", "use api::common::Error\n", "api").expect("api.ids exists");
         assert_eq!(location.uri.as_str(), "file:///pkg/src/api.ids");
     }
 
@@ -382,7 +416,10 @@ struct User {
         // `api::v1` here has no schema of its own, only a deeper one
         // (`api::v1::user`) - same shape as `std` itself above, just
         // within the package being edited rather than a dependency.
-        let files = vec![local("src/api/v1/user.ids", "struct Profile {\n    id: u64\n}\n")];
+        let files = vec![local(
+            "src/api/v1/user.ids",
+            "struct Profile {\n    id: u64\n}\n",
+        )];
         let uri = Url::parse("file:///pkg/src/chat.ids").unwrap();
         let source = "use api::v1::user::Profile\n";
         let offset = source.find("v1").unwrap();
@@ -395,15 +432,20 @@ struct User {
         // `Request` here could be mistaken for a module segment (it's the
         // last segment of a `::` path) - it must still resolve as the
         // struct declaration, not as a (nonexistent) module.
-        let location =
-            definition_in("chat.ids", "use std::http::Request\n", "Request").expect("declaration, not module");
+        let location = definition_in("chat.ids", "use std::http::Request\n", "Request")
+            .expect("declaration, not module");
         assert_eq!(location.uri.as_str(), "comline-std:/http.ids");
-        assert_ne!(location.range.start, Position::new(0, 0), "lands on Request's own declaration, not the file start");
+        assert_ne!(
+            location.range.start,
+            Position::new(0, 0),
+            "lands on Request's own declaration, not the file start"
+        );
     }
 
     #[test]
     fn a_whole_namespace_import_names_a_module_at_the_end() {
-        let location = definition_in("chat.ids", "use types\n", "types").expect("lone word on a use line");
+        let location =
+            definition_in("chat.ids", "use types\n", "types").expect("lone word on a use line");
         assert_eq!(location.uri.as_str(), "file:///pkg/src/types.ids");
     }
 
@@ -423,7 +465,10 @@ struct User {
         let position = crate::util::offset_to_position(source, offset);
 
         let location = scalar(find_definition(source, &uri, position));
-        assert_eq!(location.range.start.line, 0, "jumps to the validator's own declaration");
+        assert_eq!(
+            location.range.start.line, 0,
+            "jumps to the validator's own declaration"
+        );
     }
 
     #[test]
@@ -434,7 +479,10 @@ struct User {
         let position = crate::util::offset_to_position(source, offset);
 
         let location = scalar(find_definition(source, &uri, position));
-        assert_eq!(location.range.start.line, 0, "jumps to the error's own declaration");
+        assert_eq!(
+            location.range.start.line, 0,
+            "jumps to the error's own declaration"
+        );
     }
 
     #[test]
@@ -462,12 +510,13 @@ struct User {
         let offset = source.rfind("StringBounds").unwrap();
         let position = crate::util::offset_to_position(source, offset);
 
-        let location = match find_definition_with_project(source, &uri, position, &documented_package())
-            .expect("validator declaration")
-        {
-            GotoDefinitionResponse::Scalar(location) => location,
-            other => panic!("expected a scalar location, got {other:?}"),
-        };
+        let location =
+            match find_definition_with_project(source, &uri, position, &documented_package())
+                .expect("validator declaration")
+            {
+                GotoDefinitionResponse::Scalar(location) => location,
+                other => panic!("expected a scalar location, got {other:?}"),
+            };
         assert_eq!(location.uri.as_str(), "comline-std:/validators.ids");
     }
 }

@@ -25,7 +25,11 @@ use crate::analysis::source::ProjectSource;
 use crate::parser;
 
 /// Validator names for an entry of the list.
-pub(super) fn names<S: ProjectSource>(source: &str, uri: &Url, other_files: &[S]) -> Vec<CompletionItem> {
+pub(super) fn names<S: ProjectSource>(
+    source: &str,
+    uri: &Url,
+    other_files: &[S],
+) -> Vec<CompletionItem> {
     let siblings = Project::new(other_files.iter());
     let mut items = Vec::new();
     // Names in scope here, so nothing is offered twice.
@@ -33,7 +37,11 @@ pub(super) fn names<S: ProjectSource>(source: &str, uri: &Url, other_files: &[S]
 
     for validator in local_validators(source) {
         if in_scope.insert(validator.name()) {
-            items.push(item(&validator, validator.name(), "declared here".to_string()));
+            items.push(item(
+                &validator,
+                validator.name(),
+                "declared here".to_string(),
+            ));
         }
     }
 
@@ -42,7 +50,9 @@ pub(super) fn names<S: ProjectSource>(source: &str, uri: &Url, other_files: &[S]
     for (sibling, label, real) in imported_validators(&siblings, source, uri) {
         imported.insert((sibling, real.clone()));
         let doc = &siblings.docs[sibling];
-        let Some(validator) = declared(doc, &real) else { continue };
+        let Some(validator) = declared(doc, &real) else {
+            continue;
+        };
         if in_scope.insert(label.clone()) {
             let detail = match label == real {
                 true => format!("from {}", origin(doc)),
@@ -59,7 +69,11 @@ pub(super) fn names<S: ProjectSource>(source: &str, uri: &Url, other_files: &[S]
                 continue;
             }
             let path = format!("{}::{}", doc.namespace.join("::"), name);
-            let mut item = item(validator, name.clone(), format!("from {} — adds `use {path}`", origin(doc)));
+            let mut item = item(
+                validator,
+                name.clone(),
+                format!("from {} — adds `use {path}`", origin(doc)),
+            );
             // After everything in scope; a dependency's after the package's own.
             item.sort_text = Some(match doc.dependency {
                 Some(_) => format!("~~{name}"),
@@ -111,7 +125,11 @@ pub(super) fn arguments<S: ProjectSource>(
                 documentation: p.docstring().map(lsp_types::Documentation::String),
                 insert_text: Some(format!("{} = ", p.name())),
                 // Required ones first.
-                sort_text: Some(format!("{}{}", u8::from(p.default_value().is_some()), p.name())),
+                sort_text: Some(format!(
+                    "{}{}",
+                    u8::from(p.default_value().is_some()),
+                    p.name()
+                )),
                 ..Default::default()
             }
         })
@@ -121,10 +139,15 @@ pub(super) fn arguments<S: ProjectSource>(
 /// Validators a `use` here imports, as (file, name in scope here, declared
 /// name). A glob or whole-namespace `use` brings in no validator - core only
 /// expands those to types, protocols and consts.
-fn imported_validators(siblings: &Project, source: &str, uri: &Url) -> Vec<(usize, String, String)> {
+fn imported_validators(
+    siblings: &Project,
+    source: &str,
+    uri: &Url,
+) -> Vec<(usize, String, String)> {
     let mut found = Vec::new();
     for use_decl in uses_in(source, uri) {
-        let Target::Found(sibling, remaining) = import_check::target_of(siblings, None, &use_decl) else {
+        let Target::Found(sibling, remaining) = import_check::target_of(siblings, None, &use_decl)
+        else {
             continue; // can't list what a file outside the project declares
         };
         let doc = &siblings.docs[sibling];
@@ -139,7 +162,11 @@ fn imported_validators(siblings: &Project, source: &str, uri: &Url) -> Vec<(usiz
         } else if !remaining.is_empty() {
             let real = remaining.join("::");
             if declares_validator(doc, &real) {
-                found.push((sibling, use_decl.alias.clone().unwrap_or_else(|| real.clone()), real));
+                found.push((
+                    sibling,
+                    use_decl.alias.clone().unwrap_or_else(|| real.clone()),
+                    real,
+                ));
             }
         }
     }
@@ -152,13 +179,23 @@ fn local_validators(source: &str) -> Vec<Validator> {
     let cleaned = super::strip_comments_and_strings(source);
     let mut found = Vec::new();
     for (start, _) in cleaned.match_indices("validator") {
-        let at_line_start = cleaned[..start].rsplit('\n').next().is_some_and(|before| before.trim().is_empty());
+        let at_line_start = cleaned[..start]
+            .rsplit('\n')
+            .next()
+            .is_some_and(|before| before.trim().is_empty());
         let word_ends = cleaned[start + "validator".len()..].starts_with(char::is_whitespace);
         if !at_line_start || !word_ends {
             continue;
         }
-        let Some(end) = block_end(&cleaned, start) else { continue };
-        let Some(document) = parser::parse(&source[start..end]).ok().and_then(|r| r.document) else { continue };
+        let Some(end) = block_end(&cleaned, start) else {
+            continue;
+        };
+        let Some(document) = parser::parse(&source[start..end])
+            .ok()
+            .and_then(|r| r.document)
+        else {
+            continue;
+        };
         found.extend(document.0.into_iter().filter_map(|decl| match decl.value {
             Declaration::Validator(v) => Some(v),
             _ => None,
@@ -214,14 +251,20 @@ fn item(validator: &Validator, label: String, detail: String) -> CompletionItem 
         .join(", ");
 
     let snippet = (!required.is_empty()).then(|| {
-        let args: Vec<String> =
-            required.iter().enumerate().map(|(i, name)| format!("{name} = ${{{}}}", i + 1)).collect();
+        let args: Vec<String> = required
+            .iter()
+            .enumerate()
+            .map(|(i, name)| format!("{name} = ${{{}}}", i + 1))
+            .collect();
         format!("{label}({})", args.join(", "))
     });
 
     CompletionItem {
         kind: Some(CompletionItemKind::FUNCTION),
-        detail: Some(format!("validator {}({signature}) — {detail}", validator.name())),
+        detail: Some(format!(
+            "validator {}({signature}) — {detail}",
+            validator.name()
+        )),
         documentation: validator.docstring().map(lsp_types::Documentation::String),
         insert_text_format: snippet.as_ref().map(|_| InsertTextFormat::SNIPPET),
         insert_text: snippet,
