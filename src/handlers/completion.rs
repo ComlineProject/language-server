@@ -1169,36 +1169,81 @@ fn effective_settings<S: ProjectSource>(
     effective_schema_settings(&package, &schema)
 }
 
+/// The snippet an annotation's dictionary form inserts, when it has one with
+/// keys beyond the required: every key, each its own tab-stop, values as
+/// choice lists (`@handshake = { name = "comline@2", scope = protocol, ... }`).
+/// The plain completion inserts the plainest form; this one is offered
+/// beside it, so the parameters can be found without the docs.
+fn dict_form_insert_text(info: &annotations::AnnotationInfo) -> Option<String> {
+    let ValueType::AnyOf(types) = &info.value else {
+        return None;
+    };
+    let keys = types.iter().find_map(|t| match t {
+        ValueType::Dict(keys) if keys.iter().any(|k| !k.required) => Some(*keys),
+        _ => None,
+    })?;
+    let entries: Vec<String> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| match value_snippet(&k.value, i + 1) {
+            Some(value) => format!("{} = {value}", k.key),
+            None => k.key.to_string(),
+        })
+        .collect();
+    Some(format!("{} = {{ {} }}$0", info.key, entries.join(", ")))
+}
+
 fn get_annotation_completions(
     scope: AnnotationScope,
     effective: &comline_core::settings::SettingsDict,
 ) -> Vec<CompletionItem> {
     annotations::for_scope(scope)
-        .map(|info| {
-            let snippet = annotation_insert_text(info);
-            let forbidden = forbidding_key(info.key, scope, effective);
-            CompletionItem {
-                label: info.key.to_string(),
-                kind: Some(CompletionItemKind::PROPERTY),
-                detail: Some(match &forbidden {
-                    Some(key) => format!("forbidden here by `{key}` — {}", info.description),
-                    None => info.description.to_string(),
-                }),
-                // Shown but marked, not hidden: the settings forbidding it
-                // may well be the thing the author wants to change, and a
-                // key that silently vanishes from the list is not a usable
-                // explanation of why.
-                tags: forbidden
-                    .as_ref()
-                    .map(|_| vec![lsp_types::CompletionItemTag::DEPRECATED]),
-                insert_text_format: snippet
-                    .as_ref()
-                    .map(|_| lsp_types::InsertTextFormat::SNIPPET),
-                insert_text: snippet,
-                ..Default::default()
-            }
+        .flat_map(|info| {
+            let plain = annotation_completion(info, scope, effective, annotation_insert_text(info));
+            let dict = dict_form_insert_text(info).map(|snippet| {
+                let mut item = annotation_completion(info, scope, effective, Some(snippet));
+                item.label = format!("{} {{ … }}", info.key);
+                item.filter_text = Some(info.key.to_string());
+                item.sort_text = Some(format!("{}~", info.key));
+                item.detail = item
+                    .detail
+                    .map(|d| format!("dictionary form, with every key: {d}"));
+                item
+            });
+            std::iter::once(plain).chain(dict)
         })
         .collect()
+}
+
+/// One completion item for `@key`, inserting `snippet`, marked when the
+/// effective settings forbid it here.
+fn annotation_completion(
+    info: &annotations::AnnotationInfo,
+    scope: AnnotationScope,
+    effective: &comline_core::settings::SettingsDict,
+    snippet: Option<String>,
+) -> CompletionItem {
+    let forbidden = forbidding_key(info.key, scope, effective);
+    CompletionItem {
+        label: info.key.to_string(),
+        kind: Some(CompletionItemKind::PROPERTY),
+        detail: Some(match &forbidden {
+            Some(key) => format!("forbidden here by `{key}` — {}", info.description),
+            None => info.description.to_string(),
+        }),
+        // Shown but marked, not hidden: the settings forbidding it
+        // may well be the thing the author wants to change, and a
+        // key that silently vanishes from the list is not a usable
+        // explanation of why.
+        tags: forbidden
+            .as_ref()
+            .map(|_| vec![lsp_types::CompletionItemTag::DEPRECATED]),
+        insert_text_format: snippet
+            .as_ref()
+            .map(|_| lsp_types::InsertTextFormat::SNIPPET),
+        insert_text: snippet,
+        ..Default::default()
+    }
 }
 
 /// The settings key that forbids `@key` at `scope`, if one does.
@@ -1790,7 +1835,7 @@ mod tests {
         let framing = annotations::lookup("framing").unwrap();
         assert_eq!(
             annotation_insert_text(framing).as_deref(),
-            Some("framing = \"${1|jsonrpc,datagram,datagram@2|}\"$0")
+            Some("framing = \"${1|jsonrpc,datagram,datagram@2,datagram@3|}\"$0")
         );
         const KEYS: &[DictKey] = &[
             DictKey {
@@ -1965,6 +2010,36 @@ mod tests {
             settings_insert_text(&["level"], &level.value).contains("allow,hint"),
             "a level key offers the level set, not a boolean"
         );
+    }
+
+    #[test]
+    fn handshakes_dictionary_form_is_offered_with_every_parameter() {
+        let info = annotations::lookup("handshake").expect("handshake is an annotation");
+        let plain = annotation_insert_text(info).unwrap();
+        assert!(
+            plain.starts_with("handshake = \"${1|") && plain.contains("comline@2"),
+            "{plain}"
+        );
+        let dict = dict_form_insert_text(info).expect("handshake has a dictionary form");
+        assert!(dict.starts_with("handshake = { name = \"${1|"), "{dict}");
+        for part in [
+            "scope = ${2|protocol,package|}",
+            "newer_consumer = ${3|degrade,refuse|}",
+            "same_version_differs = ${4|refuse,warn|}",
+            "exchange = ${5|offer,symmetric|}",
+        ] {
+            assert!(dict.contains(part), "{part} missing from {dict}");
+        }
+        // Offered beside the plain form, under the same name.
+        let items = get_annotation_completions(AnnotationScope::Leading, &Default::default());
+        let forms: Vec<&CompletionItem> = items
+            .iter()
+            .filter(|c| c.filter_text.as_deref().unwrap_or(&c.label) == "handshake")
+            .collect();
+        assert_eq!(forms.len(), 2, "{forms:?}");
+        // An annotation with no optional keys has only the plain form.
+        let deprecated = annotations::lookup("deprecated").unwrap();
+        assert_eq!(dict_form_insert_text(deprecated), None);
     }
 
     #[test]

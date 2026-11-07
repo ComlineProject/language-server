@@ -110,7 +110,7 @@ impl Context {
             base_dir,
             ..Default::default()
         };
-        let mut wire_format = annotations::DEFAULT_FORMAT.to_string();
+        let mut wire = source::DeclaredWire::default();
         let mut schemas = Vec::new();
         let mut complete = true;
         for file in files {
@@ -123,7 +123,7 @@ impl Context {
                 if file.dependency().is_none() {
                     context.has_manifest = true;
                     context.languages = source::declared_languages(text);
-                    wire_format = source::declared_wire_format(text);
+                    wire = source::declared_wire(text);
                 }
                 context
                     .encodings
@@ -163,7 +163,19 @@ impl Context {
             }
         }
         if complete {
-            context.used = Some(comline_codegen::encodings::used(&schemas, &wire_format));
+            source::apply_package_wire(&mut schemas, &wire);
+            // A declared framing's grammar is in its profile file, which the
+            // editor doesn't read: only the official ones are known to write
+            // JSON here.
+            let writes_json = |framing: &str| {
+                official::profile(EncodingKind::Framing, framing)
+                    .is_some_and(|profile| profile.grammar().as_deref() == Some("json"))
+            };
+            context.used = Some(comline_codegen::encodings::used(
+                &schemas,
+                &wire.format,
+                &writes_json,
+            ));
         }
         context
     }
@@ -571,7 +583,7 @@ impl Walk<'_, '_> {
     ) {
         let parent = &path[..path.len() - 1];
         if key == "default_framing" && (parent == ["generate"] || target.is_some()) {
-            let written = item.as_str().unwrap_or("datagram@2");
+            let written = item.as_str().unwrap_or(annotations::DEFAULT_FRAMING);
             let framing = annotations::canonical_value("framing", written).unwrap_or(written);
             let span = item.span().map(|v| (span.0, v.end)).unwrap_or(span);
             self.problem(
@@ -580,8 +592,9 @@ impl Walk<'_, '_> {
                 format!(
                     "`default_framing` moved from {} to config.idp\n  help: drop it here, and declare the \
                      package's framing in config.idp:\n      wire = {{ framing = \"{framing}\" }}\n  Protocols \
-                     with no `@framing` default to `datagram@2` without it.",
-                    config::FILE_NAME
+                     with no `@framing` default to `{}` without it.",
+                    config::FILE_NAME,
+                    annotations::DEFAULT_FRAMING
                 ),
                 Some(json!({ "fix": FIX_REPLACE, "candidates": [], "remove_line": true })),
             );
@@ -1060,6 +1073,9 @@ fn semantic(analysis: &mut Analysis, context: &Context) {
                 map: e.map.clone(),
                 establishes: Vec::new(),
                 has_vectors: false,
+                grammar: None,
+                calls: None,
+                directions: None,
             })
             .collect();
         let overrides = |target: Option<usize>| {
@@ -1073,6 +1089,8 @@ fn semantic(analysis: &mut Analysis, context: &Context) {
                         type_path: e.text.clone().unwrap_or_default(),
                         package: None,
                         version: None,
+                        grammar: None,
+                        calls: None,
                     };
                     (comline_codegen::encodings::canonical(&name), mapping)
                 })
@@ -1497,6 +1515,47 @@ mod tests {
         assert_eq!(
             context.used,
             Some(BTreeSet::from([annotations::DEFAULT_FORMAT.to_string()]))
+        );
+    }
+
+    #[test]
+    fn a_package_taking_the_defaults_uses_datagram3_and_comline2() {
+        use crate::analysis::source::SourceFile;
+        let used = |config: &str, schema: &str| {
+            let files = vec![
+                SourceFile::local(
+                    Url::parse("file:///p/config.idp").unwrap(),
+                    format!("congregation p\n{config}"),
+                ),
+                SourceFile::local(
+                    Url::parse("file:///p/src/app.ids").unwrap(),
+                    schema.to_string(),
+                ),
+            ];
+            Context::from_files(&files, None).used.unwrap()
+        };
+        let set = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<BTreeSet<_>>();
+        let plain = "protocol Chat {\n    function ping();\n}\n";
+        assert_eq!(
+            used("", plain),
+            set(&["packed@1", "datagram@3", "comline@2"])
+        );
+        // The old framing stated keeps the old handshake.
+        assert_eq!(
+            used("wire = { framing = \"datagram@2\" }\n", plain),
+            set(&["packed@1", "datagram@2", "comline@1"])
+        );
+        // A protocol off `datagram@3` keeps `comline@1` for the package.
+        let mixed = "protocol Chat {\n    function ping();\n}\n\
+            @framing = \"jsonrpc\"\nprotocol Rpc {\n    function ping();\n}\n";
+        assert_eq!(
+            used("", mixed),
+            set(&["packed@1", "json@1", "jsonrpc", "datagram@3", "comline@1"])
+        );
+        // A stated handshake wins.
+        assert_eq!(
+            used("handshake = \"none\"\n", plain),
+            set(&["packed@1", "datagram@3"])
         );
     }
 }

@@ -1700,6 +1700,57 @@ struct User {
         );
     }
 
+    /// `@handshake`'s dictionary form: `comline@2`'s parameters are checked
+    /// as the build checks them, with core's sentence, where it's written.
+    #[test]
+    fn a_bad_handshake_parameter_is_reported_where_its_written() {
+        let manifest = "congregation pkg\nspecification_version = 1\n";
+        let good = "@handshake = { name = \"comline@2\", newer_consumer = refuse, exchange = \"symmetric\" }\n\
+            protocol Chat {\n    function ping() -> string;\n}\n";
+        let found =
+            project_messages(&[(MANIFEST_URI, manifest), ("file:///pkg/src/chat.ids", good)]);
+        assert!(found.is_empty(), "{found:?}");
+
+        for (written, says) in [
+            (
+                "scope = bogus",
+                "handshake `comline@2`'s `scope` can't be `bogus`",
+            ),
+            (
+                "speed = fast",
+                "`speed` isn't a parameter of handshake `comline@2`",
+            ),
+        ] {
+            let chat = format!(
+                "protocol Other {{\n    function a();\n}}\n\
+                 @handshake = {{ name = \"comline@2\", {written} }}\n\
+                 protocol Chat {{\n    function ping() -> string;\n}}\n"
+            );
+            let found = project_messages(&[
+                (MANIFEST_URI, manifest),
+                ("file:///pkg/src/chat.ids", &chat),
+            ]);
+            let hit = found.iter().find(|(msg, ..)| msg.contains(says));
+            assert!(hit.is_some(), "{written}: {found:?}");
+            assert_eq!(
+                hit.unwrap().2,
+                3,
+                "{written}: on the `@handshake` line, {found:?}"
+            );
+        }
+
+        let chat = "@handshake = { name = \"comline@1\", scope = package }\n\
+            protocol Chat {\n    function ping() -> string;\n}\n";
+        let found =
+            project_messages(&[(MANIFEST_URI, manifest), ("file:///pkg/src/chat.ids", chat)]);
+        assert!(
+            found
+                .iter()
+                .any(|(msg, ..)| msg.contains("handshake `comline@1` takes no parameters")),
+            "{found:?}"
+        );
+    }
+
     /// A manifest that allows `@framing` and declares one namespaced
     /// encoding of each kind.
     const ENCODINGS_MANIFEST: &str = "congregation pkg\nspecification_version = 1\n\

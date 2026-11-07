@@ -1005,8 +1005,12 @@ impl Backend {
                         document.uri.to_file_path().ok().as_deref(),
                     ) {
                         if !lsp_diagnostics.iter().any(|d| d.message == message) {
+                            let (start, end) = crate::analysis::source::manifest_error_span(
+                                &document.text,
+                                &message,
+                            );
                             lsp_diagnostics.push(Diagnostic {
-                                range: byte_range_to_lsp_range(&document.text, 0, 0),
+                                range: byte_range_to_lsp_range(&document.text, start, end),
                                 severity: Some(DiagnosticSeverity::ERROR),
                                 source: Some("comline".to_string()),
                                 message,
