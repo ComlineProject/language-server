@@ -273,6 +273,27 @@ pub fn manifest_error(manifest: &str, path: Option<&std::path::Path>) -> Option<
         .map(|e| e.to_string())
 }
 
+/// Where in `manifest` a [`manifest_error`] belongs: the top-level entry it's
+/// about when that's `handshake` (its name or parameters), else the start
+/// of the file.
+pub fn manifest_error_span(manifest: &str, message: &str) -> (usize, usize) {
+    let about = "handshake";
+    if !message.contains(about) {
+        return (0, 0);
+    }
+    parser::parse_idp(manifest)
+        .ok()
+        .and_then(|r| r.document)
+        .and_then(|congregation| {
+            congregation
+                .assignments
+                .iter()
+                .find(|a| a.value.key.text() == about)
+                .map(|a| a.span)
+        })
+        .unwrap_or((0, 0))
+}
+
 /// `congregation` without its `encodings` key. Core freezes an encoding by
 /// reading its profile from the package directory, which the text alone
 /// doesn't have, so the key is left out wherever only other keys matter.
@@ -381,25 +402,100 @@ pub fn declared_encoding_details(manifest: &str) -> Vec<DeclaredEncoding> {
     declared
 }
 
-/// The wire format `config.idp`'s text declares (`wire = { format = ... }`),
-/// or the default when it declares none or doesn't interpret.
-pub fn declared_wire_format(manifest: &str) -> String {
+/// What `config.idp` states about the wire, read as core reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredWire {
+    /// `wire.format`, else core's default.
+    pub format: String,
+    /// `wire.framing`, else core's default.
+    pub framing: String,
+    /// `handshake`, by name, if the package states one.
+    pub handshake: Option<String>,
+}
+
+impl Default for DeclaredWire {
+    fn default() -> Self {
+        use comline_core::schema::idl::annotations::{DEFAULT_FORMAT, DEFAULT_FRAMING};
+        DeclaredWire {
+            format: DEFAULT_FORMAT.to_string(),
+            framing: DEFAULT_FRAMING.to_string(),
+            handshake: None,
+        }
+    }
+}
+
+/// The wire `config.idp`'s text declares (`wire = { format = ... framing =
+/// ... }`, `handshake`), core's defaults for what it leaves out or when it
+/// doesn't interpret.
+pub fn declared_wire(manifest: &str) -> DeclaredWire {
     use comline_core::package::config::idl::grammar::Key;
     use comline_core::package::config::ir::context::ProjectContext;
     use comline_core::package::config::ir::frozen;
     use comline_core::package::config::ir::interpreter::interpret::interpret_context;
 
-    let default = || comline_core::schema::idl::annotations::DEFAULT_FORMAT.to_string();
     let Some(mut congregation) = parser::parse_idp(manifest).ok().and_then(|r| r.document) else {
-        return default();
+        return DeclaredWire::default();
     };
     congregation
         .assignments
         .retain(|a| !matches!(&a.value.key, Key::Identifier(id) if id.value == "settings"));
     without_encodings(&mut congregation);
     match interpret_context(&ProjectContext::with_config(congregation), None) {
-        Ok(units) => frozen::wire_format(&units).to_string(),
-        Err(_) => default(),
+        Ok(units) => DeclaredWire {
+            format: frozen::wire_format(&units).to_string(),
+            framing: frozen::wire_framing(&units).to_string(),
+            handshake: frozen::stated_handshake(&units).map(str::to_string),
+        },
+        Err(_) => DeclaredWire::default(),
+    }
+}
+
+/// Freeze the package's framing and handshake into every protocol of
+/// `schemas` that doesn't write its own, as core does when it compiles the
+/// package: without a package handshake, `comline@2` only where every
+/// protocol is on `datagram@3` (`annotations::package_default_handshake`).
+/// Schemas read straight from their declarations lack them, and an absent
+/// one would read as the implicit `datagram@2` / `comline@1`.
+pub fn apply_package_wire(
+    schemas: &mut [(
+        String,
+        Vec<comline_core::schema::ir::frozen::unit::FrozenUnit>,
+    )],
+    wire: &DeclaredWire,
+) {
+    use comline_core::schema::idl::annotations::package_default_handshake;
+    use comline_core::schema::ir::frozen::unit::{ConfigValue, FrozenUnit};
+
+    let handshake = match &wire.handshake {
+        Some(handshake) => handshake.clone(),
+        None => {
+            let protocols = schemas
+                .iter()
+                .flat_map(|(_, units)| units)
+                .filter_map(|u| match u {
+                    FrozenUnit::Protocol { parameters, .. } => Some(parameters.as_slice()),
+                    _ => None,
+                });
+            package_default_handshake(protocols, &wire.framing).to_string()
+        }
+    };
+    for (_, units) in schemas.iter_mut() {
+        for unit in units.iter_mut() {
+            let FrozenUnit::Protocol { parameters, .. } = unit else {
+                continue;
+            };
+            for (key, value) in [("framing", &wire.framing), ("handshake", &handshake)] {
+                if !parameters
+                    .iter()
+                    .any(|p| matches!(p, FrozenUnit::Property { name, .. } if name == key))
+                {
+                    parameters.push(FrozenUnit::Property {
+                        name: key.to_string(),
+                        value: ConfigValue::Str(value.clone()),
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -752,5 +848,36 @@ mod tests {
             .expect("a namespaced value should resolve to Some")
             .expect_err("the middle segment must be literally 'settings'");
         assert!(err.contains("<dependency>::settings::<name>"), "got: {err}");
+    }
+
+    #[test]
+    fn a_bad_handshake_parameter_in_the_manifest_is_core_s_sentence_at_handshake() {
+        let base = "congregation app\nspecification_version = 1\n";
+        let good = format!("{base}handshake = {{ name = \"comline@2\" scope = \"package\" exchange = symmetric }}\n");
+        assert_eq!(manifest_error(&good, None), None);
+        for (written, says) in [
+            (
+                "scope = \"bogus\"",
+                "handshake `comline@2`'s `scope` can't be `bogus`",
+            ),
+            (
+                "speed = \"fast\"",
+                "`speed` isn't a parameter of handshake `comline@2`",
+            ),
+        ] {
+            let manifest = format!("{base}handshake = {{ name = \"comline@2\" {written} }}\n");
+            let err = manifest_error(&manifest, None).expect(written);
+            assert!(err.contains(says), "{err}");
+            let (start, end) = manifest_error_span(&manifest, &err);
+            assert!(
+                manifest[start..end].starts_with("handshake = {"),
+                "{:?}",
+                &manifest[start..end]
+            );
+        }
+        let manifest =
+            format!("{base}handshake = {{ name = \"comline@1\" scope = \"package\" }}\n");
+        let err = manifest_error(&manifest, None).expect("comline@1 takes none");
+        assert!(err.contains("takes no parameters"), "{err}");
     }
 }

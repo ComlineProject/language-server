@@ -12,6 +12,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 
 use comline_core::inspect::{self, Acceptance, ProtocolSummary, Source};
+use comline_core::schema::idl::annotations::{self, HandshakeValue};
 use comline_core::schema::idl::grammar::{Declaration, Document};
 use lsp_types::{Hover, HoverContents, MarkedString, Position, Url};
 
@@ -94,6 +95,54 @@ pub fn markdown(p: &ProtocolSummary) -> String {
             Source::Framing => "JSON-RPC's format".to_string(),
         };
         out.push_str(&format!("| {key} | {value} | {from} |\n"));
+    }
+
+    // A handshake that takes parameters: every one, as it's in effect.
+    let handshake = HandshakeValue::with(
+        &p.handshake.value,
+        p.handshake
+            .params
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str())),
+    );
+    let params = annotations::handshake_params(&handshake.name);
+    if !params.is_empty() {
+        out.push_str(&format!(
+            "\n**`{}`'s parameters**\n\n| parameter | value | |\n|---|---|---|\n",
+            handshake.name
+        ));
+        for param in params {
+            let value = handshake.param(param.key).unwrap_or_default();
+            let mut notes = vec![];
+            if !handshake.params.contains_key(param.key) {
+                notes.push("default");
+            }
+            notes.push(if param.wire {
+                "wire: both ends must agree"
+            } else {
+                "policy: each end applies its own"
+            });
+            out.push_str(&format!(
+                "| `{}` | `{value}` | {} |\n",
+                param.key,
+                notes.join("; ")
+            ));
+        }
+    }
+    // Core's defaults moved (runtime#15): a package released before that and
+    // taking them now gets them frozen in, a wire change.
+    let takes_new_default = (p.framing.source == Source::CoreDefault
+        && p.framing.value == annotations::DEFAULT_FRAMING)
+        || (p.handshake.source == Source::CoreDefault
+            && p.handshake.value == annotations::DEFAULT_HANDSHAKE);
+    if takes_new_default {
+        out.push_str(&format!(
+            "\n*Core's defaults are `{}` and `{}` since `comline@2`. A package released before then, taking them, \
+             takes a breaking bump (minor in 0.x) on its next release. Stating `wire.framing = \"{}\"` keeps the old wire.*\n",
+            annotations::DEFAULT_FRAMING,
+            annotations::DEFAULT_HANDSHAKE,
+            annotations::IMPLICIT_FRAMING,
+        ));
     }
 
     out.push_str("\n**Guarantees**\n\n| guarantee | | why | accepted |\n|---|---|---|---|\n");
@@ -319,6 +368,72 @@ mod tests {
                 }
             ),
             None
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn core_defaults_show_comline2_and_its_parameters() {
+        let root = std::env::temp_dir().join(format!(
+            "comline-lsp-protocol-defaults-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        package(&root, "", "protocol Plain {\n    function ping();\n}\n");
+        let plain = markdown(&summary(&root, "api", "Plain").unwrap());
+        for row in [
+            "| format | `packed@1` | core's default |",
+            "| framing | `datagram@3` | core's default |",
+            "| handshake | `comline@2` | core's default |",
+            "| `scope` | `protocol` | default; policy: each end applies its own |",
+            "| `newer_consumer` | `degrade` | default; policy: each end applies its own |",
+            "| `same_version_differs` | `refuse` | default; policy: each end applies its own |",
+            "| `exchange` | `offer` | default; wire: both ends must agree |",
+            "takes a breaking bump (minor in 0.x) on its next release",
+        ] {
+            assert!(plain.contains(row), "{row}\n{plain}");
+        }
+
+        // Parameters written in config.idp; the old framing stated keeps
+        // the implicit pair and no note.
+        package(
+            &root,
+            "handshake = { name = \"comline@2\" exchange = \"symmetric\" }\n",
+            "protocol Plain {\n    function ping();\n}\n",
+        );
+        let written = markdown(&summary(&root, "api", "Plain").unwrap());
+        assert!(
+            written.contains(
+                "| handshake | `comline@2` (exchange = symmetric) | config.idp `handshake` |"
+            ),
+            "{written}"
+        );
+        assert!(
+            written.contains("| `exchange` | `symmetric` | wire: both ends must agree |"),
+            "{written}"
+        );
+        assert!(
+            written.contains("| `scope` | `protocol` | default;"),
+            "{written}"
+        );
+
+        package(
+            &root,
+            "wire = { framing = \"datagram@2\" }\n",
+            "protocol Plain {\n    function ping();\n}\n",
+        );
+        let old = markdown(&summary(&root, "api", "Plain").unwrap());
+        assert!(
+            old.contains("| framing | `datagram@2` | config.idp `wire.framing` |"),
+            "{old}"
+        );
+        assert!(
+            old.contains("| handshake | `comline@1` | core's default |"),
+            "{old}"
+        );
+        assert!(
+            !old.contains("parameters") && !old.contains("breaking bump"),
+            "{old}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
