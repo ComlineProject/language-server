@@ -24,3 +24,19 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup update stable && rustup default stable && rustup target add wasm32-unknown-unknown
       - run: cargo build --no-default-features --target wasm32-unknown-unknown --verbose
+
+  # Cross-platform (core#9): separate job names so the Linux checks above
+  # stay unchanged.
+  build_and_test_xp:
+    name: Rust project - stable (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup update stable && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --verbose
+      - run: cargo test --verbose
