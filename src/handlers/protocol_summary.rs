@@ -92,7 +92,8 @@ pub fn markdown(p: &ProtocolSummary) -> String {
             Source::PackageDefault if key == "handshake" => "config.idp `handshake`".to_string(),
             Source::PackageDefault => format!("config.idp `wire.{key}`"),
             Source::CoreDefault => "core's default".to_string(),
-            Source::Framing => "JSON-RPC's format".to_string(),
+            // Whichever framing writes its payloads as JSON, by its facts.
+            Source::Framing => format!("implied by `{}`", p.framing.value),
         };
         out.push_str(&format!("| {key} | {value} | {from} |\n"));
     }
@@ -323,7 +324,7 @@ mod tests {
         assert_eq!(
             markdown(&legacy),
             "**On the wire**\n\n| | | from |\n|---|---|---|\n\
-             | format | `json@1` | JSON-RPC's format |\n\
+             | format | `json@1` | implied by `jsonrpc` |\n\
              | framing | `jsonrpc` (method_names = qualified) | `@framing` |\n\
              | handshake | `none` | `@handshake` |\n\
              \n**Guarantees**\n\n| guarantee | | why | accepted |\n|---|---|---|---|\n\

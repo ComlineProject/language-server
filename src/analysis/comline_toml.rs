@@ -23,6 +23,7 @@ use comline_core::package::config::ir::frozen::FrozenUnit as ConfigUnit;
 use comline_core::schema::idl::annotations;
 use comline_core::schema::ir::compiler::interpreter::incremental::IncrementalInterpreter;
 use comline_core::schema::ir::compiler::Compile;
+use comline_core::schema::ir::package_wire::apply_package_wire;
 use lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Url};
 use serde_json::{json, Value as Json};
 use toml_edit::{ImDocument, Item, TableLike, Value};
@@ -94,6 +95,10 @@ pub struct Context {
     /// The package's own and its dependencies' encodings (the official ones
     /// are always added).
     pub encodings: Vec<KnownEncoding>,
+    /// The package's own and its dependencies' encoding declarations,
+    /// frozen with the facts their profiles state where the profile can be
+    /// read (`source::declared_encoding_units`).
+    pub declared: Vec<ConfigUnit>,
     /// The encodings the package's schemas use, canonical. `None` when they
     /// can't all be read (a schema mid-edit): then nothing is called unmapped.
     pub used: Option<BTreeSet<String>>,
@@ -111,6 +116,7 @@ impl Context {
             ..Default::default()
         };
         let mut wire = source::DeclaredWire::default();
+        let mut config = Vec::new();
         let mut schemas = Vec::new();
         let mut complete = true;
         for file in files {
@@ -124,7 +130,17 @@ impl Context {
                     context.has_manifest = true;
                     context.languages = source::declared_languages(text);
                     wire = source::declared_wire(text);
+                    config = source::declared_config(text).unwrap_or_default();
                 }
+                // Profiles are read from beside the manifest, on disk; in
+                // a browser there's none, and declarations state nothing.
+                #[cfg(not(target_arch = "wasm32"))]
+                let path = uri.to_file_path().ok();
+                #[cfg(target_arch = "wasm32")]
+                let path: Option<PathBuf> = None;
+                context
+                    .declared
+                    .extend(source::declared_encoding_units(text, path.as_deref()));
                 context
                     .encodings
                     .extend(
@@ -163,18 +179,18 @@ impl Context {
             }
         }
         if complete {
-            source::apply_package_wire(&mut schemas, &wire);
-            // A declared framing's grammar is in its profile file, which the
-            // editor doesn't read: only the official ones are known to write
-            // JSON here.
-            let writes_json = |framing: &str| {
-                official::profile(EncodingKind::Framing, framing)
-                    .is_some_and(|profile| profile.grammar().as_deref() == Some("json"))
-            };
-            context.used = Some(comline_codegen::encodings::used(
+            // As core's compiler freezes them, and each framing judged by
+            // its declaration's frozen facts, as `comline generate` does.
+            let mut units: Vec<&mut [comline_core::schema::ir::frozen::unit::FrozenUnit]> = schemas
+                .iter_mut()
+                .map(|(_, units)| units.as_mut_slice())
+                .collect();
+            apply_package_wire(&mut units, &config);
+            context.used = Some(comline_codegen::encodings::used_as_declared(
                 &schemas,
                 &wire.format,
-                &writes_json,
+                official::units(),
+                &context.declared,
             ));
         }
         context
@@ -1215,6 +1231,7 @@ mod tests {
     fn rust_package() -> Context {
         Context {
             has_manifest: true,
+            declared: vec![],
             languages: vec![DeclaredLanguage {
                 language: "rust".into(),
                 version: "1.85.0".into(),
@@ -1515,6 +1532,111 @@ mod tests {
         assert_eq!(
             context.used,
             Some(BTreeSet::from([annotations::DEFAULT_FORMAT.to_string()]))
+        );
+    }
+
+    #[test]
+    fn a_dependencys_framing_is_judged_by_its_frozen_facts() {
+        use crate::analysis::source::SourceFile;
+        // A dependency declares `com.acme.lines@1`, its profile beside its
+        // config.idp: whether it writes JSON is that profile's `payload`,
+        // frozen on the declaration, as `comline generate` reads it.
+        let used = |payload: Option<&str>| {
+            let root = std::env::temp_dir().join(format!(
+                "comline-lsp-framing-facts-{}-{}",
+                payload.unwrap_or("none"),
+                std::process::id()
+            ));
+            let dep = root.join("d");
+            std::fs::create_dir_all(dep.join("profiles")).unwrap();
+            if let Some(payload) = payload {
+                std::fs::write(
+                    dep.join("profiles/lines.json"),
+                    format!(
+                        r#"{{ "name": "com.acme.lines@1", "kind": "framing", "facts": {{
+                            "calls": {{ "value": "by_name", "proven_by": [] }},
+                            "directions": {{ "value": "both", "proven_by": [] }},
+                            "errors": {{ "value": "by_name", "proven_by": [] }},
+                            "payload": {{ "value": "{payload}", "proven_by": [] }}
+                        }} }}"#
+                    ),
+                )
+                .unwrap();
+            }
+            let dep_manifest = "congregation d
+encodings = {
+    \"com.acme.lines@1\" = { kind = \"framing\" \
+                profile = \"profiles/lines.json\" map = { rust = { type = \"acme::Lines\" } } }
+}
+";
+            let files = vec![
+                SourceFile::local(
+                    Url::from_file_path(root.join("p/config.idp")).unwrap(),
+                    "congregation p\n".into(),
+                ),
+                SourceFile::local(
+                    Url::from_file_path(root.join("p/src/app.ids")).unwrap(),
+                    "@framing = \"com.acme.lines@1\"\nprotocol Chat {\n    function ping();\n}\n"
+                        .into(),
+                ),
+                SourceFile::of_dependency(
+                    Url::from_file_path(dep.join("config.idp")).unwrap(),
+                    dep_manifest.into(),
+                    "d",
+                    vec!["d".into()],
+                ),
+            ];
+            let context = Context::from_files(&files, None);
+            let _ = std::fs::remove_dir_all(&root);
+            context.used.unwrap()
+        };
+        // No format named: the package's is `packed@1`, but a JSON payload
+        // needs `json@1`'s mapping too.
+        let json = used(Some("json"));
+        assert!(json.contains("json@1"), "{json:?}");
+        assert!(json.contains("com.acme.lines@1"), "{json:?}");
+        let opaque = used(Some("opaque"));
+        assert!(!opaque.contains("json@1"), "{opaque:?}");
+        // A profile the editor can't read states nothing.
+        assert!(!used(None).contains("json@1"));
+        // The same set `comline generate` resolves through generation.
+        let mut schemas = vec![(
+            "app".to_string(),
+            IncrementalInterpreter::from_declarations(
+                crate::parser::parse(
+                    "@framing = \"com.acme.lines@1\"\nprotocol Chat {\n    function ping();\n}\n",
+                )
+                .unwrap()
+                .document
+                .unwrap()
+                .0,
+            ),
+        )];
+        let mut units: Vec<&mut [comline_core::schema::ir::frozen::unit::FrozenUnit]> =
+            schemas.iter_mut().map(|(_, u)| u.as_mut_slice()).collect();
+        apply_package_wire(&mut units, &[]);
+        let mut declared = ConfigUnit::Encoding {
+            name: "com.acme.lines@1".into(),
+            kind: EncodingKind::Framing,
+            profile_hash: String::new(),
+            map: BTreeMap::new(),
+            establishes: Vec::new(),
+            has_vectors: false,
+            grammar: Some("json".into()),
+            calls: None,
+            directions: None,
+        };
+        if let ConfigUnit::Encoding { calls, .. } = &mut declared {
+            *calls = Some("by_name".into());
+        }
+        assert_eq!(
+            comline_codegen::encodings::used_as_declared(
+                &schemas,
+                annotations::DEFAULT_FORMAT,
+                official::units(),
+                &[declared],
+            ),
+            json
         );
     }
 

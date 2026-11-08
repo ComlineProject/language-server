@@ -428,75 +428,89 @@ impl Default for DeclaredWire {
 /// ... }`, `handshake`), core's defaults for what it leaves out or when it
 /// doesn't interpret.
 pub fn declared_wire(manifest: &str) -> DeclaredWire {
-    use comline_core::package::config::idl::grammar::Key;
-    use comline_core::package::config::ir::context::ProjectContext;
     use comline_core::package::config::ir::frozen;
-    use comline_core::package::config::ir::interpreter::interpret::interpret_context;
 
-    let Some(mut congregation) = parser::parse_idp(manifest).ok().and_then(|r| r.document) else {
+    let Some(units) = declared_config(manifest) else {
         return DeclaredWire::default();
     };
+    DeclaredWire {
+        format: frozen::wire_format(&units).to_string(),
+        framing: frozen::wire_framing(&units).to_string(),
+        handshake: frozen::stated_handshake(&units).map(str::to_string),
+    }
+}
+
+/// `config.idp`'s text frozen as core freezes it, but for `settings` and
+/// `encodings`, which need what the editor may not have (a dependency's
+/// schemas, the profile files). What core's
+/// `schema::ir::package_wire::apply_package_wire` takes. `None` when it
+/// doesn't parse or interpret (mid-edit).
+pub fn declared_config(
+    manifest: &str,
+) -> Option<Vec<comline_core::package::config::ir::frozen::FrozenUnit>> {
+    use comline_core::package::config::idl::grammar::Key;
+    use comline_core::package::config::ir::context::ProjectContext;
+    use comline_core::package::config::ir::interpreter::interpret::interpret_context;
+
+    let mut congregation = parser::parse_idp(manifest).ok().and_then(|r| r.document)?;
     congregation
         .assignments
         .retain(|a| !matches!(&a.value.key, Key::Identifier(id) if id.value == "settings"));
     without_encodings(&mut congregation);
-    match interpret_context(&ProjectContext::with_config(congregation), None) {
-        Ok(units) => DeclaredWire {
-            format: frozen::wire_format(&units).to_string(),
-            framing: frozen::wire_framing(&units).to_string(),
-            handshake: frozen::stated_handshake(&units).map(str::to_string),
-        },
-        Err(_) => DeclaredWire::default(),
-    }
+    interpret_context(&ProjectContext::with_config(congregation), None).ok()
 }
 
-/// Freeze the package's framing and handshake into every protocol of
-/// `schemas` that doesn't write its own, as core does when it compiles the
-/// package: without a package handshake, `comline@2` only where every
-/// protocol is on `datagram@3` (`annotations::package_default_handshake`).
-/// Schemas read straight from their declarations lack them, and an absent
-/// one would read as the implicit `datagram@2` / `comline@1`.
-pub fn apply_package_wire(
-    schemas: &mut [(
-        String,
-        Vec<comline_core::schema::ir::frozen::unit::FrozenUnit>,
-    )],
-    wire: &DeclaredWire,
-) {
-    use comline_core::schema::idl::annotations::package_default_handshake;
-    use comline_core::schema::ir::frozen::unit::{ConfigValue, FrozenUnit};
+/// Every encoding `config.idp` declares, frozen as core freezes it, with the
+/// facts its profile states (`grammar`, `calls`, `directions`), read from
+/// beside the manifest at `path`. Each entry is frozen on its own, so one
+/// that doesn't (a missing profile, mid-edit, no `path`) costs only its own
+/// facts: it's kept with its name, kind and suggested mappings alone, as
+/// [`declared_encoding_details`] reads them, and states nothing.
+pub fn declared_encoding_units(
+    manifest: &str,
+    path: Option<&std::path::Path>,
+) -> Vec<comline_core::package::config::ir::frozen::FrozenUnit> {
+    use comline_core::package::config::idl::grammar::Value;
+    use comline_core::package::config::ir::context::{Origin, ProjectContext};
+    use comline_core::package::config::ir::frozen::FrozenUnit as ConfigUnit;
+    use comline_core::package::config::ir::interpreter::interpret::interpret_context;
 
-    let handshake = match &wire.handshake {
-        Some(handshake) => handshake.clone(),
-        None => {
-            let protocols = schemas
-                .iter()
-                .flat_map(|(_, units)| units)
-                .filter_map(|u| match u {
-                    FrozenUnit::Protocol { parameters, .. } => Some(parameters.as_slice()),
-                    _ => None,
-                });
-            package_default_handshake(protocols, &wire.framing).to_string()
-        }
+    let frozen_one = |name: &str| -> Option<ConfigUnit> {
+        let path = path?;
+        let mut congregation = parser::parse_idp(manifest).ok().and_then(|r| r.document)?;
+        let mut encodings = congregation
+            .assignments
+            .iter()
+            .find(|a| a.value.key.text() == "encodings")?
+            .clone();
+        let Value::Dictionary(entries) = &mut encodings.value.value else {
+            return None;
+        };
+        entries.assignments.retain(|e| e.value.key.text() == name);
+        congregation.assignments = vec![encodings];
+        let context =
+            ProjectContext::with_config_from_origin(Origin::Disk(path.to_path_buf()), congregation);
+        let units = interpret_context(&context, None).ok()?;
+        units
+            .into_iter()
+            .find(|u| matches!(u, ConfigUnit::Encoding { .. }))
     };
-    for (_, units) in schemas.iter_mut() {
-        for unit in units.iter_mut() {
-            let FrozenUnit::Protocol { parameters, .. } = unit else {
-                continue;
-            };
-            for (key, value) in [("framing", &wire.framing), ("handshake", &handshake)] {
-                if !parameters
-                    .iter()
-                    .any(|p| matches!(p, FrozenUnit::Property { name, .. } if name == key))
-                {
-                    parameters.push(FrozenUnit::Property {
-                        name: key.to_string(),
-                        value: ConfigValue::Str(value.clone()),
-                    });
-                }
-            }
-        }
-    }
+    declared_encoding_details(manifest)
+        .into_iter()
+        .map(|e| {
+            frozen_one(&e.name).unwrap_or(ConfigUnit::Encoding {
+                name: e.name,
+                kind: e.kind,
+                profile_hash: String::new(),
+                map: e.map,
+                establishes: Vec::new(),
+                has_vectors: false,
+                grammar: None,
+                calls: None,
+                directions: None,
+            })
+        })
+        .collect()
 }
 
 /// `settings = <dependency>::settings::<name>` resolved live, against
