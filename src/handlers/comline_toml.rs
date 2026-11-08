@@ -441,6 +441,7 @@ mod tests {
     fn context() -> Context {
         Context {
             has_manifest: true,
+            declared: vec![],
             languages: vec![DeclaredLanguage {
                 language: "rust".into(),
                 version: "1.85.0".into(),
