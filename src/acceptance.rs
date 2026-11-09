@@ -61,7 +61,7 @@ pub fn unverified_in(dir: &Path) -> Vec<Unverified> {
             found.push(Unverified {
                 protocol: protocol.to_string(),
                 set: set.to_vec(),
-                reason: reason.map(str::to_string),
+                reason,
             });
         }
     }
@@ -92,7 +92,7 @@ pub fn diagnostics(
             let reason = u
                 .reason
                 .as_deref()
-                .map(|r| format!(": \"{r}\""))
+                .map(|r| format!(": {r}"))
                 .unwrap_or_default();
             let what = match dependency.accept_unverified.get(&u.protocol) {
                 None => format!(
