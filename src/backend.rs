@@ -813,8 +813,9 @@ impl LanguageServer for Backend {
             else {
                 return Ok(None);
             };
-            let actions =
+            let mut actions =
                 crate::acceptance::code_actions(&package_dir, &uri, &document.text, &params);
+            actions.extend(crate::handlers::code_actions::fix_actions(&uri, &params));
             return Ok((!actions.is_empty()).then_some(actions));
         }
 
@@ -1000,11 +1001,21 @@ impl Backend {
                     // `manifest_diagnostics` covers the dependency block
                     // in more detail, and anchors its range at the entry
                     // rather than at the top of the file.
+                    // The edition first (core#102): a missing or unknown
+                    // `specification_version`, at its span and with its fix.
+                    let edition = diagnostics::edition_config_diagnostics(&document.text);
+                    let edition_said = !edition.is_empty();
+                    lsp_diagnostics.extend(edition);
+
                     if let Some(message) = crate::analysis::source::manifest_error(
                         &document.text,
                         document.uri.to_file_path().ok().as_deref(),
                     ) {
-                        if !lsp_diagnostics.iter().any(|d| d.message == message) {
+                        // An unknown edition is the build's error too;
+                        // the one above says it with a span and a fix.
+                        let about_edition =
+                            edition_said && message.contains("specification_version");
+                        if !about_edition && !lsp_diagnostics.iter().any(|d| d.message == message) {
                             let (start, end) = crate::analysis::source::manifest_error_span(
                                 &document.text,
                                 &message,

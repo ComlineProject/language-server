@@ -1,7 +1,7 @@
 // Code actions handler - provides quick fixes and refactorings
 
 use crate::analysis::diagnostics::{
-    DUPLICATE_BLOCK, DUPLICATE_DECLARATION, MESSAGE_NOT_INTERPOLATED, MISSING_IMPORT,
+    DUPLICATE_BLOCK, DUPLICATE_DECLARATION, FIX_DATA, MESSAGE_NOT_INTERPOLATED, MISSING_IMPORT,
     UNRESOLVED_IMPORT,
 };
 use crate::analysis::import_check;
@@ -111,6 +111,7 @@ pub fn get_code_actions_with_project<S: ProjectSource>(
         other_files,
     ));
     actions.extend(f_string_actions(source, uri, params));
+    actions.extend(fix_actions(uri, params));
 
     // Several uses of the same name in range: one fix per candidate is enough.
     actions.dedup_by(|a, b| match (a, b) {
@@ -120,6 +121,38 @@ pub fn get_code_actions_with_project<S: ProjectSource>(
         _ => false,
     });
     actions
+}
+
+/// The quick fix each diagnostic in range carries from core (a [`Fix`],
+/// in its `data` under [`FIX_DATA`]): whatever the diagnostic, in a schema
+/// or a `config.idp`. Core only attaches a fix that's safe to make without
+/// asking, so each is the preferred one.
+///
+/// [`Fix`]: comline_core::diagnostics::Fix
+pub fn fix_actions(uri: &Url, params: &CodeActionParams) -> Vec<CodeActionOrCommand> {
+    params
+        .context
+        .diagnostics
+        .iter()
+        .filter(|d| overlaps(d.range, params.range))
+        .filter_map(|d| {
+            let fix = d.data.as_ref()?.get(FIX_DATA)?;
+            let title = fix.get("title")?.as_str()?.to_string();
+            let edits: Vec<TextEdit> = serde_json::from_value(fix.get("edits")?.clone()).ok()?;
+            Some(CodeActionOrCommand::CodeAction(CodeAction {
+                title,
+                kind: Some(CodeActionKind::QUICKFIX),
+                diagnostics: Some(vec![d.clone()]),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(HashMap::from([(uri.clone(), edits)])),
+                    document_changes: None,
+                    change_annotations: None,
+                }),
+                is_preferred: Some(true),
+                ..Default::default()
+            }))
+        })
+        .collect()
 }
 
 /// Quick fixes for a name declared twice in one schema: on *each* of the
@@ -814,5 +847,113 @@ mod duplicate_name_tests {
 
         at.range = Range::new(Position::new(0, 0), Position::new(0, 0));
         assert!(titles(source, &at).iter().all(|t| !t.contains("f-string")));
+    }
+
+    /// Core's fixes, carried through the diagnostics' `data`, come back as
+    /// quick fixes that leave the source fixed (core#102).
+    mod core_fixes {
+        use super::*;
+        use crate::analysis::diagnostics::{edition_config_diagnostics, edition_diagnostics};
+        use comline_core::diagnostics::DiagnosticCode;
+        use comline_core::edition::Edition;
+        use comline_core::schema::idl::vocabulary::Deprecation;
+        use lsp_types::{CodeActionContext, Position, TextDocumentIdentifier};
+
+        fn fixes(uri: &Url, diagnostics: Vec<Diagnostic>) -> Vec<CodeAction> {
+            let params = CodeActionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                range: Range::new(Position::new(0, 0), Position::new(u32::MAX, 0)),
+                context: CodeActionContext {
+                    diagnostics,
+                    only: None,
+                    trigger_kind: None,
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            };
+            fix_actions(uri, &params)
+                .into_iter()
+                .map(|a| match a {
+                    CodeActionOrCommand::CodeAction(a) => a,
+                    other => panic!("expected a code action, got {other:?}"),
+                })
+                .collect()
+        }
+
+        /// `source` with `action`'s edits made, last first.
+        fn apply(source: &str, uri: &Url, action: &CodeAction) -> String {
+            let changes = action.edit.as_ref().unwrap().changes.as_ref().unwrap();
+            let mut edits = changes[uri].clone();
+            edits.sort_by_key(|e| std::cmp::Reverse((e.range.start.line, e.range.start.character)));
+            let mut out = source.to_string();
+            for edit in edits {
+                let start = position_to_offset(&out, edit.range.start).unwrap();
+                let end = position_to_offset(&out, edit.range.end).unwrap();
+                out.replace_range(start..end, &edit.new_text);
+            }
+            out
+        }
+
+        #[test]
+        fn a_manifest_without_an_edition_is_fixed_by_its_quick_fix() {
+            let uri = Url::parse("file:///pkg/config.idp").unwrap();
+            let source = "//! An app.\ncongregation app\nid = \"x\"\n";
+            let actions = fixes(&uri, edition_config_diagnostics(source));
+            assert_eq!(actions.len(), 1);
+            let action = &actions[0];
+            assert_eq!(action.title, "Add `specification_version = 1`");
+            assert_eq!(action.kind, Some(CodeActionKind::QUICKFIX));
+            assert_eq!(action.is_preferred, Some(true));
+            assert_eq!(action.diagnostics.as_ref().unwrap().len(), 1);
+            let fixed = apply(source, &uri, action);
+            assert_eq!(
+                fixed,
+                "//! An app.\ncongregation app\nspecification_version = 1\nid = \"x\"\n"
+            );
+            assert!(edition_config_diagnostics(&fixed).is_empty());
+        }
+
+        #[test]
+        fn an_unknown_edition_is_fixed_to_the_newest() {
+            let uri = Url::parse("file:///pkg/config.idp").unwrap();
+            let source = "congregation app\nspecification_version = 300\n";
+            let actions = fixes(&uri, edition_config_diagnostics(source));
+            assert_eq!(actions[0].title, "Use edition 1");
+            assert_eq!(
+                apply(source, &uri, &actions[0]),
+                "congregation app\nspecification_version = 1\n"
+            );
+        }
+
+        #[test]
+        fn a_deprecated_word_is_replaced_by_its_quick_fix() {
+            const TABLE: &[Deprecation] = &[Deprecation {
+                word: "u8",
+                since: Edition::E1,
+                removed: None,
+                replacement: Some("byte"),
+                code: DiagnosticCode::warning("deprecation::u8"),
+                note: "`byte` says what it is",
+            }];
+            let uri = Url::parse("file:///pkg/src/a.ids").unwrap();
+            // Multi-byte text before it: the edit's range is in UTF-16.
+            let source = "/// Größe\nstruct S {\n    a: u8\n    b: u8\n}\n";
+            let actions = fixes(&uri, edition_diagnostics(source, Edition::E1, TABLE));
+            assert_eq!(actions.len(), 2);
+            assert_eq!(
+                apply(source, &uri, &actions[1]),
+                "/// Größe\nstruct S {\n    a: u8\n    b: byte\n}\n"
+            );
+        }
+
+        #[test]
+        fn a_diagnostic_without_a_fix_offers_none() {
+            let uri = Url::parse("file:///pkg/src/a.ids").unwrap();
+            let plain = Diagnostic {
+                data: Some(serde_json::json!({ "dependency": "dep" })),
+                ..Default::default()
+            };
+            assert!(fixes(&uri, vec![plain, Diagnostic::default()]).is_empty());
+        }
     }
 }

@@ -36,6 +36,49 @@ pub fn get_completions_with_project<S: ProjectSource>(
     position: Position,
     other_files: &[S],
 ) -> Vec<CompletionItem> {
+    mark_deprecated_words(
+        completions_at(source, uri, position, other_files),
+        vocabulary::deprecation,
+    )
+}
+
+/// `items` with every keyword or primitive type an edition deprecates
+/// (core#102) tagged deprecated, which the editor shows struck through.
+/// Still offered: a package on an older edition may use it freely.
+/// `deprecation` is [`vocabulary::deprecation`] outside tests.
+fn mark_deprecated_words(
+    mut items: Vec<CompletionItem>,
+    deprecation: impl Fn(&str) -> Option<&'static vocabulary::Deprecation>,
+) -> Vec<CompletionItem> {
+    for item in &mut items {
+        let a_word = matches!(
+            item.kind,
+            Some(CompletionItemKind::KEYWORD | CompletionItemKind::TYPE_PARAMETER)
+        );
+        if !a_word {
+            continue;
+        }
+        if let Some(d) = deprecation(&item.label) {
+            let tags = item.tags.get_or_insert_with(Vec::new);
+            if !tags.contains(&lsp_types::CompletionItemTag::DEPRECATED) {
+                tags.push(lsp_types::CompletionItemTag::DEPRECATED);
+            }
+            let note = format!("deprecated since edition {} — {}", d.since, d.note);
+            item.detail = Some(match item.detail.take() {
+                Some(detail) => format!("{detail} ({note})"),
+                None => note,
+            });
+        }
+    }
+    items
+}
+
+fn completions_at<S: ProjectSource>(
+    source: &str,
+    uri: &Url,
+    position: Position,
+    other_files: &[S],
+) -> Vec<CompletionItem> {
     let offset = match position_to_offset(source, position) {
         Some(o) => o,
         None => return get_keyword_completions(),
@@ -2547,5 +2590,53 @@ mod tests {
             thing.additional_text_edits.as_ref().unwrap()[0].new_text,
             "use shared::models::Thing\n\n"
         );
+    }
+
+    #[test]
+    fn a_deprecated_keyword_or_primitive_is_tagged_in_completions() {
+        use comline_core::diagnostics::DiagnosticCode;
+        use comline_core::edition::Edition;
+        static DEPRECATED: vocabulary::Deprecation = vocabulary::Deprecation {
+            word: "u8",
+            since: Edition::E1,
+            removed: None,
+            replacement: Some("byte"),
+            code: DiagnosticCode::warning("deprecation::u8"),
+            note: "`byte` says what it is",
+        };
+        let lookup = |w: &str| (w == "u8").then_some(&DEPRECATED);
+
+        let items = mark_deprecated_words(get_primitive_type_completions(), lookup);
+        let u8 = items.iter().find(|i| i.label == "u8").unwrap();
+        assert_eq!(
+            u8.tags,
+            Some(vec![lsp_types::CompletionItemTag::DEPRECATED])
+        );
+        assert!(u8
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("deprecated since edition 1"));
+        let u16 = items.iter().find(|i| i.label == "u16").unwrap();
+        assert_eq!(u16.tags, None);
+
+        // Only a word of the language: a field or type of the same name isn't.
+        let named = CompletionItem {
+            label: "u8".to_string(),
+            kind: Some(CompletionItemKind::FIELD),
+            ..Default::default()
+        };
+        assert_eq!(mark_deprecated_words(vec![named], lookup)[0].tags, None);
+    }
+
+    #[test]
+    fn the_language_deprecates_no_completion_yet() {
+        let items = get_completions(
+            "",
+            &Url::parse("file:///a.ids").unwrap(),
+            Position::new(0, 0),
+        );
+        assert!(!items.is_empty());
+        assert!(items.iter().all(|i| i.tags.is_none()));
     }
 }

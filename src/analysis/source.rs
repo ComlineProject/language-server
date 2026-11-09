@@ -144,6 +144,18 @@ pub struct DeclaredLanguage {
 /// Every language `config.idp`'s text declares, read with core's own
 /// interpreter, as `comline generate` reads them. Empty when the manifest
 /// doesn't parse (mid-edit) or doesn't interpret.
+/// The edition `config.idp` names (core#102), as core reads it: the newest
+/// when the manifest names none it knows or doesn't parse - `config.idp`'s
+/// own diagnostics say what's wrong with it.
+pub fn declared_edition(manifest: &str) -> comline_core::edition::Edition {
+    use comline_core::package::config::ir::context::ProjectContext;
+    parser::parse_idp(manifest)
+        .ok()
+        .and_then(|r| r.document)
+        .map(|congregation| ProjectContext::with_config(congregation).edition())
+        .unwrap_or(comline_core::edition::Edition::LATEST)
+}
+
 pub fn declared_languages(manifest: &str) -> Vec<DeclaredLanguage> {
     use comline_core::package::config::idl::grammar::Key;
     use comline_core::package::config::ir::context::ProjectContext;
