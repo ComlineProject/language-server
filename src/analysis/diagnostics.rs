@@ -8,9 +8,11 @@ use crate::analysis::import_check::{self, MissingImport, UnresolvedImport, Unver
 use crate::analysis::project::Project;
 use crate::analysis::symbols::Namespace;
 use crate::util::byte_range_to_lsp_range;
-use comline_core::diagnostics::Severity;
+use comline_core::diagnostics::{Fix, Severity};
+use comline_core::edition::{self, Edition};
 use comline_core::package::layout;
 use comline_core::schema::idl::grammar::{Declaration, Document};
+use comline_core::schema::idl::vocabulary;
 use comline_core::schema::ir::compiler::import_resolver::{
     declared_alias_target, declared_validator_properties, declared_validator_targets,
 };
@@ -25,7 +27,7 @@ use comline_core::schema::ir::validation;
 use comline_core::settings::{SettingsDict, SettingsSpans};
 use lsp_types::{
     Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, DiagnosticTag, Location,
-    NumberOrString, Range, Url,
+    NumberOrString, Range, TextEdit, Url,
 };
 
 /// The `code` of a missing-import diagnostic - what the quick fix in
@@ -104,8 +106,99 @@ fn hint_pointer(code_id: &str) -> &'static str {
 fn lsp_tags(code_id: &str) -> Option<Vec<DiagnosticTag>> {
     match code_id {
         "validation::deprecated-type-usage" => Some(vec![DiagnosticTag::DEPRECATED]),
+        // A keyword or primitive type an edition deprecates (core#102).
+        id if id.starts_with("deprecation::") => Some(vec![DiagnosticTag::DEPRECATED]),
         _ => None,
     }
+}
+
+/// The key under an LSP diagnostic's `data` that a core [`Fix`] travels
+/// in, already turned into LSP edits of the diagnostic's own document.
+/// `handlers::code_actions::fix_actions` offers it back as a quick fix, so
+/// any core diagnostic that carries a fix gets one in the editor without
+/// either side knowing which diagnostic it is.
+pub const FIX_DATA: &str = "fix";
+
+/// `diagnostic` with `fix` carried in its `data` (see [`FIX_DATA`]), the
+/// fix's byte spans in `source` turned into LSP ranges. Whatever `data`
+/// already holds is kept.
+pub fn with_fix(mut diagnostic: Diagnostic, source: &str, fix: Option<&Fix>) -> Diagnostic {
+    let Some(fix) = fix else {
+        return diagnostic;
+    };
+    let edits: Vec<TextEdit> = fix
+        .edits
+        .iter()
+        .map(|((start, end), text)| TextEdit {
+            range: byte_range_to_lsp_range(source, *start, *end),
+            new_text: text.clone(),
+        })
+        .collect();
+    let value = serde_json::json!({ "title": fix.title, "edits": edits });
+    match &mut diagnostic.data {
+        Some(serde_json::Value::Object(map)) => {
+            map.insert(FIX_DATA.to_string(), value);
+        }
+        _ => diagnostic.data = Some(serde_json::json!({ FIX_DATA: value })),
+    }
+    diagnostic
+}
+
+/// A core diagnostic as the editor shows it: its own severity (with any
+/// project override), code, message and help, its span, the tags its code
+/// implies, and its fix.
+pub fn from_core(source: &str, diagnostic: &comline_core::diagnostics::Diagnostic) -> Diagnostic {
+    let range = diagnostic
+        .span
+        .map(|(start, end)| byte_range_to_lsp_range(source, start, end))
+        .unwrap_or_default();
+    let message = match &diagnostic.help {
+        Some(help) => format!("{} — {help}", diagnostic.message),
+        None => diagnostic.message.clone(),
+    };
+    let lsp = Diagnostic {
+        range,
+        severity: Some(lsp_severity(diagnostic.effective_severity())),
+        code: Some(NumberOrString::String(diagnostic.code.id.to_string())),
+        source: Some("comline".to_string()),
+        message,
+        tags: lsp_tags(diagnostic.code.id),
+        ..Default::default()
+    };
+    with_fix(lsp, source, diagnostic.fix.as_ref())
+}
+
+/// What `config.idp` says about its edition (core#102): nothing when it
+/// names one this core knows, else the error - no `specification_version`,
+/// or an unknown one - with its fix. Empty while the manifest doesn't
+/// parse; its parse errors say that.
+pub fn edition_config_diagnostics(manifest: &str) -> Vec<Diagnostic> {
+    let Some(congregation) = crate::parser::parse_idp(manifest)
+        .ok()
+        .filter(|r| !r.has_errors())
+        .and_then(|r| r.document)
+    else {
+        return vec![];
+    };
+    match edition::check_config(manifest, &congregation) {
+        Ok(_) => vec![],
+        Err(diagnostic) => vec![from_core(manifest, &diagnostic)],
+    }
+}
+
+/// Every use in `source` of a word `edition` deprecates (a warning, struck
+/// through) or removes (an error), from `table` - the language's own is
+/// [`vocabulary::DEPRECATIONS`]. Each with its fix when the word has a
+/// replacement.
+pub fn edition_diagnostics(
+    source: &str,
+    edition: Edition,
+    table: &[vocabulary::Deprecation],
+) -> Vec<Diagnostic> {
+    edition::deprecations(source, edition, table)
+        .iter()
+        .map(|d| from_core(source, d))
+        .collect()
 }
 
 /// `document` frozen the way validation reads it: its own units, then
@@ -394,6 +487,7 @@ fn validation_diagnostics_with(
                 .map(|(start, end)| byte_range_to_lsp_range(source, start, end))
                 .unwrap_or_default();
             let code = error.code;
+            let fix = error.fix.clone();
             let effective_severity = error.effective_severity();
             let lsp_code = Some(NumberOrString::String(code.id.to_string()));
 
@@ -412,17 +506,21 @@ fn validation_diagnostics_with(
 
             // No secondary span: today's single-diagnostic shape, unchanged.
             let Some((sec_span, sec_label)) = &error.secondary else {
-                return vec![Diagnostic {
-                    range,
-                    severity: Some(lsp_severity(effective_severity)),
-                    code: lsp_code,
-                    code_description: None,
-                    source: Some("comline".to_string()),
-                    message,
-                    related_information: None,
-                    tags: lsp_tags(code.id),
-                    data: None,
-                }];
+                return vec![with_fix(
+                    Diagnostic {
+                        range,
+                        severity: Some(lsp_severity(effective_severity)),
+                        code: lsp_code,
+                        code_description: None,
+                        source: Some("comline".to_string()),
+                        message,
+                        related_information: None,
+                        tags: lsp_tags(code.id),
+                        data: None,
+                    },
+                    source,
+                    fix.as_ref(),
+                )];
             };
 
             // A two-site error (e.g. a malformed settings value): the real
@@ -452,6 +550,7 @@ fn validation_diagnostics_with(
                 tags: lsp_tags(code.id),
                 data: None,
             };
+            let primary = with_fix(primary, source, fix.as_ref());
             let hint = Diagnostic {
                 range: sec_range,
                 severity: Some(DiagnosticSeverity::HINT),
@@ -530,6 +629,15 @@ pub fn project_diagnostics(project: &Project, doc: usize) -> Vec<Diagnostic> {
         ));
     }
     diagnostics.extend(reserved_name_diagnostic(here));
+    // What the package's edition deprecates or removes. A dependency's
+    // schemas are on their own package's edition, and not this one's to fix.
+    if here.dependency.is_none() {
+        diagnostics.extend(edition_diagnostics(
+            here.source,
+            project.edition,
+            vocabulary::DEPRECATIONS,
+        ));
+    }
     diagnostics.extend(
         check
             .missing
@@ -737,7 +845,7 @@ fn parse_diagnostic(
         None => diagnostic.message.clone(),
     };
 
-    Diagnostic {
+    let lsp = Diagnostic {
         range,
         severity: Some(DiagnosticSeverity::ERROR),
         code: None,
@@ -747,7 +855,8 @@ fn parse_diagnostic(
         related_information: None,
         tags: None,
         data: None,
-    }
+    };
+    with_fix(lsp, source, diagnostic.fix.as_ref())
 }
 
 #[cfg(test)]
@@ -2036,5 +2145,181 @@ mod reserved_schema_name_tests {
     #[test]
     fn an_ordinary_name_is_not_flagged() {
         assert!(reserved("file:///pkg/src/greeting.ids").is_none());
+    }
+}
+
+/// Editions (core#102): a manifest's `specification_version`, and the
+/// words a package's edition deprecates or removes.
+#[cfg(test)]
+mod edition_tests {
+    use super::*;
+
+    fn covered<'s>(source: &'s str, d: &Diagnostic) -> &'s str {
+        let start = crate::util::position_to_offset(source, d.range.start).unwrap();
+        let end = crate::util::position_to_offset(source, d.range.end).unwrap();
+        &source[start..end]
+    }
+
+    // Editions (core#102). Edition 1 deprecates nothing yet, so the schema
+    // half runs on a table of its own, as core's tests do: `u8` renamed to
+    // `byte`, `optional` removed.
+    const RENAMED: comline_core::diagnostics::DiagnosticCode =
+        comline_core::diagnostics::DiagnosticCode::warning("deprecation::u8");
+    const DROPPED: comline_core::diagnostics::DiagnosticCode =
+        comline_core::diagnostics::DiagnosticCode::warning("deprecation::optional");
+    const TABLE: &[vocabulary::Deprecation] = &[
+        vocabulary::Deprecation {
+            word: "u8",
+            since: Edition::E1,
+            removed: None,
+            replacement: Some("byte"),
+            code: RENAMED,
+            note: "`byte` says what it is",
+        },
+        vocabulary::Deprecation {
+            word: "optional",
+            since: Edition::E1,
+            removed: Some(Edition::E1),
+            replacement: None,
+            code: DROPPED,
+            note: "write `T?`",
+        },
+    ];
+
+    fn fix_of(d: &Diagnostic) -> &serde_json::Value {
+        &d.data.as_ref().expect("data")[FIX_DATA]
+    }
+
+    #[test]
+    fn a_manifest_without_an_edition_is_an_error_with_a_fix() {
+        let source = "congregation app\nid = \"x\"\n";
+        let found = edition_config_diagnostics(source);
+        assert_eq!(found.len(), 1, "{found:#?}");
+        let d = &found[0];
+        assert_eq!(
+            d.code,
+            Some(NumberOrString::String("edition::missing".into()))
+        );
+        assert_eq!(d.severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(covered(source, d), "congregation app");
+        assert_eq!(fix_of(d)["title"], "Add `specification_version = 1`");
+        assert_eq!(
+            fix_of(d)["edits"][0]["newText"],
+            "\nspecification_version = 1"
+        );
+        assert_eq!(fix_of(d)["edits"][0]["range"]["start"]["character"], 16);
+    }
+
+    #[test]
+    fn an_unknown_edition_is_an_error_at_the_number() {
+        let source = "congregation app\nspecification_version = 7\n";
+        let found = edition_config_diagnostics(source);
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].code,
+            Some(NumberOrString::String("edition::unknown".into()))
+        );
+        assert_eq!(covered(source, &found[0]), "7");
+        assert_eq!(fix_of(&found[0])["edits"][0]["newText"], "1");
+    }
+
+    #[test]
+    fn a_known_or_unparsed_edition_says_nothing() {
+        assert!(
+            edition_config_diagnostics("congregation app\nspecification_version = 1\n").is_empty()
+        );
+        assert!(edition_config_diagnostics("congregation app\nsettings = {").is_empty());
+    }
+
+    #[test]
+    fn a_deprecated_word_is_a_struck_through_warning_with_its_fix() {
+        let source = "struct S {\n    a: u8\n    u8_count: u16\n}\n";
+        let found = edition_diagnostics(source, Edition::E1, &TABLE[..1]);
+        assert_eq!(found.len(), 1, "{found:#?}");
+        let d = &found[0];
+        assert_eq!(d.severity, Some(DiagnosticSeverity::WARNING));
+        assert_eq!(d.tags, Some(vec![DiagnosticTag::DEPRECATED]));
+        assert_eq!(
+            d.code,
+            Some(NumberOrString::String("deprecation::u8".into()))
+        );
+        assert_eq!(covered(source, d), "u8");
+        assert!(
+            d.message.contains("`byte` says what it is"),
+            "{}",
+            d.message
+        );
+        assert_eq!(fix_of(d)["title"], "Replace `u8` with `byte`");
+        assert_eq!(fix_of(d)["edits"][0]["newText"], "byte");
+    }
+
+    #[test]
+    fn a_removed_word_is_an_error_without_a_fix() {
+        let source = "struct S {\n    optional a: u16\n}\n";
+        let found = edition_diagnostics(source, Edition::E1, &TABLE[1..]);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(
+            found[0].code,
+            Some(NumberOrString::String("edition::removed".into()))
+        );
+        assert_eq!(found[0].tags, None);
+        assert_eq!(found[0].data, None);
+    }
+
+    #[test]
+    fn the_language_deprecates_nothing_in_a_project_yet() {
+        let files: Vec<(Url, String)> = [
+            (
+                "file:///pkg/src/a.ids",
+                "struct S {\n    optional a: u8\n}\n",
+            ),
+            (
+                "file:///pkg/config.idp",
+                "congregation app\nspecification_version = 1\n",
+            ),
+        ]
+        .iter()
+        .map(|(u, s)| (Url::parse(u).unwrap(), s.to_string()))
+        .collect();
+        let project = Project::new(files.iter());
+        let messages: Vec<String> = project_diagnostics(&project, 0)
+            .into_iter()
+            .map(|d| d.message)
+            .collect();
+        assert!(messages.is_empty(), "{messages:?}");
+    }
+
+    #[test]
+    fn a_projects_edition_comes_from_its_manifest() {
+        let files: Vec<(Url, String)> = vec![
+            (
+                Url::parse("file:///pkg/src/a.ids").unwrap(),
+                "struct S {}\n".into(),
+            ),
+            (
+                Url::parse("file:///pkg/config.idp").unwrap(),
+                "congregation app\nspecification_version = 1\n".into(),
+            ),
+        ];
+        assert_eq!(Project::new(files.iter()).edition, Edition::E1);
+        // None named, or none known: the newest, as core reads it.
+        assert_eq!(
+            crate::analysis::source::declared_edition("congregation app\n"),
+            Edition::LATEST
+        );
+    }
+
+    #[test]
+    fn a_fix_keeps_what_data_already_holds() {
+        let fix = Fix::replace("Do it", (0, 1), "x");
+        let d = Diagnostic {
+            data: Some(serde_json::json!({ "dependency": "dep" })),
+            ..Default::default()
+        };
+        let d = with_fix(d, "ab", Some(&fix));
+        let data = d.data.unwrap();
+        assert_eq!(data["dependency"], "dep");
+        assert_eq!(data[FIX_DATA]["title"], "Do it");
     }
 }

@@ -71,6 +71,9 @@ pub struct Project<'a> {
     /// declare under `encodings`, by name and kind - what `@framing` and
     /// `@handshake` may name beyond the official ones.
     pub encodings: Vec<(String, comline_core::encodings::EncodingKind)>,
+    /// The edition `config.idp` names (core#102): what its schemas are
+    /// checked for deprecated words against. The newest without one.
+    pub edition: comline_core::edition::Edition,
 }
 
 /// A declaration [`Project::resolve`] found: which file (an index into
@@ -151,6 +154,7 @@ impl<'a> Project<'a> {
             settings: Default::default(),
             settings_error: None,
             encodings: vec![],
+            edition: comline_core::edition::Edition::LATEST,
         }
     }
 
@@ -171,6 +175,7 @@ impl<'a> Project<'a> {
             settings: Default::default(),
             settings_error: None,
             encodings: vec![],
+            edition: comline_core::edition::Edition::LATEST,
         };
 
         for &input in &inputs {
@@ -192,6 +197,7 @@ impl<'a> Project<'a> {
                             .extend(source::declared_encodings(input.text));
                         project.dependencies = source::declared_dependencies(input.text);
                         project.languages = source::declared_languages(input.text);
+                        project.edition = source::declared_edition(input.text);
                         match source::resolve_cross_package_settings(input.text, &inputs) {
                             Some(Ok(dict)) => project.settings = dict,
                             Some(Err(message)) => project.settings_error = Some(message),
