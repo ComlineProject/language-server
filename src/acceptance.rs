@@ -19,6 +19,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 
+use crate::util::byte_range_to_lsp_range;
+
 use comline_core::package::config::dependency::DependencyConfig;
 use comline_core::schema::ir::frozen::unit::Guarantee;
 use comline_core::schema::ir::unverified;
@@ -28,7 +30,6 @@ use lsp_types::{
 };
 use serde_json::json;
 
-use crate::util::byte_range_to_lsp_range;
 
 /// The diagnostic code on a dependency entry with an unaccepted protocol.
 pub const UNACCEPTED: &str = "dependency::unaccepted_unverified";

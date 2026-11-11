@@ -20,6 +20,7 @@ use crate::analysis::source::DeclaredLanguage;
 use crate::parser;
 use crate::util::{byte_range_to_lsp_range, word_occurrences};
 
+
 /// The file every package's manifest is in.
 pub const MANIFEST: &str = "config.idp";
 
