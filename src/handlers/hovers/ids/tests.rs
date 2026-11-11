@@ -31,8 +31,14 @@ struct User {
 
         let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
         let text = hover_text(hover);
-        assert!(text.contains("8 bytes"), "got: {text}");
-        assert!(text.contains("64 bits"), "got: {text}");
+        // The package's own format first, then the other official ones.
+        assert!(text.contains("packed@1: 8 B"), "got: {text}");
+        let packed = text.find("packed@1:").expect("packed line");
+        let json = text.find("json@1:").expect("json line");
+        let msgpack = text.find("msgpack@1:").expect("msgpack line");
+        assert!(packed < json && packed < msgpack, "got: {text}");
+        // Each field's own, in the package's format.
+        assert!(text.contains("- #0 x: 4 B"), "got: {text}");
     }
 
     #[test]
@@ -44,7 +50,7 @@ struct User {
 
         let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
         let text = hover_text(hover);
-        assert!(text.contains("variable"), "got: {text}");
+        assert!(text.contains("packed@1: 1 B\u{2013}unbounded"), "got: {text}");
     }
 
     #[test]
@@ -56,7 +62,8 @@ struct User {
 
         let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
         let text = hover_text(hover);
-        assert!(text.contains("variable"), "got: {text}");
+        // Absent (a tag byte), or the tag and the `u64`.
+        assert!(text.contains("packed@1: 1\u{2013}9 B"), "got: {text}");
     }
 
     #[test]
@@ -106,7 +113,8 @@ struct User {
         assert!(text.contains("of `Greeting`"), "got: {text}");
         assert!(text.contains("3 fields"), "got: {text}");
         assert!(text.contains("optional: no"), "got: {text}");
-        assert!(text.contains("variable"), "got: {text}"); // `string` is unbounded
+        // `string` is unbounded.
+        assert!(text.contains("packed@1: 1 B\u{2013}unbounded"), "got: {text}");
     }
 
     #[test]
@@ -119,8 +127,7 @@ struct User {
 
         let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
         let text = hover_text(hover);
-        assert!(text.contains("1 byte"), "got: {text}");
-        assert!(!text.contains("1 bytes"), "got: {text}");
+        assert!(text.contains("packed@1: 1 B"), "got: {text}");
     }
 
     #[test]
@@ -132,9 +139,7 @@ struct User {
 
         let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
         let text = hover_text(hover);
-        assert!(text.contains("1 byte"), "got: {text}");
-        assert!(!text.contains("1 bytes"), "got: {text}");
-        assert!(text.contains("8 bits"), "got: {text}");
+        assert!(text.contains("packed@1: 1 B"), "got: {text}");
     }
 
     #[test]
@@ -255,9 +260,9 @@ struct User {
         let text = hover_text(hover);
         assert!(text.contains("optional id: u64 = 0"), "got: {text}");
         assert!(text.contains("optional: yes"), "got: {text}");
-        // Optional is always variable at the wire, regardless of `u64`'s
-        // own fixed size, since it needs a presence sentinel.
-        assert!(text.contains("size: variable"), "got: {text}");
+        // Optional is absent or the `u64`: the field's own range, not the
+        // type's (`range_of_field`).
+        assert!(text.contains("packed@1: 1\u{2013}9 B"), "got: {text}");
     }
 
     #[test]
@@ -412,7 +417,7 @@ protocol Chat {
         // `text: string` is unbounded, so the whole struct's size is too —
         // the direct regression guard for the `other_docs`-retention
         // restructuring that threads a cross-file SizeLookup through.
-        assert!(text.contains("variable"), "got: {text}");
+        assert!(text.contains("B\u{2013}unbounded"), "got: {text}");
     }
 
     /// Without a `use`, a name another file declares is unknown here: the
@@ -437,7 +442,7 @@ protocol Chat {
     }
 
     /// A field typed with a name nothing imports has no size to add: the
-    /// struct's is unknown, not the unimported declaration's estimate.
+    /// struct has no size, not the unimported declaration's.
     #[test]
     fn a_size_does_not_count_an_unimported_type() {
         let types = [(
@@ -452,10 +457,78 @@ protocol Chat {
         };
 
         let text = hover_on("struct S {\n    m: Message\n}\n", 0);
-        assert!(text.contains("wire size: unknown"), "got: {text}");
+        assert!(!text.contains("packed@1"), "got: {text}");
+        assert!(!text.contains("json@1"), "got: {text}");
 
         let text = hover_on("use types::Message\n\nstruct S {\n    m: Message\n}\n", 2);
-        assert!(text.contains("8 bytes"), "got: {text}");
+        assert!(text.contains("packed@1: 8 B"), "got: {text}");
+    }
+
+    /// The package's own format comes first, whichever it is, and the
+    /// others follow once each.
+    #[test]
+    fn the_packages_own_format_is_shown_first() {
+        let names =
+            |own: &str| -> Vec<&str> { size_formats(own).into_iter().map(|f| f.name).collect() };
+        let default = names("packed@1");
+        assert_eq!(default[0], "packed@1");
+        assert!(default.contains(&"json@1") && default.contains(&"msgpack@1"));
+
+        let json = names("json@1");
+        assert_eq!(json[0], "json@1");
+        assert_eq!(json.len(), default.len());
+
+        // Not an official format, so no rules: the official ones, in order.
+        assert_eq!(names("custom@1"), names("packed@1")[..].to_vec());
+    }
+
+    #[test]
+    fn a_hover_leads_with_the_format_the_manifest_declares() {
+        let manifest = (
+            Url::parse("file:///pkg/config.idp").unwrap(),
+            "congregation app\nspecification_version = 1\nwire = { format = \"json@1\" }\n".to_string(),
+        );
+        let uri = Url::parse("file:///pkg/src/a.ids").unwrap();
+        let text = get_hover_info_with_project(
+            "struct S {\n    on: bool\n}\n",
+            &uri,
+            Position::new(0, 8),
+            &[manifest],
+        )
+        .map(hover_text)
+        .expect("hover should resolve");
+        let json = text.find("json@1:").expect("json line");
+        let packed = text.find("packed@1:").expect("packed line");
+        assert!(json < packed, "got: {text}");
+    }
+
+    #[test]
+    fn a_range_reads_as_bytes() {
+        let range = |min, max, upper_bound| Range {
+            min,
+            max,
+            upper_bound,
+        };
+        assert_eq!(render_range(range(8, Some(8), false)), "8 B");
+        assert_eq!(render_range(range(9, Some(137), false)), "9\u{2013}137 B");
+        assert_eq!(render_range(range(9, None, false)), "9 B\u{2013}unbounded");
+        assert_eq!(render_range(range(9, Some(137), true)), "9 B, at most 137 B");
+    }
+
+    /// An enum is sized in each format by itself; a `const` by its type.
+    #[test]
+    fn an_enum_and_a_constant_show_their_sizes() {
+        let uri = Url::parse("file:///test.ids").unwrap();
+        let hover = |source: &str, line, character| {
+            get_hover_info(source, &uri, Position::new(line, character))
+                .map(hover_text)
+                .unwrap_or_default()
+        };
+        let text = hover("enum Color {\n    Red\n    Green\n}\n", 0, 6);
+        assert!(text.contains("packed@1: 1 B"), "got: {text}");
+
+        let text = hover("const LIMIT: u32 = 10\n", 0, 7);
+        assert!(text.contains("packed@1: 4 B"), "got: {text}");
     }
 
     /// A std validator nothing imports: no signature, no docs.
@@ -503,7 +576,9 @@ protocol Chat {
 
         let hover = hover.expect("hover should resolve even through a cross-file cycle");
         let text = hover_text(hover);
-        assert!(text.contains("unknown"), "got: {text}");
+        // Sized in no format: nothing said, not a number.
+        assert!(text.contains("struct A"), "got: {text}");
+        assert!(!text.contains("packed@1"), "got: {text}");
     }
 
     #[test]
