@@ -16,8 +16,9 @@ use comline_core::schema::idl::grammar::{
     Declaration, Document, Expression, Field, Settings, Type,
 };
 use comline_core::schema::idl::module_docs::summary;
-use comline_core::schema::idl::size::{self, Range, SizeLookup, SizeTarget};
+use comline_core::schema::idl::size::{self, Range, SizeLookup, SizeTarget, Sizes};
 use comline_core::schema::idl::vocabulary;
+use comline_core::encodings::{official, EncodingKind};
 use comline_core::schema::ir::compiler::interpreter::incremental::IncrementalInterpreter;
 use comline_core::schema::ir::compiler::Compile;
 use comline_core::settings::catalog;
@@ -155,6 +156,7 @@ pub fn get_hover_info_with_project<S: ProjectSource>(
     let lookup = HoverSizeLookup {
         local: &document,
         others: &other_docs,
+        formats: size_formats(&package_format(other_files)),
     };
 
     // A symbol in this file. The cursor sitting on a declaration's own
@@ -228,65 +230,56 @@ type Sibling<'a> = (&'a Url, &'a str, Document);
 /// Where a sibling sits: the namespace it's seen under.
 type Origin = Vec<String>;
 
-/// The size hover shows for a type: what `packed@1` (the packed encoding, the
-/// one the hover has always described) takes for it, by core's per-format
-/// ranges. Fixed when every value takes the same bytes, variable when they
-/// differ or have no bound, unknown where the type can't be sized (a name
-/// that doesn't resolve, a union, a cycle with no depth limit).
-#[derive(Clone, Copy)]
-enum WireSize {
-    Fixed(u64),
-    Variable,
-    Unknown,
-}
-
-impl WireSize {
-    fn of(range: Option<Range>) -> Self {
-        match range {
-            Some(r) if r.is_fixed() => WireSize::Fixed(r.min),
-            Some(_) => WireSize::Variable,
-            None => WireSize::Unknown,
-        }
-    }
-}
-
-/// No constant's value is known to the hover, so a size that names one
-/// (`char[max MAX_NAME]`) is not sized.
-fn no_constants(_: &str) -> Option<u64> {
-    None
-}
-
-fn size_of_type(ty: &Type, lookup: &HoverSizeLookup) -> WireSize {
-    WireSize::of(
-        size::rules("packed@1")
-            .and_then(|rules| size::range_of_type(ty, rules, lookup, &no_constants)),
-    )
-}
-
-fn size_of_struct(
-    s: &comline_core::schema::idl::grammar::Struct,
-    lookup: &HoverSizeLookup,
-) -> WireSize {
-    WireSize::of(
-        size::rules("packed@1")
-            .and_then(|rules| size::range_of_struct(s, rules, lookup, &no_constants)),
-    )
-}
-
-fn size_of_enum(e: &comline_core::schema::idl::grammar::Enum) -> WireSize {
-    WireSize::of(size::rules("packed@1").and_then(|rules| size::range_of_enum(e, rules)))
-}
-
 /// Resolves a bare type name to its declaration across the active document
 /// plus the files its `use`s reach: local document first, then `others` in
 /// order — directly imported siblings first (see the call site that builds
-/// `others`). A name nothing imports stays unresolved, and its size
-/// `Unknown`. Backs
-/// [`size::range_of_type`] / [`size::range_of_struct`] for the size block in
-/// [`create_symbol_hover`].
+/// `others`). A name nothing imports stays unresolved, and a type that
+/// names it has no size. Backs [`size::range_of_type`] /
+/// [`size::range_of_struct`] for the size block in [`create_symbol_hover`],
+/// and carries the formats those sizes are shown in.
 struct HoverSizeLookup<'a> {
     local: &'a Document,
     others: &'a [(&'a Url, &'a str, Document)],
+    formats: Vec<SizeFormat>,
+}
+
+/// A format the hover shows sizes in, with its size rules.
+struct SizeFormat {
+    name: &'static str,
+    rules: &'static Sizes,
+}
+
+/// The formats a size is shown in: the package's own first (its
+/// `wire.format`, as `config.idp` writes it), then each other official
+/// format that has size rules. A format of the package's own declaring has
+/// none, so isn't shown.
+fn size_formats(own: &str) -> Vec<SizeFormat> {
+    let mut names: Vec<&'static str> = official::resolve(EncodingKind::Format, own)
+        .into_iter()
+        .collect();
+    for name in official::names(EncodingKind::Format) {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+        .into_iter()
+        .filter_map(|name| {
+            Some(SizeFormat {
+                name,
+                rules: size::rules(name)?,
+            })
+        })
+        .collect()
+}
+
+/// The `wire.format` the package's `config.idp` states, else core's default.
+fn package_format<S: ProjectSource>(other_files: &[S]) -> String {
+    other_files
+        .iter()
+        .find(|file| source::is_manifest(file.uri()) && file.dependency().is_none())
+        .map(|manifest| source::declared_wire(manifest.text()).format)
+        .unwrap_or_else(|| comline_core::schema::idl::annotations::DEFAULT_FORMAT.to_string())
 }
 
 impl<'a> SizeLookup for HoverSizeLookup<'a> {
@@ -344,75 +337,95 @@ fn fully_resolve_alias_chain(
     current
 }
 
-/// Render a computed size as the one-line summary hover shows for a struct
-/// or enum: `wire size (fixed, packed@1): 16 bytes (128 bits)`,
-/// `wire size: variable`, or `wire size: unknown` when a reference doesn't
-/// resolve or a cycle was hit. Plain text, not markdown emphasis — this
-/// joins the per-field breakdown into one multi-line prose block (see
-/// `create_symbol_hover`), not a single-line caption like the "*N fields*"
-/// detail line.
-fn format_wire_size(size: WireSize) -> String {
-    match size {
-        WireSize::Fixed(bytes) => {
-            format!(
-                "wire size (fixed, packed@1): {} ({} bits)",
-                byte_count(bytes),
-                bytes * 8
-            )
-        }
-        WireSize::Variable => "wire size: variable".to_string(),
-        WireSize::Unknown => "wire size: unknown".to_string(),
+/// No constant has a value here: a size that names one has none.
+fn no_constants(_: &str) -> Option<u64> {
+    None
+}
+
+/// What `range_of` makes of each of the lookup's formats, the formats it
+/// can't size left out.
+fn ranges_by_format(
+    lookup: &HoverSizeLookup,
+    range_of: impl Fn(&Sizes) -> Option<Range>,
+) -> Vec<(&'static str, Range)> {
+    lookup
+        .formats
+        .iter()
+        .filter_map(|format| Some((format.name, range_of(format.rules)?)))
+        .collect()
+}
+
+/// A range as bytes: `8 B`, `9–137 B`, `9 B–unbounded` where
+/// nothing bounds it, `9 B, at most 137 B` where the maximum is only a bound.
+fn render_range(range: Range) -> String {
+    match range.max {
+        Some(max) if range.upper_bound => format!("{} B, at most {max} B", range.min),
+        Some(max) if max == range.min => format!("{max} B"),
+        Some(max) => format!("{}\u{2013}{max} B", range.min),
+        None => format!("{} B\u{2013}unbounded", range.min),
     }
 }
 
-/// One-line rendering of a field's own size: `8 bytes` / `variable` /
-/// `unknown` — shared between the struct's per-field breakdown and a single
-/// field's own hover.
-fn render_size_oneline(size: WireSize) -> String {
-    match size {
-        WireSize::Fixed(bytes) => byte_count(bytes),
-        WireSize::Variable => "variable".to_string(),
-        WireSize::Unknown => "unknown".to_string(),
-    }
+/// One bullet per format: `- packed@1: 9–137 B`.
+fn render_format_ranges(ranges: &[(&str, Range)]) -> String {
+    ranges
+        .iter()
+        .map(|(format, range)| format!("- {format}: {}", render_range(*range)))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-/// "1 byte" / "N bytes" — 0 reads as plural ("0 bytes"), same as English
-/// normally treats a zero count.
-fn byte_count(bytes: u64) -> String {
-    if bytes == 1 {
-        "1 byte".to_string()
-    } else {
-        format!("{bytes} bytes")
-    }
+/// The size block of a hover: `**Wire size**` and a line per format; `None`
+/// where no format can size it.
+fn render_size_block(ranges: &[(&str, Range)]) -> Option<String> {
+    (!ranges.is_empty()).then(|| format!("**Wire size**\n\n{}", render_format_ranges(ranges)))
 }
 
-/// A field's declared size: `variable` the moment it's `optional` (absence
-/// is itself variable-length), otherwise whatever its type resolves to.
-fn field_size(f: &Field, lookup: &HoverSizeLookup) -> WireSize {
-    WireSize::of(
-        size::rules("packed@1")
-            .and_then(|rules| size::range_of_field(f, rules, lookup, &no_constants)),
-    )
+/// A field's own range in each format. `optional` is the field's, so it
+/// counts for the absent value too.
+fn field_size(f: &Field, lookup: &HoverSizeLookup) -> Vec<(&'static str, Range)> {
+    ranges_by_format(lookup, |rules| {
+        size::range_of_field(f, rules, lookup, &no_constants)
+    })
 }
 
-/// Per-field breakdown line for a struct's size block, one field per line,
-/// prefixed with its wire index — the position `comline-rust`'s positional
+/// A struct's size block: its total in each format, then a per-field
+/// breakdown in the first (the package's own), one field per line,
+/// prefixed with its wire index - the position `comline-rust`'s positional
 /// (array-form) MsgPack encoding actually keys on, and the number the
 /// append-only field discipline (see Versioning rules) protects.
-/// `- #0 name: 8 bytes` / `- #1 name: variable`.
+/// `- #0 name: 8 B` / `- #1 name: 1 B–unbounded`; a field with no size
+/// in that format is listed without one.
+fn render_struct_size_block(
+    s: &comline_core::schema::idl::grammar::Struct,
+    lookup: &HoverSizeLookup,
+) -> Option<String> {
+    let totals = ranges_by_format(lookup, |rules| {
+        size::range_of_struct(s, rules, lookup, &no_constants)
+    });
+    let fields = render_field_sizes(s, lookup);
+    match (render_size_block(&totals), fields.is_empty()) {
+        (Some(total), true) => Some(total),
+        (Some(total), false) => Some(format!("{total}\n\n{fields}")),
+        (None, false) => Some(fields),
+        (None, true) => None,
+    }
+}
+
 fn render_field_sizes(
     s: &comline_core::schema::idl::grammar::Struct,
     lookup: &HoverSizeLookup,
 ) -> String {
+    let own = lookup.formats.first();
     s.fields()
         .iter()
         .enumerate()
         .map(|(index, f)| {
-            format!(
-                "- #{index} {}: {}",
-                f.name(),
-                render_size_oneline(field_size(f, lookup))
-            )
+            let size = own
+                .and_then(|format| size::range_of_field(f, format.rules, lookup, &no_constants))
+                .map(|range| format!(": {}", render_range(range)))
+                .unwrap_or_default();
+            format!("- #{index} {}{size}", f.name())
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -526,17 +539,10 @@ fn create_symbol_hover(
                     })
                     .collect();
 
-                let total = size_of_struct(s, lookup);
-                let size_block = format!(
-                    "{}\n{}",
-                    format_wire_size(total),
-                    render_field_sizes(s, lookup)
-                );
-
                 (
                     format!("struct {} {{\n{}\n}}", symbol.name, fields.join("\n")),
                     s.docstring(),
-                    Some(size_block),
+                    render_struct_size_block(s, lookup),
                 )
             } else {
                 (format!("struct {}", symbol.name), None, None)
@@ -550,12 +556,13 @@ fn create_symbol_hover(
                     .map(|v| format!("  {}", v.identifier().text))
                     .collect();
 
-                let size_block = format_wire_size(size_of_enum(e));
+                let size_block =
+                    render_size_block(&ranges_by_format(lookup, |rules| size::range_of_enum(e, rules)));
 
                 (
                     format!("enum {} {{\n{}\n}}", symbol.name, variants.join("\n")),
                     e.docstring(),
-                    Some(size_block),
+                    size_block,
                 )
             } else {
                 (format!("enum {}", symbol.name), None, None)
@@ -601,24 +608,14 @@ fn create_symbol_hover(
         }
         SymbolKind::CONSTANT => {
             if let Some(c) = find_const_declaration(document, &symbol.name) {
-                let size = size_of_type(&c.type_def, lookup);
-                let size_display = format_wire_size(size);
-
-                println!("Size of constant: {}", format_wire_size(size));
-                
-                /*
-                let total = size_of_struct(s, lookup);
-                let size_block = format!(
-                    "{}\n{}",
-                    format_wire_size(total),
-                    render_field_sizes(s, lookup)
-                );
-                */
+                let size_display = render_size_block(&ranges_by_format(lookup, |rules| {
+                    size::range_of_type(&c.type_def, rules, lookup, &no_constants)
+                }));
 
                 (
                     format!("const {}: {}", c.name(), format_type(c.type_def())),
                     c.docstring(),
-                    Some(size_display),
+                    size_display,
                 )
             } else {
                 (format!("const {}", symbol.name), None, None)
@@ -973,7 +970,8 @@ struct FieldHoverInfo {
     default: Option<String>,
     docstring: Option<String>,
     annotations: Vec<String>,
-    size: WireSize,
+    /// Its range in each format that can size it.
+    size: Vec<(&'static str, Range)>,
 }
 
 /// Create hover for a field: signature, docstring (if any), then a detail
@@ -997,16 +995,16 @@ fn create_field_hover(info: &FieldHoverInfo) -> Hover {
         contents.push(MarkedString::from_markdown(doc.clone()));
     }
 
-    let mut detail = vec![
-        format!(
-            "field **#{}** of `{}` ({} field{})",
-            info.index,
-            info.container,
-            info.total,
-            if info.total == 1 { "" } else { "s" }
-        ),
-        format!("size: {}", render_size_oneline(info.size)),
-    ];
+    let mut detail = vec![format!(
+        "field **#{}** of `{}` ({} field{})",
+        info.index,
+        info.container,
+        info.total,
+        if info.total == 1 { "" } else { "s" }
+    )];
+    if !info.size.is_empty() {
+        detail.push(format!("size:\n\n{}", render_format_ranges(&info.size)));
+    }
     detail.push(format!(
         "optional: {}",
         if info.optional { "yes" } else { "no" }
