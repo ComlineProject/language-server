@@ -30,23 +30,18 @@ jobs:
   # The analysis library alone (`--no-default-features`: no tower-lsp, no
   # tokio), which the playground links for the browser. Building core for
   # wasm32 compiles C for the target (tree-sitter through rust-sitter-tool,
-  # psm through stacker), which needs clang; the VM ships with it and the wasm
-  # CI image doesn't yet. It moves into ci-wasm once the image has clang
-  # (ci-images#5). Nothing is installed here.
+  # psm through stacker), so it needs clang, which the wasm CI image has
+  # (stable 1.99.1 and the wasm32-unknown-unknown target).
   wasm:
     name: analysis lib - wasm32
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    container: ghcr.io/comlineproject/ci-wasm@sha256:9e0c4c31b5e8ebf1521f912f693fa3881e95c437d29698ec0925c174869f760b
+    defaults:
+      run:
+        shell: bash
     steps:
-      - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
-        with:
-          egress-policy: audit
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
-        with:
-          toolchain: 1.99.1
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo build --no-default-features --target wasm32-unknown-unknown --verbose
