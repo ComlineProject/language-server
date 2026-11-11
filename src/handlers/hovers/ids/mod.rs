@@ -16,7 +16,7 @@ use comline_core::schema::idl::grammar::{
     Declaration, Document, Expression, Field, Settings, Type,
 };
 use comline_core::schema::idl::module_docs::summary;
-use comline_core::schema::idl::size::{self, SizeLookup, SizeTarget, WireSize, size_of_type};
+use comline_core::schema::idl::size::{self, Range, SizeLookup, SizeTarget};
 use comline_core::schema::idl::vocabulary;
 use comline_core::schema::ir::compiler::interpreter::incremental::IncrementalInterpreter;
 use comline_core::schema::ir::compiler::Compile;
@@ -228,12 +228,61 @@ type Sibling<'a> = (&'a Url, &'a str, Document);
 /// Where a sibling sits: the namespace it's seen under.
 type Origin = Vec<String>;
 
+/// The size hover shows for a type: what `packed@1` (the packed encoding, the
+/// one the hover has always described) takes for it, by core's per-format
+/// ranges. Fixed when every value takes the same bytes, variable when they
+/// differ or have no bound, unknown where the type can't be sized (a name
+/// that doesn't resolve, a union, a cycle with no depth limit).
+#[derive(Clone, Copy)]
+enum WireSize {
+    Fixed(u64),
+    Variable,
+    Unknown,
+}
+
+impl WireSize {
+    fn of(range: Option<Range>) -> Self {
+        match range {
+            Some(r) if r.is_fixed() => WireSize::Fixed(r.min),
+            Some(_) => WireSize::Variable,
+            None => WireSize::Unknown,
+        }
+    }
+}
+
+/// No constant's value is known to the hover, so a size that names one
+/// (`char[max MAX_NAME]`) is not sized.
+fn no_constants(_: &str) -> Option<u64> {
+    None
+}
+
+fn size_of_type(ty: &Type, lookup: &HoverSizeLookup) -> WireSize {
+    WireSize::of(
+        size::rules("packed@1")
+            .and_then(|rules| size::range_of_type(ty, rules, lookup, &no_constants)),
+    )
+}
+
+fn size_of_struct(
+    s: &comline_core::schema::idl::grammar::Struct,
+    lookup: &HoverSizeLookup,
+) -> WireSize {
+    WireSize::of(
+        size::rules("packed@1")
+            .and_then(|rules| size::range_of_struct(s, rules, lookup, &no_constants)),
+    )
+}
+
+fn size_of_enum(e: &comline_core::schema::idl::grammar::Enum) -> WireSize {
+    WireSize::of(size::rules("packed@1").and_then(|rules| size::range_of_enum(e, rules)))
+}
+
 /// Resolves a bare type name to its declaration across the active document
 /// plus the files its `use`s reach: local document first, then `others` in
 /// order — directly imported siblings first (see the call site that builds
 /// `others`). A name nothing imports stays unresolved, and its size
 /// `Unknown`. Backs
-/// [`size::size_of_type`] / [`size::size_of_struct`] for the size block in
+/// [`size::range_of_type`] / [`size::range_of_struct`] for the size block in
 /// [`create_symbol_hover`].
 struct HoverSizeLookup<'a> {
     local: &'a Document,
@@ -296,7 +345,7 @@ fn fully_resolve_alias_chain(
 }
 
 /// Render a computed size as the one-line summary hover shows for a struct
-/// or enum: `wire size (fixed, raw-packed estimate): 16 bytes (128 bits)`,
+/// or enum: `wire size (fixed, packed@1): 16 bytes (128 bits)`,
 /// `wire size: variable`, or `wire size: unknown` when a reference doesn't
 /// resolve or a cycle was hit. Plain text, not markdown emphasis — this
 /// joins the per-field breakdown into one multi-line prose block (see
@@ -306,7 +355,7 @@ fn format_wire_size(size: WireSize) -> String {
     match size {
         WireSize::Fixed(bytes) => {
             format!(
-                "wire size (fixed, raw-packed estimate): {} ({} bits)",
+                "wire size (fixed, packed@1): {} ({} bits)",
                 byte_count(bytes),
                 bytes * 8
             )
@@ -329,7 +378,7 @@ fn render_size_oneline(size: WireSize) -> String {
 
 /// "1 byte" / "N bytes" — 0 reads as plural ("0 bytes"), same as English
 /// normally treats a zero count.
-fn byte_count(bytes: u32) -> String {
+fn byte_count(bytes: u64) -> String {
     if bytes == 1 {
         "1 byte".to_string()
     } else {
@@ -340,11 +389,10 @@ fn byte_count(bytes: u32) -> String {
 /// A field's declared size: `variable` the moment it's `optional` (absence
 /// is itself variable-length), otherwise whatever its type resolves to.
 fn field_size(f: &Field, lookup: &HoverSizeLookup) -> WireSize {
-    if f.optional() {
-        WireSize::Variable
-    } else {
-        size::size_of_type(f.field_type(), lookup)
-    }
+    WireSize::of(
+        size::rules("packed@1")
+            .and_then(|rules| size::range_of_field(f, rules, lookup, &no_constants)),
+    )
 }
 
 /// Per-field breakdown line for a struct's size block, one field per line,
@@ -478,7 +526,7 @@ fn create_symbol_hover(
                     })
                     .collect();
 
-                let total = size::size_of_struct(s, lookup);
+                let total = size_of_struct(s, lookup);
                 let size_block = format!(
                     "{}\n{}",
                     format_wire_size(total),
@@ -502,7 +550,7 @@ fn create_symbol_hover(
                     .map(|v| format!("  {}", v.identifier().text))
                     .collect();
 
-                let size_block = format_wire_size(size::size_of_enum(e));
+                let size_block = format_wire_size(size_of_enum(e));
 
                 (
                     format!("enum {} {{\n{}\n}}", symbol.name, variants.join("\n")),
@@ -553,13 +601,13 @@ fn create_symbol_hover(
         }
         SymbolKind::CONSTANT => {
             if let Some(c) = find_const_declaration(document, &symbol.name) {
-                let size = size::size_of_type(&c.type_def, lookup);
+                let size = size_of_type(&c.type_def, lookup);
                 let size_display = format_wire_size(size);
 
                 println!("Size of constant: {}", format_wire_size(size));
                 
                 /*
-                let total = size::size_of_struct(s, lookup);
+                let total = size_of_struct(s, lookup);
                 let size_block = format!(
                     "{}\n{}",
                     format_wire_size(total),
