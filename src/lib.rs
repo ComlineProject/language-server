@@ -13,37 +13,8 @@
 pub mod parser;
 pub mod util;
 
-pub mod analysis {
-    pub mod comline_toml;
-    pub mod diagnostics;
-    pub mod generation;
-    pub mod import_check;
-    pub mod imports;
-    pub mod modules;
-    pub mod parse_cache;
-    pub mod project;
-    pub mod source;
-    pub mod stdlib;
-    pub mod symbols;
-}
-
-pub mod handlers {
-    pub mod annotation_hover;
-    pub mod code_actions;
-    pub mod comline_toml;
-    pub mod completion;
-    pub mod definition;
-    pub mod formatting;
-    pub mod hover;
-    pub mod idp_hover;
-    pub mod protocol_summary;
-    pub mod references;
-    pub mod rename;
-    pub mod semantic_tokens;
-    pub mod signature_help;
-    pub mod symbols;
-    pub mod unit_hover;
-}
+pub mod analysis;
+pub mod handlers;
 
 #[cfg(feature = "server")]
 pub mod acceptance;

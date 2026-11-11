@@ -527,8 +527,8 @@ impl LanguageServer for Backend {
             // through to VS Code's own idpSchema.ts-backed client
             // provider — an independent registration, merged by VS Code
             // with whatever the server returns, not middleware.
-            use crate::handlers::idp_hover;
-            return Ok(idp_hover::get_idp_hover_info(&document.text, position));
+            use crate::handlers::hovers::idp;
+            return Ok(idp::get_idp_hover_info(&document.text, position));
         }
         if is_comline_toml(&uri) {
             let Some(document) = self.documents.get(&uri) else {
@@ -552,9 +552,8 @@ impl LanguageServer for Backend {
         let other_files = self.other_project_files(&uri);
 
         // Use our hover handler
-        use crate::handlers::hover;
         let found =
-            hover::get_hover_info_with_project(&document.text, &uri, position, &other_files);
+            crate::handlers::hovers::ids::get_hover_info_with_project(&document.text, &uri, position, &other_files);
         // On a protocol's name, `@framing` or `@handshake`: what it speaks
         // and which guarantees it keeps, as `comline inspect` shows them.
         Ok(crate::handlers::protocol_summary::extend(

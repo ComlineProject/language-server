@@ -1,3 +1,4 @@
+//! Package configuration hover handler - provides type information on hover
 // Hover for `.idp` `settings = { ... }` blocks — the one `.idp` construct
 // that gets real, server-side, position-based hover. Everything else in
 // `.idp` keeps using the client-side text-heuristic (`idpSchema.ts`) —
