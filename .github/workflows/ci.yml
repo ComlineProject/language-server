@@ -4,39 +4,42 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+# A newer push to the same pull request supersedes this run; a branch's runs
+# queue instead.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build_and_test:
-    name: Rust project - stable
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: rustup update stable && rustup default stable
-      - run: cargo build --verbose
-      - run: cargo test --verbose
+  # The toolchain matrix (stable, beta, nightly), the same build and tests on
+  # the other platforms (core#9), and a stable canary on ubuntu-26.04 that may
+  # fail without failing the run. The reusable workflow's own jobs set the
+  # runner, the timeouts and the pinned actions.
+  rust:
+    name: rust
+    permissions:
+      contents: read
+    uses: ComlineProject/.github/.github/workflows/rust-ci.yml@797d473553d7f2fc50895bb2573acb83ac63c7cb # main, no release tag yet
 
+  # The analysis library alone (`--no-default-features`: no tower-lsp, no
+  # tokio), which the playground links for the browser. In the wasm CI image
+  # (stable 1.99.1 and the wasm32-unknown-unknown target).
   wasm:
     name: analysis lib - wasm32
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    container: ghcr.io/comlineproject/ci-wasm@sha256:badd6af13cee6c459c9284de8ef0ef4a1667ed7e35582f87d1afb08f3c30fd8f
+    defaults:
+      run:
+        shell: bash
     steps:
-      - uses: actions/checkout@v4
-      - run: rustup update stable && rustup default stable && rustup target add wasm32-unknown-unknown
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - run: cargo build --no-default-features --target wasm32-unknown-unknown --verbose
-
-  # Cross-platform (core#9): separate job names so the Linux checks above
-  # stay unchanged.
-  build_and_test_xp:
-    name: Rust project - stable (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, macos-latest, ubuntu-24.04-arm]
-    steps:
-      - uses: actions/checkout@v7
-      - run: rustup update stable && rustup default stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --verbose
-      - run: cargo test --verbose
