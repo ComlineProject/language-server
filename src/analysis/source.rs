@@ -306,6 +306,85 @@ pub fn manifest_error_span(manifest: &str, message: &str) -> (usize, usize) {
         .unwrap_or((0, 0))
 }
 
+/// What a manifest freezes to, for the wire and encodings the guarantee check
+/// reads: core's own interpretation of `config.idp`, as `comline build` makes
+/// it.
+pub struct FrozenConfig {
+    /// The frozen units, or `None` when the manifest can't be interpreted (it
+    /// doesn't parse, or the build would refuse it): then nothing is known of
+    /// the package's wire or encodings.
+    pub units: Option<Vec<comline_core::package::config::ir::frozen::FrozenUnit>>,
+    /// Whether `units` holds every encoding the manifest declares. An
+    /// encoding freezes with the facts its profile states and whether vectors
+    /// sit beside it, which only the package's directory can say: where the
+    /// manifest isn't on disk, or a profile can't be read, the entries are
+    /// left out and this is `false`.
+    pub complete: bool,
+}
+
+/// `manifest` interpreted by core, its `encodings` read from the profiles
+/// beside it when `path` (where the manifest lives on disk, if it does) allows.
+///
+/// `settings` is left out: it can be a cross-package reference, which has
+/// nothing to resolve against here and which the guarantee check doesn't read
+/// (the package's settings come from [`declared_settings`] and
+/// [`resolve_cross_package_settings`]).
+pub fn frozen_config(manifest: &str, path: Option<&std::path::Path>) -> FrozenConfig {
+    use comline_core::package::config::ir::context::{Origin, ProjectContext};
+    use comline_core::package::config::ir::interpreter::interpret::interpret_context;
+
+    let Some(mut congregation) = parser::parse_idp(manifest).ok().and_then(|r| r.document) else {
+        return FrozenConfig {
+            units: None,
+            complete: false,
+        };
+    };
+    congregation
+        .assignments
+        .retain(|a| a.value.key.text() != "settings");
+    let declares_encodings = congregation
+        .assignments
+        .iter()
+        .any(|a| a.value.key.text() == "encodings");
+
+    if let Some(path) = path.filter(|_| declares_encodings) {
+        let context = ProjectContext::with_config_from_origin(
+            Origin::Disk(path.to_path_buf()),
+            congregation.clone(),
+        );
+        if let Ok(units) = interpret_context(&context, None) {
+            return FrozenConfig {
+                units: Some(units),
+                complete: true,
+            };
+        }
+    }
+    // Without the profiles: the rest of the manifest is still what it says.
+    without_encodings(&mut congregation);
+    match interpret_context(&ProjectContext::with_config(congregation), None) {
+        Ok(units) => FrozenConfig {
+            units: Some(units),
+            complete: !declares_encodings,
+        },
+        Err(_) => FrozenConfig {
+            units: None,
+            complete: false,
+        },
+    }
+}
+
+/// Where `uri` is on disk, if it is. [`Url::to_file_path`] doesn't exist on
+/// `wasm32-unknown-unknown` (see `analysis::imports`), where nothing is.
+#[cfg(any(unix, windows, target_os = "redox", target_os = "wasi"))]
+pub fn disk_path(uri: &Url) -> Option<std::path::PathBuf> {
+    uri.to_file_path().ok()
+}
+
+#[cfg(not(any(unix, windows, target_os = "redox", target_os = "wasi")))]
+pub fn disk_path(_: &Url) -> Option<std::path::PathBuf> {
+    None
+}
+
 /// `congregation` without its `encodings` key. Core freezes an encoding by
 /// reading its profile from the package directory, which the text alone
 /// doesn't have, so the key is left out wherever only other keys matter.
