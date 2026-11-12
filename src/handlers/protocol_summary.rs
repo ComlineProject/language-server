@@ -11,9 +11,9 @@
 //! The saved state is not the buffer's: an unsaved `@handshake = "none"`, or
 //! a removed `@unverified`, changes what is guaranteed and the saved build
 //! doesn't know. So when any open file the build reads (a schema of the
-//! package, or its `config.idp`) differs from disk, the guarantee rows are
-//! left out and a line says why - never a guarantee claimed from a stale
-//! view. The rest of the summary stays (see [`markdown_unsaved`]).
+//! package, or its `config.idp`) differs from disk, the whole summary (the
+//! wire choices and the guarantees) is left out and a line says why - never
+//! a guarantee claimed from a stale view (see [`markdown_unsaved`]).
 
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
@@ -84,18 +84,17 @@ pub fn markdown(p: &ProtocolSummary) -> String {
     out
 }
 
-/// The summary for a package whose view differs from disk: the choices, and
-/// in place of the guarantees, [`UNSAVED_NOTE`]. The summary is of the saved
-/// build, so what it says is not the buffer's to claim held or given up.
-pub fn markdown_unsaved(p: &ProtocolSummary) -> String {
-    let mut out = choices(p);
-    out.push_str(&format!("\n*{UNSAVED_NOTE}*\n"));
-    out
+/// The summary for a package whose view differs from disk: only
+/// [`UNSAVED_NOTE`]. The summary is of the saved build, so neither its wire
+/// choices nor its guarantees are the buffer's to claim.
+pub fn markdown_unsaved() -> String {
+    format!("*{UNSAVED_NOTE}*\n")
 }
 
-/// What the hover says in place of the guarantees.
-pub const UNSAVED_NOTE: &str = "Guarantees: save to see them. \
-    The open file has unsaved changes, and they come from the saved build.";
+/// What the hover says in place of the summary.
+pub const UNSAVED_NOTE: &str = "The open file has unsaved changes. \
+    Save to see this protocol's wire choices and guarantees, \
+    which come from the saved build.";
 
 /// The choices: what the protocol speaks, and where each came from.
 fn choices(p: &ProtocolSummary) -> String {
@@ -207,7 +206,7 @@ fn guarantees(p: &ProtocolSummary) -> String {
 ///
 /// `unsaved` says whether the package's view differs from disk (see
 /// [`unsaved_in_package`]); it is asked only when there is a summary to
-/// show. When it does, the guarantees are left out.
+/// show. When it does, the summary is replaced by [`UNSAVED_NOTE`].
 pub fn extend(
     hover: Option<Hover>,
     source: &str,
@@ -239,7 +238,7 @@ pub fn extend(
         return hover;
     };
     let summary = MarkedString::from_markdown(if unsaved() {
-        markdown_unsaved(&summary)
+        markdown_unsaved()
     } else {
         markdown(&summary)
     });
@@ -606,11 +605,16 @@ mod tests {
     }
 
     fn shows_guarantees(hover: &str) -> bool {
-        hover.contains("**Guarantees**") && hover.contains("| schema agreement |")
+        hover.contains("**On the wire**")
+            && hover.contains("**Guarantees**")
+            && hover.contains("| schema agreement |")
     }
 
     fn says_save_first(hover: &str) -> bool {
-        hover.contains(&format!("*{UNSAVED_NOTE}*"))
+        // Only the note: no wire choices and no guarantees.
+        hover == format!("*{UNSAVED_NOTE}*\n")
+            && !hover.contains("On the wire")
+            && !hover.contains("| format |")
             && !hover.contains("held")
             && !hover.contains("given up")
             && !hover.contains("| schema agreement |")
@@ -647,9 +651,10 @@ mod tests {
         let edited = format!("@handshake = \"none\"\n{ORDERS}");
         let hover = hover_with_open(&root, &edited, &[], "Orders");
         assert!(says_save_first(&hover), "{hover}");
-        // What is the buffer's own and what the build resolved stay.
-        assert!(hover.starts_with("**On the wire**"), "{hover}");
-        assert!(hover.contains("| format |"), "{hover}");
+        assert!(
+            hover.contains("Save to see this protocol's wire choices and guarantees"),
+            "{hover}"
+        );
 
         // And a removed `@unverified`: the build has it, the buffer not.
         let root_unverified = stale_package("removed");
