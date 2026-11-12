@@ -1,5 +1,5 @@
 //! `comline.toml`: the consumer's code-generation config, checked the way
-//! `comline generate` reads it.
+//! `comline generation` reads it.
 //!
 //! The file's shape comes from `comline_codegen::config` - its types, and the
 //! JSON Schema derived from them - so every key, type and enum value here is
@@ -42,7 +42,7 @@ pub const WRONG_TYPE: &str = "comline-toml::wrong-type";
 pub const BAD_VALUE: &str = "comline-toml::bad-value";
 /// A key that moved out of `comline.toml`.
 pub const MOVED_KEY: &str = "comline-toml::moved-key";
-/// Anything else `comline generate` refuses in the file's shape.
+/// Anything else `comline generation` refuses in the file's shape.
 pub const INVALID: &str = "comline-toml::invalid";
 /// A language `config.idp` doesn't declare.
 pub const UNDECLARED_LANGUAGE: &str = "comline-toml::undeclared-language";
@@ -180,7 +180,7 @@ impl Context {
         }
         if complete {
             // As core's compiler freezes them, and each framing judged by
-            // its declaration's frozen facts, as `comline generate` does.
+            // its declaration's frozen facts, as `comline generation` does.
             let mut units: Vec<&mut [comline_core::schema::ir::frozen::unit::FrozenUnit]> = schemas
                 .iter_mut()
                 .map(|(_, units)| units.as_mut_slice())
@@ -1118,7 +1118,7 @@ fn semantic(analysis: &mut Analysis, context: &Context) {
             .filter(|e| e.path == ["generate", "only"])
             .filter_map(|e| e.text.clone())
             .collect();
-        // (language, block) for every target `comline generate` would build.
+        // (language, block) for every target `comline generation` would build.
         let mut targets: Vec<(String, Option<usize>)> = Vec::new();
         let block_language = |i: usize| {
             analysis
@@ -1540,7 +1540,7 @@ mod tests {
         use crate::analysis::source::SourceFile;
         // A dependency declares `com.acme.lines@1`, its profile beside its
         // config.idp: whether it writes JSON is that profile's `payload`,
-        // frozen on the declaration, as `comline generate` reads it.
+        // frozen on the declaration, as `comline generation` reads it.
         let used = |payload: Option<&str>| {
             let root = std::env::temp_dir().join(format!(
                 "comline-lsp-framing-facts-{}-{}",
@@ -1599,7 +1599,7 @@ encodings = {
         assert!(!opaque.contains("json@1"), "{opaque:?}");
         // A profile the editor can't read states nothing.
         assert!(!used(None).contains("json@1"));
-        // The same set `comline generate` resolves through generation.
+        // The same set `comline generation` resolves through generation.
         let mut schemas = vec![(
             "app".to_string(),
             IncrementalInterpreter::from_declarations(

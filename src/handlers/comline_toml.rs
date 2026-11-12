@@ -317,13 +317,13 @@ pub fn code_actions(
 }
 
 /// "Check generator" on `generator = "<written>"`: would run its `Describe`,
-/// sandboxed as `comline generate` runs a `.wasm`. The language server
+/// sandboxed as `comline generation` runs a `.wasm`. The language server
 /// doesn't embed that sandbox (wasmtime), and never runs a native
 /// generator, so the action is offered disabled, saying why.
 pub fn check_generator(written: &str) -> CodeAction {
     let reason = if written.ends_with(".wasm") {
         "not available in the editor yet: the language server doesn't embed the wasm sandbox. Run \
-         `comline generate`, which describes it sandboxed"
+         `comline generation`, which describes it sandboxed"
             .to_string()
     } else {
         "only a `.wasm` generator can be checked, sandboxed - the editor never runs a native generator".to_string()
