@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use comline_core::package::config::ir::frozen::FrozenUnit as ConfigUnit;
 use comline_core::schema::idl::grammar::{
     Annotation, AnnotationValue, Declaration, Document, Type,
 };
@@ -71,6 +72,21 @@ pub struct Project<'a> {
     /// declare under `encodings`, by name and kind - what `@framing` and
     /// `@handshake` may name beyond the official ones.
     pub encodings: Vec<(String, comline_core::encodings::EncodingKind)>,
+    /// The package's `config.idp` as core freezes it: its `wire` and
+    /// `handshake` defaults, the encodings it declares with their facts. `None`
+    /// without a manifest in view, or one core can't interpret: nothing is
+    /// then known of the package's wire.
+    pub config: Option<Vec<ConfigUnit>>,
+    /// Each dependency's frozen `config.idp`, under its declared name - the
+    /// manifests the view has, which are the direct dependencies' only.
+    pub dependency_configs: Vec<(String, Vec<ConfigUnit>)>,
+    /// Each dependency's package-level settings, under its declared name: what
+    /// its own schemas' default bounds come from.
+    pub dependency_settings: BTreeMap<String, comline_core::settings::SettingsDict>,
+    /// Whether the view holds everything `comline build` judges `@unverified`
+    /// by: see [`Project::encodings_for`]. When it doesn't, a claim that a
+    /// protocol gives nothing up can't be made.
+    pub encodings_complete: bool,
     /// The edition `config.idp` names (core#102): what its schemas are
     /// checked for deprecated words against. The newest without one.
     pub edition: comline_core::edition::Edition,
@@ -154,6 +170,10 @@ impl<'a> Project<'a> {
             settings: Default::default(),
             settings_error: None,
             encodings: vec![],
+            config: None,
+            dependency_configs: vec![],
+            dependency_settings: BTreeMap::new(),
+            encodings_complete: false,
             edition: comline_core::edition::Edition::LATEST,
         }
     }
@@ -175,8 +195,17 @@ impl<'a> Project<'a> {
             settings: Default::default(),
             settings_error: None,
             encodings: vec![],
+            config: None,
+            dependency_configs: vec![],
+            dependency_settings: BTreeMap::new(),
+            encodings_complete: false,
             edition: comline_core::edition::Edition::LATEST,
         };
+        // What the guarantee check needs of the manifests, noted as they pass.
+        let mut own_frozen = false;
+        // Each dependency manifest: its name, whether it froze whole, and
+        // whether it has dependencies of its own (which the view doesn't hold).
+        let mut dependency_manifests: Vec<(String, bool, bool)> = vec![];
 
         for &input in &inputs {
             if source::is_manifest(input.uri) {
@@ -186,6 +215,21 @@ impl<'a> Project<'a> {
                         project
                             .encodings
                             .extend(source::declared_encodings(input.text));
+                        let frozen = source::frozen_config(
+                            input.text,
+                            source::disk_path(input.uri).as_deref(),
+                        );
+                        dependency_manifests.push((
+                            name.to_string(),
+                            frozen.complete,
+                            !source::declared_dependencies(input.text).is_empty(),
+                        ));
+                        if let Some(units) = frozen.units {
+                            project.dependency_configs.push((name.to_string(), units));
+                        }
+                        project
+                            .dependency_settings
+                            .insert(name.to_string(), source::declared_settings(input.text));
                         if let Some(docs) = module_docs(input.text) {
                             project.package_docs.insert(name.to_string(), docs);
                         }
@@ -198,6 +242,12 @@ impl<'a> Project<'a> {
                         project.dependencies = source::declared_dependencies(input.text);
                         project.languages = source::declared_languages(input.text);
                         project.edition = source::declared_edition(input.text);
+                        let frozen = source::frozen_config(
+                            input.text,
+                            source::disk_path(input.uri).as_deref(),
+                        );
+                        own_frozen = frozen.complete && frozen.units.is_some();
+                        project.config = frozen.units;
                         match source::resolve_cross_package_settings(input.text, &inputs) {
                             Some(Ok(dict)) => project.settings = dict,
                             Some(Err(message)) => project.settings_error = Some(message),
@@ -224,7 +274,55 @@ impl<'a> Project<'a> {
             }
         }
 
+        // Complete when the build's own view is: the package's manifest, whole;
+        // every dependency it declares, with its manifest, whole, and none of
+        // those declaring dependencies the view doesn't hold; and a package
+        // setting that resolved. (A schema that doesn't parse might be the
+        // one that states the package's handshake.)
+        project.encodings_complete = own_frozen
+            && project.settings_error.is_none()
+            && project.unparsed.is_empty()
+            && project.dependencies.iter().all(|declared| {
+                dependency_manifests
+                    .iter()
+                    .any(|(name, complete, _)| *name == declared.name && *complete)
+            })
+            && dependency_manifests
+                .iter()
+                .all(|(_, complete, has_own)| *complete && !has_own);
+
         project
+    }
+
+    /// What core's guarantee check reads of `docs[doc]`'s package: the
+    /// encodings its manifest and its dependencies' declare, and its `wire`
+    /// defaults - core's [`Encodings::of`], from the manifests this view has
+    /// rather than a `ProjectContext` (which holds `Rc`s, and so can't live in
+    /// a view an async server holds).
+    ///
+    /// [`Encodings::complete`] says whether the view is the whole picture. Where
+    /// it isn't - no manifest, a profile or a dependency that can't be read,
+    /// a dependency's own dependencies not in view - the answer is core's
+    /// incomplete one, which skips what it can't see instead of guessing.
+    /// A dependency's own schemas are judged by its own package, not this one.
+    ///
+    /// [`Encodings::of`]: comline_core::schema::ir::unverified::Encodings::of
+    /// [`Encodings::complete`]: comline_core::schema::ir::unverified::Encodings::complete
+    pub fn encodings_for(&self, doc: usize) -> comline_core::schema::ir::unverified::Encodings<'_> {
+        use comline_core::package::config::ir::frozen;
+        use comline_core::schema::idl::annotations::DEFAULT_FRAMING;
+
+        let (Some(own), None) = (self.config.as_deref(), self.docs[doc].dependency) else {
+            return Default::default();
+        };
+        let dependencies = self.dependency_configs.iter().flat_map(|(_, units)| units);
+        let (format, framing) = frozen::wire(own);
+        comline_core::schema::ir::unverified::Encodings {
+            declared: own.iter().chain(dependencies).collect(),
+            format,
+            framing: Some(framing.unwrap_or(DEFAULT_FRAMING)),
+            complete: self.encodings_complete,
+        }
     }
 
     pub fn index_of(&self, uri: &Url) -> Option<usize> {

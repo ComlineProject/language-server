@@ -55,6 +55,11 @@ pub const DUPLICATE_DECLARATION: &str = "validation::duplicate-declaration";
 /// two-site report.
 pub const DUPLICATE_BLOCK: &str = "settings::duplicate-block";
 
+/// The codes of core's two warnings that say an `@unverified` protocol gives
+/// something up less than it claims. Core keeps its codes private.
+const UNVERIFIED_CLAIMS_NOT_GIVEN_UP: [&str; 2] =
+    ["unverified::nothing-given-up", "unverified::not-given-up"];
+
 /// A message with `{...}` in a plain string, where only an f-string
 /// interpolates. The quick fix inserts the `f`.
 pub const MESSAGE_NOT_INTERPOLATED: &str = "validation::message-not-interpolated";
@@ -225,10 +230,13 @@ fn frozen_units(
 /// `comline build` runs. Call only on a document that parsed cleanly.
 pub fn validation_diagnostics(source: &str, document: &Document) -> Vec<Diagnostic> {
     let uri = Url::parse("file:///schema.ids").expect("static URL");
+    let units = frozen_units(document, vec![], &[]);
     validation_diagnostics_with(
         source,
         document,
-        &frozen_units(document, vec![], &[]),
+        &units,
+        &units,
+        vec![],
         &crate::analysis::source::base_settings(),
         &uri,
         &validation::NoImports,
@@ -251,15 +259,19 @@ struct ProjectImports<'p, 'a> {
 
 impl ProjectImports<'_, '_> {
     fn declaration(&self, name: &str) -> Option<(usize, String)> {
-        let bare = name.rsplit("::").next()?;
-        // In scope only, as `comline build` resolves: the project-wide
-        // fallback would answer for a validator this file never imported.
-        let target = self
-            .project
-            .resolve(self.doc, bare, Namespace::Declaration)?;
-        let real_name = self.project.symbol(&target)?.name.clone();
-        Some((target.doc, real_name))
+        declaration_in(self.project, self.doc, name)
     }
+}
+
+/// The declaration `name`, written in `project.docs[doc]`, refers to: its file
+/// and its own name there.
+fn declaration_in(project: &Project, doc: usize, name: &str) -> Option<(usize, String)> {
+    let bare = name.rsplit("::").next()?;
+    // In scope only, as `comline build` resolves: the project-wide
+    // fallback would answer for a validator this file never imported.
+    let target = project.resolve(doc, bare, Namespace::Declaration)?;
+    let real_name = project.symbol(&target)?.name.clone();
+    Some((target.doc, real_name))
 }
 
 impl validation::ImportLookup for ProjectImports<'_, '_> {
@@ -271,6 +283,15 @@ impl validation::ImportLookup for ProjectImports<'_, '_> {
             .encodings
             .iter()
             .any(|(n, k)| n == name && *k == kind)
+    }
+
+    /// What `@unverified` is judged against: the encodings the package's
+    /// manifest and its dependencies' declare, and its `wire` defaults
+    /// ([`Project::encodings_for`]). Without it core judges with the official
+    /// encodings only, and takes a custom handshake to establish both
+    /// agreements and a custom format or framing to have vectors.
+    fn encodings(&self) -> comline_core::schema::ir::unverified::Encodings<'_> {
+        self.project.encodings_for(self.doc)
     }
 
     fn validator_targets(&self, name: &str) -> Option<Vec<TypeRef>> {
@@ -391,10 +412,19 @@ impl DeclaredData<'_, '_> {
 /// schema's own module path - core names a declaration by it (`error
 /// 'test::main::Test'`), and without it the editor would say `'Test'` where
 /// `comline build` says the qualified form.
+///
+/// `units` are what validation reads. `written` is what the schema's author
+/// wrote, for settings enforcement: the package's own wire choices are its
+/// choices, not the schema's, so the framing it freezes in is not in it
+/// (core keeps the same two). `bounds` are the build's "no value without a
+/// maximum" errors (`bounds::check_bounded`), which are not validation's.
+#[allow(clippy::too_many_arguments)]
 fn validation_diagnostics_with(
     source: &str,
     document: &Document,
     units: &[FrozenUnit],
+    written: &[FrozenUnit],
+    bounds: Vec<comline_core::diagnostics::Diagnostic>,
     package_settings: &SettingsDict,
     uri: &Url,
     imports: &dyn validation::ImportLookup,
@@ -411,7 +441,14 @@ fn validation_diagnostics_with(
         .unwrap_or_default();
 
     let mut errors = match validation::validate_with(units, imports) {
-        Ok(warnings) => {
+        Ok(mut warnings) => {
+            // "Marked `@unverified` but gives nothing up" and "lists a
+            // guarantee it doesn't give up" are claims about what the
+            // protocol's encodings establish. Over a view that can't see them
+            // all, a protocol only seems to give nothing up: no claim.
+            if !imports.encodings().complete {
+                warnings.retain(|w| !UNVERIFIED_CLAIMS_NOT_GIVEN_UP.contains(&w.code.id));
+            }
             // No real build to fail here, unlike the CLI's compile pass -
             // an "error"-escalated or malformed-level diagnostic just
             // renders as a real LSP error alongside everything else.
@@ -427,8 +464,9 @@ fn validation_diagnostics_with(
         }
         Err(errors) => errors,
     };
+    errors.extend(bounds);
     errors.extend(
-        check_settings_enforcement(units, package_settings, &SettingsSpans::default())
+        check_settings_enforcement(written, package_settings, &SettingsSpans::default())
             .err()
             .unwrap_or_default(),
     );
@@ -608,17 +646,21 @@ pub fn project_diagnostics(project: &Project, doc: usize) -> Vec<Diagnostic> {
     let stand_ins = check.missing.iter().map(|m| m.name.clone()).collect();
 
     let units = frozen_units(&here.document, check.scope, &here.namespace);
+    let imports = ProjectImports {
+        project,
+        doc,
+        stand_ins,
+    };
+    let judged = judged_units(project, doc, &units);
     let mut diagnostics = validation_diagnostics_with(
         here.source,
         &here.document,
-        &units,
+        &judged.units,
+        &judged.written,
+        judged.bounds,
         &project.settings,
         here.uri,
-        &ProjectImports {
-            project,
-            doc,
-            stand_ins,
-        },
+        &imports,
     );
     // A dependency's schemas aren't generated by this package.
     if here.dependency.is_none() {
@@ -657,6 +699,158 @@ pub fn project_diagnostics(project: &Project, doc: usize) -> Vec<Diagnostic> {
             .map(|u| unverified_import_diagnostic(here.source, u)),
     );
     diagnostics
+}
+
+/// A schema's units as `comline build` judges them: the package's wire
+/// choices and what is given up frozen in, then the bounds pass.
+struct Judged {
+    /// What validation reads.
+    units: Vec<FrozenUnit>,
+    /// What the schema's author wrote, plus the handshake and what's given up:
+    /// what settings enforcement reads. Without the package's framing.
+    written: Vec<FrozenUnit>,
+    /// Where a value has no maximum and nothing gives up bounded size.
+    bounds: Vec<comline_core::diagnostics::Diagnostic>,
+}
+
+/// `units` (the file's own, frozen with no package behind them) the way the
+/// package build freezes a schema, in the same order
+/// (`package::config::ir::compiler::interpret`):
+///
+/// 1. what each protocol takes from the package, read before the package's
+///    handshake makes it look its own;
+/// 2. the package's handshake, then what each marked or package-covered
+///    protocol gives up (`unverified::freeze_with`, from the encodings the
+///    package sees);
+/// 3. the package's framing - after the snapshot [`Judged::written`] is;
+/// 4. default bounds from the package's settings, then `check_bounded`, which
+///    adds bounded size to what a marked protocol gives up, and says where an
+///    unmarked one reaches a value without a maximum.
+///
+/// With no manifest to say what the package's wire or settings are (none in
+/// view, or one that can't be read, or whose `settings` didn't resolve), the
+/// file is judged as it was before: by its own units alone.
+fn judged_units(project: &Project, doc: usize, units: &[FrozenUnit]) -> Judged {
+    use comline_core::package::config::ir::frozen as config;
+    use comline_core::schema::ir::compiler::bounds;
+    use comline_core::schema::ir::unverified;
+
+    let alone = || Judged {
+        units: units.to_vec(),
+        written: units.to_vec(),
+        bounds: vec![],
+    };
+    let here = &project.docs[doc];
+    let (Some(own), None, None) = (
+        project.config.as_deref(),
+        here.dependency,
+        project.settings_error.as_ref(),
+    ) else {
+        return alone();
+    };
+
+    let encodings = project.encodings_for(doc);
+    let wire = package_wire(project, own);
+    let mut judged = units.to_vec();
+    let inherits = unverified::inherits(&judged);
+    wire.freeze_handshake(&mut judged);
+    unverified::freeze_with(&mut judged, &encodings, config::unverified(own), &inherits);
+    let written = judged.clone();
+    wire.freeze_framing(&mut judged);
+
+    bounds::apply_default_bounds(&mut judged, &project.settings);
+    let sizes = ImportedBounds::new(project);
+    let unbounded = bounds::check_bounded(&mut judged, &|name| sizes.imported(doc, name));
+    Judged {
+        units: judged,
+        written,
+        bounds: unbounded,
+    }
+}
+
+/// The package's framing and handshake for the protocols that don't write
+/// their own (core's [`PackageWire`]): its `config.idp`'s, else its default.
+/// Where the manifest states no handshake, the default is one for the whole
+/// package, and so decided by every protocol its own schemas write.
+///
+/// [`PackageWire`]: comline_core::schema::ir::package_wire::PackageWire
+fn package_wire(
+    project: &Project,
+    own: &[comline_core::package::config::ir::frozen::FrozenUnit],
+) -> comline_core::schema::ir::package_wire::PackageWire {
+    use comline_core::schema::ir::package_wire::PackageWire;
+
+    if comline_core::package::config::ir::frozen::stated_handshake(own).is_some() {
+        return PackageWire::of(own, std::iter::empty());
+    }
+    let written: Vec<Vec<FrozenUnit>> = project
+        .docs
+        .iter()
+        .filter(|d| d.dependency.is_none())
+        .flat_map(|d| IncrementalInterpreter::from_declarations(d.document.0.clone()))
+        .filter_map(|unit| match unit {
+            FrozenUnit::Protocol { parameters, .. } => Some(parameters),
+            _ => None,
+        })
+        .collect();
+    PackageWire::of(own, written.iter().map(Vec::as_slice))
+}
+
+/// Whether a type another file declares holds a value without a maximum
+/// (core's `SchemaContext::unbounded`), which `check_bounded` asks of every
+/// type a schema names that it doesn't declare. Worked out in the file that
+/// declares it, under the settings of its own package, from the declarations
+/// its own `use`s bring in.
+struct ImportedBounds<'p, 'a> {
+    project: &'p Project<'a>,
+    /// Per file: `None` while it's being worked out, which is what a cycle of
+    /// imports reads, and which answers yes: like core, it fails closed.
+    unbounded: std::cell::RefCell<HashMap<usize, Option<BTreeSet<String>>>>,
+}
+
+impl<'p, 'a> ImportedBounds<'p, 'a> {
+    fn new(project: &'p Project<'a>) -> Self {
+        Self {
+            project,
+            unbounded: Default::default(),
+        }
+    }
+
+    /// Whether `name`, as written in `docs[doc]`, is another file's type that
+    /// holds a value without a maximum.
+    fn imported(&self, doc: usize, name: &str) -> bool {
+        let Some((declared_in, real_name)) = declaration_in(self.project, doc, name) else {
+            return false;
+        };
+        if declared_in == doc {
+            return false;
+        }
+        if !self.unbounded.borrow().contains_key(&declared_in) {
+            self.unbounded.borrow_mut().insert(declared_in, None);
+            let found = self.declarations(declared_in);
+            self.unbounded.borrow_mut().insert(declared_in, Some(found));
+        }
+        match &self.unbounded.borrow()[&declared_in] {
+            Some(found) => found.contains(&real_name),
+            None => true,
+        }
+    }
+
+    /// The types `docs[doc]` declares that hold a value without a maximum.
+    fn declarations(&self, doc: usize) -> BTreeSet<String> {
+        use comline_core::schema::ir::compiler::bounds;
+
+        let here = &self.project.docs[doc];
+        let mut units = frozen_units(&here.document, vec![], &here.namespace);
+        let settings = match here.dependency {
+            Some(name) => self.project.dependency_settings.get(name),
+            None => Some(&self.project.settings),
+        };
+        bounds::apply_default_bounds(&mut units, settings.unwrap_or(&self.project.settings));
+        bounds::unbounded_declarations(&units, &|name| self.imported(doc, name))
+            .into_iter()
+            .collect()
+    }
 }
 
 /// A file whose own name core refuses to compile.
@@ -1815,7 +2009,7 @@ struct User {
     fn a_bad_handshake_parameter_is_reported_where_its_written() {
         let manifest = "congregation pkg\nspecification_version = 1\n";
         let good = "@handshake = { name = \"comline@2\", newer_consumer = refuse, exchange = \"symmetric\" }\n\
-            protocol Chat {\n    function ping() -> string;\n}\n";
+            protocol Chat {\n    function ping() -> char[max 16];\n}\n";
         let found =
             project_messages(&[(MANIFEST_URI, manifest), ("file:///pkg/src/chat.ids", good)]);
         assert!(found.is_empty(), "{found:?}");
@@ -1871,7 +2065,7 @@ struct User {
     #[test]
     fn a_declared_namespaced_framing_and_handshake_are_accepted() {
         let chat = "@framing = \"com.acme.frames@1\"\n@handshake = \"com.acme.hello@1\"\n\
-            protocol Chat {\n    function ping() -> string;\n}\n";
+            protocol Chat {\n    function ping() -> char[max 16];\n}\n";
         let found = project_messages(&[
             (MANIFEST_URI, ENCODINGS_MANIFEST),
             ("file:///pkg/src/chat.ids", chat),
@@ -2321,5 +2515,281 @@ mod edition_tests {
         let data = d.data.unwrap();
         assert_eq!(data["dependency"], "dep");
         assert_eq!(data[FIX_DATA]["title"], "Do it");
+    }
+}
+
+/// What `@unverified` is judged against (ComlineProject/language-server#108):
+/// the encodings the package's manifest and its dependencies' declare, the
+/// package's `wire` and `handshake` defaults, and the bounds pass - the way
+/// `comline build` judges it, and no guess where the view can't.
+#[cfg(test)]
+mod unverified_judgement_tests {
+    use super::*;
+    use crate::analysis::source::SourceFile;
+
+    /// Allows `@unverified`, as a package that uses it has to.
+    const ALLOWS: &str = "settings = { annotations = { unverified = { allowed = true } } }\n";
+
+    /// Every message the package's `src/chat.ids` gets, with its code.
+    fn found(files: &[SourceFile], chat: &Url) -> Vec<(String, String)> {
+        let project = Project::new(files);
+        let doc = project.index_of(chat).expect("chat.ids parses");
+        project_diagnostics(&project, doc)
+            .into_iter()
+            .map(|d| {
+                let code = match d.code {
+                    Some(NumberOrString::String(code)) => code,
+                    other => panic!("no code: {other:?}"),
+                };
+                (code, d.message)
+            })
+            .collect()
+    }
+
+    /// A package in memory: its manifest (after the header) and `chat.ids`.
+    fn package(manifest: &str, chat: &str) -> Vec<(String, String)> {
+        let chat_uri = Url::parse("file:///pkg/src/chat.ids").unwrap();
+        let files = [
+            SourceFile::local(
+                Url::parse("file:///pkg/config.idp").unwrap(),
+                format!("congregation pkg\nspecification_version = 1\n{manifest}"),
+            ),
+            SourceFile::local(chat_uri.clone(), chat.to_string()),
+        ];
+        found(&files, &chat_uri)
+    }
+
+    fn says(found: &[(String, String)], code: &str) -> bool {
+        found.iter().any(|(c, _)| c == code)
+    }
+
+    fn nothing_given_up(found: &[(String, String)]) -> bool {
+        says(found, "unverified::nothing-given-up")
+    }
+
+    /// (a) Unbounded only: a marked protocol that reaches a string with no
+    /// maximum gives up bounded size - which is why it's marked - and the
+    /// build's bounds pass is what says so.
+    #[test]
+    fn a_protocol_unverified_only_for_bounded_size_gives_something_up() {
+        let chat = "@unverified = \"names come from the peer\"\n\
+            protocol Chat {\n    function say(text: string);\n}\n";
+        let found = package(ALLOWS, chat);
+        assert!(!nothing_given_up(&found), "{found:?}");
+        assert!(says(&found, "unverified::bounded-size"), "{found:?}");
+    }
+
+    /// (b) The package's own `handshake` default is what a protocol that
+    /// names none takes, and `none` establishes nothing.
+    #[test]
+    fn a_package_default_handshake_none_is_what_the_marker_is_for() {
+        let chat = "@unverified = \"the gateway speaks none\"\n\
+            protocol Chat {\n    function ping(n: u32) -> u32;\n}\n";
+        let found = package(&format!("handshake = \"none\"\n{ALLOWS}"), chat);
+        assert!(!nothing_given_up(&found), "{found:?}");
+        assert!(says(&found, "unverified::schema-agreement"), "{found:?}");
+        assert!(says(&found, "unverified::encoding-agreement"), "{found:?}");
+    }
+
+    /// (c) What the build rejects is rejected here: the same package default
+    /// without the marker.
+    #[test]
+    fn an_unmarked_protocol_the_package_default_gives_up_for_is_an_error() {
+        let chat = "protocol Chat {\n    function ping(n: u32) -> u32;\n}\n";
+        let found = package(&format!("handshake = \"none\"\n{ALLOWS}"), chat);
+        let (_, message) = found
+            .iter()
+            .find(|(code, _)| code == "unverified::missing-marker")
+            .unwrap_or_else(|| panic!("{found:?}"));
+        assert!(message.contains("without `@unverified`"), "{message}");
+    }
+
+    /// (c) And a value with no maximum that no marked protocol covers.
+    #[test]
+    fn an_unmarked_protocol_reaching_an_unbounded_value_is_an_error() {
+        let chat = "protocol Chat {\n    function say(text: string);\n}\n";
+        let found = package(ALLOWS, chat);
+        let (_, message) = found
+            .iter()
+            .find(|(code, _)| code == "bounds::unbounded")
+            .unwrap_or_else(|| panic!("{found:?}"));
+        assert!(message.contains("has no maximum"), "{message}");
+
+        // Bounded, it builds.
+        let bounded = "protocol Chat {\n    function say(text: char[max 64]);\n}\n";
+        assert!(package(ALLOWS, bounded).is_empty());
+    }
+
+    /// A type another file declares, which holds a value without a maximum,
+    /// is the same position here: bounded size is given up by whoever reaches
+    /// it, which is what marks the protocol.
+    #[test]
+    fn an_unbounded_type_another_file_declares_is_given_up_by_its_protocol() {
+        let files = |chat: &str| {
+            [
+                SourceFile::local(
+                    Url::parse("file:///pkg/config.idp").unwrap(),
+                    format!("congregation pkg\nspecification_version = 1\n{ALLOWS}"),
+                ),
+                SourceFile::local(
+                    Url::parse("file:///pkg/src/models.ids").unwrap(),
+                    "struct Note {\n    text: string\n}\n".to_string(),
+                ),
+                SourceFile::local(
+                    Url::parse("file:///pkg/src/chat.ids").unwrap(),
+                    chat.to_string(),
+                ),
+            ]
+        };
+        let chat_uri = Url::parse("file:///pkg/src/chat.ids").unwrap();
+
+        // Marked: it gives bounded size up, so the marker isn't for nothing.
+        let marked = "use models::Note\n\n@unverified = \"notes are free text\"\n\
+            protocol Chat {\n    function post(note: Note);\n}\n";
+        let found = found(&files(marked), &chat_uri);
+        assert!(!nothing_given_up(&found), "{found:?}");
+        assert!(says(&found, "unverified::bounded-size"), "{found:?}");
+    }
+
+    /// A temporary package directory, removed when it goes.
+    struct Dir(std::path::PathBuf);
+
+    impl Dir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "comline-lsp-judgement-{name}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            Dir(dir)
+        }
+
+        fn write(&self, path: &str, text: &str) -> Url {
+            let path = self.0.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+            Url::from_file_path(path).unwrap()
+        }
+    }
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A framing's profile: states every fact a framing does.
+    const LINES_PROFILE: &str = r#"{
+  "name": "com.acme.lines@1",
+  "kind": "framing",
+  "facts": {
+    "calls": { "value": "by_name", "proven_by": ["lines/request"] },
+    "directions": { "value": "both", "proven_by": ["lines/request"] },
+    "errors": { "value": "by_name", "proven_by": ["lines/error"] },
+    "payload": { "value": "opaque", "proven_by": ["lines/request-binary"] }
+  }
+}"#;
+
+    /// `lines`, a package that declares a framing, as a dependency of `app`,
+    /// which makes it the package's own wire.
+    fn app_over_lines(dir: &Dir, vectors: bool, lines_in_view: bool) -> Vec<(String, String)> {
+        let lines_manifest = dir.write(
+            "lines/config.idp",
+            "congregation lines\nspecification_version = 1\n\
+             encodings = {\n    \"com.acme.lines@1\" = { kind = \"framing\" profile = \"profiles/lines.json\" }\n}\n",
+        );
+        dir.write("lines/profiles/lines.json", LINES_PROFILE);
+        if vectors {
+            dir.write("lines/profiles/lines.vectors.json", "{}");
+        }
+        let manifest = dir.write(
+            "app/config.idp",
+            &format!(
+                "congregation app\nspecification_version = 1\n{ALLOWS}\
+                 wire = {{ framing = \"com.acme.lines@1\" }}\n\
+                 dependencies = {{\n    lines = {{\n        path = \"../lines\"\n    }}\n}}\n"
+            ),
+        );
+        let chat = dir.write(
+            "app/src/chat.ids",
+            "@unverified = \"the lines framing is young\"\n\
+             protocol Chat {\n    function ping(n: u32) -> u32;\n}\n",
+        );
+        let mut files = vec![
+            SourceFile::local(
+                manifest.clone(),
+                std::fs::read_to_string(manifest.to_file_path().unwrap()).unwrap(),
+            ),
+            SourceFile::local(
+                chat.clone(),
+                std::fs::read_to_string(chat.to_file_path().unwrap()).unwrap(),
+            ),
+        ];
+        if lines_in_view {
+            files.push(SourceFile::of_dependency(
+                lines_manifest.clone(),
+                std::fs::read_to_string(lines_manifest.to_file_path().unwrap()).unwrap(),
+                "lines",
+                vec!["lines".to_string()],
+            ));
+        }
+        found(&files, &chat)
+    }
+
+    /// (d) The encodings come from the dependency's manifest: its framing,
+    /// declared with no vectors, is what a marked protocol gives up
+    /// conformance for - not an assumption that a custom framing has some.
+    #[test]
+    fn a_dependencys_framing_without_vectors_is_given_up() {
+        let found = app_over_lines(&Dir::new("no-vectors"), false, true);
+        assert!(!nothing_given_up(&found), "{found:?}");
+        let (_, message) = found
+            .iter()
+            .find(|(code, _)| code == "unverified::encoding-conformance")
+            .unwrap_or_else(|| panic!("{found:?}"));
+        assert!(
+            message.contains("framing `com.acme.lines@1` ships no conformance vectors"),
+            "{message}"
+        );
+    }
+
+    /// (d) And with vectors beside its profile, it gives nothing up: the marker
+    /// really is for nothing, which the view is whole enough to say.
+    #[test]
+    fn a_dependencys_framing_with_vectors_gives_nothing_up() {
+        let found = app_over_lines(&Dir::new("vectors"), true, true);
+        assert!(nothing_given_up(&found), "{found:?}");
+        assert!(
+            !says(&found, "unverified::encoding-conformance"),
+            "{found:?}"
+        );
+    }
+
+    /// (e) A dependency's manifest the view doesn't have is a framing it can't
+    /// see: the protocol only seems to give nothing up, and the view says no
+    /// such thing.
+    #[test]
+    fn an_incomplete_view_makes_no_claim_that_nothing_is_given_up() {
+        let found = app_over_lines(&Dir::new("missing"), true, false);
+        assert!(!nothing_given_up(&found), "{found:?}");
+    }
+
+    /// (e) Likewise a manifest that isn't in view at all.
+    #[test]
+    fn no_manifest_is_an_incomplete_view_too() {
+        let uri = Url::parse("file:///pkg/src/chat.ids").unwrap();
+        let chat = "@unverified = \"for nothing\"\n\
+            protocol Chat {\n    function ping(n: u32) -> u32;\n}\n";
+        let files = [SourceFile::local(uri.clone(), chat.to_string())];
+        assert!(!nothing_given_up(&found(&files, &uri)));
+    }
+
+    /// A manifest in view, declaring nothing the view lacks, is whole: a
+    /// marker that gives nothing up is still told so.
+    #[test]
+    fn a_whole_view_still_says_a_marker_is_for_nothing() {
+        let chat = "@unverified = \"for nothing\"\n\
+            protocol Chat {\n    function ping(n: u32) -> u32;\n}\n";
+        assert!(nothing_given_up(&package(ALLOWS, chat)));
     }
 }
