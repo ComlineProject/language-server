@@ -656,7 +656,7 @@ mod tests {
         package(
             &root_unverified,
             "settings = { annotations = { unverified = { allowed = true } } }\n",
-            "@unverified = \"the 2009 gateway\"\nprotocol Orders {\n    function place(id: u64) -> bool;\n}\n",
+            "@handshake = \"none\"\n@unverified = \"the 2009 gateway\"\nprotocol Orders {\n    function place(id: u64) -> bool;\n}\n",
         );
         let saved = hover_with_open(
             &root_unverified,
@@ -668,7 +668,9 @@ mod tests {
             saved.contains("`@unverified`: \"the 2009 gateway\""),
             "{saved}"
         );
-        let hover = hover_with_open(&root_unverified, ORDERS, &[], "Orders");
+        let without =
+            "@handshake = \"none\"\nprotocol Orders {\n    function place(id: u64) -> bool;\n}\n";
+        let hover = hover_with_open(&root_unverified, without, &[], "Orders");
         assert!(says_save_first(&hover), "{hover}");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&root_unverified);
