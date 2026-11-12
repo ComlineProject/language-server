@@ -142,7 +142,7 @@ pub struct DeclaredLanguage {
 }
 
 /// Every language `config.idp`'s text declares, read with core's own
-/// interpreter, as `comline generate` reads them. Empty when the manifest
+/// interpreter, as `comline generation` reads them. Empty when the manifest
 /// doesn't parse (mid-edit) or doesn't interpret.
 /// The edition `config.idp` names (core#102), as core reads it: the newest
 /// when the manifest names none it knows or doesn't parse - `config.idp`'s

@@ -89,7 +89,7 @@ pub fn feature_diagnostics(
                     DiagnosticSeverity::WARNING,
                     UNSUPPORTED_FEATURE,
                     format!(
-                        "{} can't be generated for `{target}`{} - `comline generate` refuses this schema for it",
+                        "{} can't be generated for `{target}`{} - `comline generation` refuses this schema for it",
                         u.feature.title(),
                         detail(&declared.language, &s)
                     ),

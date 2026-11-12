@@ -3,7 +3,7 @@
 //! `comline check` refuses a dependency whose `@unverified` protocols the
 //! consumer hasn't accepted, for exactly the guarantees they give up. The
 //! editor says so on the dependency's entry, and offers a quick fix that
-//! writes the `accept_unverified` line `comline accept` would.
+//! writes the `accept_unverified` line `comline deps accept` would.
 //!
 //! What a protocol gives up is worked out by core, so the dependency is
 //! compiled as its own package (its own settings and default handshake),
@@ -242,7 +242,7 @@ fn render(accepted: &BTreeMap<String, Vec<Guarantee>>) -> String {
 }
 
 /// `manifest` with `name`'s entry carrying `accept_unverified = accepted`,
-/// replacing one already there - the edit `comline accept` makes. Every
+/// replacing one already there - the edit `comline deps accept` makes. Every
 /// other byte is left as written.
 fn with_acceptance(
     manifest: &str,
