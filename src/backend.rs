@@ -561,6 +561,21 @@ impl LanguageServer for Backend {
             &document.text,
             &uri,
             position,
+            // Its guarantees come from the saved build: not shown while
+            // the package has unsaved changes (the buffer's, another open
+            // file's, or `config.idp`'s).
+            || {
+                let open: Vec<crate::document::Document> = self
+                    .documents
+                    .get_all_uris()
+                    .into_iter()
+                    .filter_map(|u| self.documents.get(&u))
+                    .collect();
+                crate::handlers::protocol_summary::unsaved_in_package(
+                    &uri,
+                    open.iter().map(|d| (&d.uri, d.text.as_str())),
+                )
+            },
         ))
     }
 

@@ -7,6 +7,13 @@
 //! `wire` and `handshake` defaults and the encodings it can see all count.
 //! The package is compiled from disk, with nothing fetched, so it shows the
 //! last saved state; a package that doesn't compile that way shows nothing.
+//!
+//! The saved state is not the buffer's: an unsaved `@handshake = "none"`, or
+//! a removed `@unverified`, changes what is guaranteed and the saved build
+//! doesn't know. So when any open file the build reads (a schema of the
+//! package, or its `config.idp`) differs from disk, the whole summary (the
+//! wire choices and the guarantees) is left out and a line says why - never
+//! a guarantee claimed from a stale view (see [`markdown_unsaved`]).
 
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
@@ -72,6 +79,25 @@ pub fn summary(package_dir: &Path, schema: &str, name: &str) -> Option<ProtocolS
 
 /// The summary as markdown: the choices, then a table of guarantees.
 pub fn markdown(p: &ProtocolSummary) -> String {
+    let mut out = choices(p);
+    out.push_str(&guarantees(p));
+    out
+}
+
+/// The summary for a package whose view differs from disk: only
+/// [`UNSAVED_NOTE`]. The summary is of the saved build, so neither its wire
+/// choices nor its guarantees are the buffer's to claim.
+pub fn markdown_unsaved() -> String {
+    format!("*{UNSAVED_NOTE}*\n")
+}
+
+/// What the hover says in place of the summary.
+pub const UNSAVED_NOTE: &str = "The open file has unsaved changes. \
+    Save to see this protocol's wire choices and guarantees, \
+    which come from the saved build.";
+
+/// The choices: what the protocol speaks, and where each came from.
+fn choices(p: &ProtocolSummary) -> String {
     let mut out = String::from("**On the wire**\n\n| | | from |\n|---|---|---|\n");
     for (key, choice) in [
         ("format", &p.format),
@@ -146,6 +172,12 @@ pub fn markdown(p: &ProtocolSummary) -> String {
         ));
     }
 
+    out
+}
+
+/// The table of guarantees, and the `@unverified` reason behind it.
+fn guarantees(p: &ProtocolSummary) -> String {
+    let mut out = String::new();
     out.push_str("\n**Guarantees**\n\n| guarantee | | why | accepted |\n|---|---|---|---|\n");
     for row in &p.guarantees {
         let state = if row.held { "held" } else { "**given up**" };
@@ -171,7 +203,17 @@ pub fn markdown(p: &ProtocolSummary) -> String {
 /// `hover` with the summary added, when the cursor at `position` in
 /// `source` (the file at `uri`) is on a protocol's name or on its `@framing`
 /// or `@handshake`, and the package compiles. Otherwise `hover` unchanged.
-pub fn extend(hover: Option<Hover>, source: &str, uri: &Url, position: Position) -> Option<Hover> {
+///
+/// `unsaved` says whether the package's view differs from disk (see
+/// [`unsaved_in_package`]); it is asked only when there is a summary to
+/// show. When it does, the summary is replaced by [`UNSAVED_NOTE`].
+pub fn extend(
+    hover: Option<Hover>,
+    source: &str,
+    uri: &Url,
+    position: Position,
+    unsaved: impl FnOnce() -> bool,
+) -> Option<Hover> {
     let Some(summary) = (|| {
         let offset = position_to_offset(source, position)?;
         if offset >= source.len() {
@@ -195,7 +237,11 @@ pub fn extend(hover: Option<Hover>, source: &str, uri: &Url, position: Position)
     })() else {
         return hover;
     };
-    let summary = MarkedString::from_markdown(markdown(&summary));
+    let summary = MarkedString::from_markdown(if unsaved() {
+        markdown_unsaved()
+    } else {
+        markdown(&summary)
+    });
     let mut parts = match hover {
         None => vec![],
         Some(Hover {
@@ -233,6 +279,70 @@ fn package_dir(uri: &Url) -> Option<std::path::PathBuf> {
 #[cfg(target_arch = "wasm32")]
 fn package_dir(_uri: &Url) -> Option<std::path::PathBuf> {
     None
+}
+
+/// A package's manifest, next to its `src/`.
+#[cfg(not(target_arch = "wasm32"))]
+const MANIFEST: &str = "config.idp";
+
+/// Whether the package of the schema at `uri` is seen differently by the
+/// server than by the saved build: any of `open` (every open document, as
+/// its URI and buffer text) that the build reads - a schema of the same
+/// package, or its `config.idp` - differs from the file on disk. The hovered
+/// document is one of them, and so is an edit in another file of the package.
+///
+/// Where there is no disk to compare with (the browser, or a `uri` that is
+/// no package file), it is conservatively `true`.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn unsaved_in_package<'a>(
+    uri: &Url,
+    open: impl IntoIterator<Item = (&'a Url, &'a str)>,
+) -> bool {
+    let Some(dir) = package_dir(uri) else {
+        return true;
+    };
+    let src = dir.join(comline_core::package::layout::SCHEMAS_DIR);
+    let manifest = dir.join(MANIFEST);
+    open.into_iter().any(|(url, text)| {
+        let Ok(path) = url.to_file_path() else {
+            return false;
+        };
+        let read = same_path(&path, &manifest)
+            || (path.extension().is_some_and(|e| e == "ids")
+                && comline_core::package::layout::schemas_root_for(&path)
+                    .is_some_and(|root| same_path(&root, &src)));
+        read && differs_from_disk(&path, text)
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn unsaved_in_package<'a>(
+    _uri: &Url,
+    _open: impl IntoIterator<Item = (&'a Url, &'a str)>,
+) -> bool {
+    true
+}
+
+/// Whether the buffer `text` is not what is saved at `path`: a file that
+/// can't be read (never saved, or gone) differs. A trailing newline or CRLF
+/// line endings alone are not a difference - nothing the build reads.
+#[cfg(not(target_arch = "wasm32"))]
+fn differs_from_disk(path: &Path, text: &str) -> bool {
+    let normal = |s: &str| s.replace("\r\n", "\n").trim_end_matches('\n').to_string();
+    match std::fs::read_to_string(path) {
+        Ok(saved) => normal(&saved) != normal(text),
+        Err(_) => true,
+    }
+}
+
+/// The same file, however the two spell it (Windows is case-blind).
+#[cfg(not(target_arch = "wasm32"))]
+fn same_path(a: &Path, b: &Path) -> bool {
+    if cfg!(windows) {
+        a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+    } else {
+        a == b
+    }
 }
 
 /// A table cell: no `|` or line break of its own.
@@ -351,7 +461,13 @@ mod tests {
         let Some(Hover {
             contents: HoverContents::Array(parts),
             ..
-        }) = extend(Some(before), SCHEMA, &uri, Position { line, character })
+        }) = extend(
+            Some(before),
+            SCHEMA,
+            &uri,
+            Position { line, character },
+            || false,
+        )
         else {
             panic!("a hover")
         };
@@ -366,7 +482,8 @@ mod tests {
                 Position {
                     line: 1,
                     character: 14
-                }
+                },
+                || false,
             ),
             None
         );
@@ -436,6 +553,191 @@ mod tests {
             !old.contains("parameters") && !old.contains("breaking bump"),
             "{old}"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A package on disk with `schema` as `src/api.ids`, a second schema
+    /// `src/other.ids`, and the hover of `needle` in `text` (the buffer of
+    /// `api.ids`) with `others` open besides, as the server asks for it:
+    /// the hover's parts after what it had, and whether it showed the
+    /// guarantees.
+    fn hover_with_open(root: &Path, text: &str, others: &[(&str, &str)], needle: &str) -> String {
+        let uri = Url::from_file_path(root.join("src/api.ids")).unwrap();
+        let mut open = vec![(uri.clone(), text.to_string())];
+        for (file, buffer) in others {
+            open.push((
+                Url::from_file_path(root.join(file)).unwrap(),
+                buffer.to_string(),
+            ));
+        }
+        let offset = text.find(needle).unwrap() + 1;
+        let line = text[..offset].matches('\n').count() as u32;
+        let character = (offset - text[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32;
+        let hover = extend(None, text, &uri, Position { line, character }, || {
+            unsaved_in_package(&uri, open.iter().map(|(u, t)| (u, t.as_str())))
+        });
+        let Some(Hover {
+            contents: HoverContents::Array(parts),
+            ..
+        }) = hover
+        else {
+            panic!("a hover")
+        };
+        assert_eq!(parts.len(), 1);
+        let MarkedString::String(markdown) = &parts[0] else {
+            panic!("markdown")
+        };
+        markdown.clone()
+    }
+
+    const ORDERS: &str = "protocol Orders {\n    function place(id: u64) -> bool;\n}\n";
+    const OTHER: &str = "protocol Other {\n    function ping();\n}\n";
+
+    fn stale_package(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "comline-lsp-protocol-stale-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        package(&root, "", ORDERS);
+        std::fs::write(root.join("src/other.ids"), OTHER).unwrap();
+        root
+    }
+
+    fn shows_guarantees(hover: &str) -> bool {
+        hover.contains("**On the wire**")
+            && hover.contains("**Guarantees**")
+            && hover.contains("| schema agreement |")
+    }
+
+    fn says_save_first(hover: &str) -> bool {
+        // Only the note: no wire choices and no guarantees.
+        hover == format!("*{UNSAVED_NOTE}*\n")
+            && !hover.contains("On the wire")
+            && !hover.contains("| format |")
+            && !hover.contains("held")
+            && !hover.contains("given up")
+            && !hover.contains("| schema agreement |")
+            && !hover.contains("`@unverified`")
+    }
+
+    #[test]
+    fn a_clean_buffer_shows_the_guarantees() {
+        let root = stale_package("clean");
+        let hover = hover_with_open(&root, ORDERS, &[], "Orders");
+        assert!(shows_guarantees(&hover), "{hover}");
+        assert!(!hover.contains("save to see them"), "{hover}");
+        // Others open, and saved as they are on disk.
+        let hover = hover_with_open(
+            &root,
+            ORDERS,
+            &[
+                ("src/other.ids", OTHER),
+                (
+                    "config.idp",
+                    &std::fs::read_to_string(root.join("config.idp")).unwrap(),
+                ),
+            ],
+            "Orders",
+        );
+        assert!(shows_guarantees(&hover), "{hover}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_unsaved_edit_in_the_hovered_file_hides_the_guarantees() {
+        let root = stale_package("hovered");
+        // A handshake written in the buffer, the saved build doesn't have it.
+        let edited = format!("@handshake = \"none\"\n{ORDERS}");
+        let hover = hover_with_open(&root, &edited, &[], "Orders");
+        assert!(says_save_first(&hover), "{hover}");
+        assert!(
+            hover.contains("Save to see this protocol's wire choices and guarantees"),
+            "{hover}"
+        );
+
+        // And a removed `@unverified`: the build has it, the buffer not.
+        let root_unverified = stale_package("removed");
+        package(
+            &root_unverified,
+            "settings = { annotations = { unverified = { allowed = true } } }\n",
+            "@handshake = \"none\"\n@unverified = \"the 2009 gateway\"\nprotocol Orders {\n    function place(id: u64) -> bool;\n}\n",
+        );
+        let saved = hover_with_open(
+            &root_unverified,
+            &std::fs::read_to_string(root_unverified.join("src/api.ids")).unwrap(),
+            &[],
+            "Orders",
+        );
+        assert!(
+            saved.contains("`@unverified`: \"the 2009 gateway\""),
+            "{saved}"
+        );
+        let without =
+            "@handshake = \"none\"\nprotocol Orders {\n    function place(id: u64) -> bool;\n}\n";
+        let hover = hover_with_open(&root_unverified, without, &[], "Orders");
+        assert!(says_save_first(&hover), "{hover}");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root_unverified);
+    }
+
+    #[test]
+    fn an_unsaved_edit_elsewhere_in_the_package_hides_the_guarantees() {
+        let root = stale_package("elsewhere");
+        let manifest = std::fs::read_to_string(root.join("config.idp")).unwrap();
+
+        // Another schema of the package.
+        let other = format!("{OTHER}\n// edited\n");
+        let hover = hover_with_open(&root, ORDERS, &[("src/other.ids", &other)], "Orders");
+        assert!(says_save_first(&hover), "{hover}");
+
+        // The package's `config.idp`: its `wire` and `handshake` defaults.
+        let edited = format!("{manifest}handshake = \"none\"\n");
+        let hover = hover_with_open(&root, ORDERS, &[("config.idp", &edited)], "Orders");
+        assert!(says_save_first(&hover), "{hover}");
+
+        // A file the build doesn't read, or of another package, doesn't.
+        let elsewhere = std::env::temp_dir().join(format!(
+            "comline-lsp-protocol-stale-else-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&elsewhere);
+        package(&elsewhere, "", ORDERS);
+        let uri = Url::from_file_path(root.join("src/api.ids")).unwrap();
+        let foreign = Url::from_file_path(elsewhere.join("src/api.ids")).unwrap();
+        let notes = Url::from_file_path(root.join("notes.txt")).unwrap();
+        assert!(!unsaved_in_package(
+            &uri,
+            [
+                (&uri, ORDERS),
+                (&foreign, "protocol Changed {}\n"),
+                (&notes, "never saved")
+            ]
+        ));
+
+        // A buffer never saved is not on disk: it differs.
+        let fresh = Url::from_file_path(root.join("src/new.ids")).unwrap();
+        assert!(unsaved_in_package(&uri, [(&uri, ORDERS), (&fresh, OTHER)]));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&elsewhere);
+    }
+
+    #[test]
+    fn line_endings_and_a_trailing_newline_are_not_unsaved_changes() {
+        let root = stale_package("endings");
+        let crlf = ORDERS.replace('\n', "\r\n");
+        let hover = hover_with_open(&root, &crlf, &[], "Orders");
+        assert!(shows_guarantees(&hover), "{hover}");
+        let no_newline = ORDERS.trim_end();
+        let hover = hover_with_open(&root, no_newline, &[], "Orders");
+        assert!(shows_guarantees(&hover), "{hover}");
+        let more_newlines = format!("{ORDERS}\n\n");
+        let hover = hover_with_open(&root, &more_newlines, &[], "Orders");
+        assert!(shows_guarantees(&hover), "{hover}");
+        // Any other whitespace is one.
+        let indented = ORDERS.replace("    function", "  function");
+        let hover = hover_with_open(&root, &indented, &[], "Orders");
+        assert!(says_save_first(&hover), "{hover}");
         let _ = std::fs::remove_dir_all(&root);
     }
 }
