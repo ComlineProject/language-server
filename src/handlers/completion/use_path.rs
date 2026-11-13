@@ -11,15 +11,16 @@
 
 use comline_core::schema::idl::vocabulary::{self, KeywordKind};
 use lsp_types::{
-    Command, CompletionItem, CompletionItemKind, CompletionTextEdit, Documentation,
-    InsertTextFormat, MarkupContent, MarkupKind, Range, TextEdit, Url,
+    Command, CompletionItem, CompletionItemKind, CompletionTextEdit, InsertTextFormat, Range,
+    TextEdit, Url,
 };
 
 use crate::analysis::modules::{self, ChildModule, DeclKind, Declared};
 use crate::analysis::project::Project;
 use crate::analysis::source::{DependencyKind, ProjectSource};
 use crate::analysis::stdlib;
-use crate::util::byte_range_to_lsp_range;
+use crate::handlers::markdown;
+use crate::util::{byte_range_to_lsp_range, is_identifier, is_partial_identifier};
 
 /// How many lines up a `{ ... }` list is followed, looking for its `use`.
 const MAX_LIST_LINES: usize = 64;
@@ -165,14 +166,6 @@ fn segments_of(path: &str) -> Option<Vec<String>> {
         .collect()
 }
 
-fn is_identifier(s: &str) -> bool {
-    s.starts_with(|c: char| c.is_alphabetic() || c == '_') && is_partial_identifier(s)
-}
-
-fn is_partial_identifier(s: &str) -> bool {
-    s.chars().all(|c| c.is_alphanumeric() || c == '_')
-}
-
 /// What can come next in the path `prefix` describes, written in the file at
 /// `uri`, with `other_files` the rest of its package.
 pub(super) fn completions<S: ProjectSource>(
@@ -259,7 +252,7 @@ fn path_starts(project: &Project, legacy: bool, range: Range) -> Vec<CompletionI
         item.documentation = project
             .package_docs
             .get(&dependency.name)
-            .map(|docs| markdown(docs));
+            .map(markdown);
         items.push(sorted(item, '1'));
     }
 
@@ -284,7 +277,7 @@ fn path_starts(project: &Project, legacy: bool, range: Range) -> Vec<CompletionI
         std.documentation = project
             .package_docs
             .get(stdlib::NAME)
-            .map(|docs| markdown(docs));
+            .map(markdown);
         items.push(sorted(std, '3'));
     }
     items
@@ -335,12 +328,6 @@ fn declared_item(declared: &Declared, range: Range) -> CompletionItem {
     item
 }
 
-fn markdown(docs: &str) -> Documentation {
-    Documentation::MarkupContent(MarkupContent {
-        kind: MarkupKind::Markdown,
-        value: docs.to_string(),
-    })
-}
 
 /// `*` and `{…}` after a schema's path.
 fn glob_and_list(base: &[String], range: Range) -> [CompletionItem; 2] {
@@ -415,6 +402,7 @@ pub(super) fn trigger_suggest() -> Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lsp_types::Documentation;
     use crate::analysis::source::SourceFile;
     use crate::handlers::completion::get_completions_with_project;
     use crate::util::offset_to_position;

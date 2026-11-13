@@ -10,13 +10,12 @@ use crate::analysis::project::Project;
 use crate::analysis::source::ProjectSource;
 use crate::analysis::symbols::{Namespace, Symbol};
 use crate::handlers::rename;
-use crate::util::{byte_range_to_lsp_range, position_to_offset};
+use crate::util::{byte_range_to_lsp_range, file_edit, position_to_offset};
 use lsp_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams, Command, Diagnostic,
-    NumberOrString, Range, SymbolKind, TextEdit, Url, WorkspaceEdit,
+    NumberOrString, Range, SymbolKind, TextEdit, Url,
 };
 use serde_json::json;
-use std::collections::HashMap;
 
 /// Get code actions for a given range, considering only this file.
 pub fn get_code_actions(
@@ -59,17 +58,10 @@ pub fn get_code_actions_with_project<S: ProjectSource>(
             title: format!("Change `{written}` to `{suggestion}`"),
             kind: Some(CodeActionKind::QUICKFIX),
             diagnostics: matching_diagnostics(params, range, UNRESOLVED_IMPORT),
-            edit: Some(WorkspaceEdit {
-                changes: Some(HashMap::from([(
-                    uri.clone(),
-                    vec![TextEdit {
-                        range,
-                        new_text: suggestion.clone(),
-                    }],
-                )])),
-                document_changes: None,
-                change_annotations: None,
-            }),
+            edit: Some(file_edit(uri, vec![TextEdit {
+                range,
+                new_text: suggestion.clone(),
+            }])),
             is_preferred: Some(true),
             ..Default::default()
         }));
@@ -91,11 +83,7 @@ pub fn get_code_actions_with_project<S: ProjectSource>(
                 title: format!("Add `use {path}`"),
                 kind: Some(CodeActionKind::QUICKFIX),
                 diagnostics: diagnostics.clone(),
-                edit: Some(WorkspaceEdit {
-                    changes: Some(HashMap::from([(uri.clone(), vec![edit])])),
-                    document_changes: None,
-                    change_annotations: None,
-                }),
+                edit: Some(file_edit(uri, vec![edit])),
                 is_preferred: Some(only_one),
                 ..Default::default()
             }));
@@ -143,11 +131,7 @@ pub fn fix_actions(uri: &Url, params: &CodeActionParams) -> Vec<CodeActionOrComm
                 title,
                 kind: Some(CodeActionKind::QUICKFIX),
                 diagnostics: Some(vec![d.clone()]),
-                edit: Some(WorkspaceEdit {
-                    changes: Some(HashMap::from([(uri.clone(), edits)])),
-                    document_changes: None,
-                    change_annotations: None,
-                }),
+                edit: Some(file_edit(uri, edits)),
                 is_preferred: Some(true),
                 ..Default::default()
             }))
@@ -236,17 +220,10 @@ fn duplicate_name_actions<S: ProjectSource>(
                 title: format!("Delete {what}"),
                 kind: Some(CodeActionKind::QUICKFIX),
                 diagnostics,
-                edit: Some(WorkspaceEdit {
-                    changes: Some(HashMap::from([(
-                        uri.clone(),
-                        vec![TextEdit {
-                            range: byte_range_to_lsp_range(source, start, end),
-                            new_text: String::new(),
-                        }],
-                    )])),
-                    document_changes: None,
-                    change_annotations: None,
-                }),
+                edit: Some(file_edit(uri, vec![TextEdit {
+                    range: byte_range_to_lsp_range(source, start, end),
+                    new_text: String::new(),
+                }])),
                 ..Default::default()
             }));
         }
@@ -357,17 +334,10 @@ fn f_string_actions(
                 title: "Make it an f-string".to_string(),
                 kind: Some(CodeActionKind::QUICKFIX),
                 diagnostics: Some(vec![d.clone()]),
-                edit: Some(WorkspaceEdit {
-                    changes: Some(HashMap::from([(
-                        uri.clone(),
-                        vec![TextEdit {
-                            range: Range::new(d.range.start, d.range.start),
-                            new_text: "f".into(),
-                        }],
-                    )])),
-                    document_changes: None,
-                    change_annotations: None,
-                }),
+                edit: Some(file_edit(uri, vec![TextEdit {
+                    range: Range::new(d.range.start, d.range.start),
+                    new_text: "f".into(),
+                }])),
                 is_preferred: Some(true),
                 ..Default::default()
             })

@@ -48,7 +48,7 @@ pub fn parse(uri: &Url, source: &str) -> Option<Arc<Document>> {
         }
     }
 
-    let document = Arc::new(parser::parse(source).ok()?.document?);
+    let document = Arc::new(parser::parse_document(source)?);
     if let Ok(mut cache) = cache().lock() {
         cache.insert(
             uri.clone(),

@@ -8,7 +8,7 @@
 // than an inline ```comline fence (confirmed against the real widget via
 // the ComlineProject/hover-sketch scratch tooling); see unit_hover.rs
 // for the same choice made the same way.
-use lsp_types::{Hover, HoverContents, MarkedString};
+use lsp_types::{Hover, MarkedString};
 
 pub struct AnnotationHover {
     key: String,
@@ -86,29 +86,14 @@ impl AnnotationHover {
             contents.push(MarkedString::from_markdown(block.join("\n")));
         }
 
-        Hover {
-            contents: HoverContents::Array(contents),
-            range: None,
-        }
+        super::hover(contents)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn blocks(hover: Hover) -> Vec<String> {
-        match hover.contents {
-            HoverContents::Array(parts) => parts
-                .into_iter()
-                .map(|p| match p {
-                    MarkedString::String(s) => s,
-                    MarkedString::LanguageString(ls) => ls.value,
-                })
-                .collect(),
-            _ => panic!("expected an array of blocks"),
-        }
-    }
+    use crate::test_support::blocks;
 
     #[test]
     fn signature_is_a_fenced_block_not_a_language_string() {

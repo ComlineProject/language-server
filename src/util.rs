@@ -1,4 +1,31 @@
-use lsp_types::{Position, Range};
+use std::collections::HashMap;
+
+use lsp_types::{
+    Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range, TextEdit, Url, WorkspaceEdit,
+};
+
+/// `edits`, all to the one file at `uri`.
+pub fn file_edit(uri: &Url, edits: Vec<TextEdit>) -> WorkspaceEdit {
+    WorkspaceEdit::new(HashMap::from([(uri.clone(), edits)]))
+}
+
+/// A diagnostic from this server: `range`, `severity`, `code` and `message`,
+/// sourced `comline`. Anything more is set on top with `..`.
+pub fn comline_diagnostic(
+    range: Range,
+    severity: DiagnosticSeverity,
+    code: Option<&str>,
+    message: String,
+) -> Diagnostic {
+    Diagnostic {
+        range,
+        severity: Some(severity),
+        code: code.map(|code| NumberOrString::String(code.to_string())),
+        source: Some("comline".to_string()),
+        message,
+        ..Default::default()
+    }
+}
 
 /// Convert LSP Position to byte offset in text
 pub fn position_to_offset(text: &str, position: Position) -> Option<usize> {
@@ -51,8 +78,61 @@ pub fn byte_range_to_lsp_range(text: &str, start: usize, end: usize) -> Range {
     }
 }
 
-fn is_ident_char(c: char) -> bool {
+pub fn is_ident_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
+}
+
+/// A whole Comline identifier: a letter or `_`, then identifier characters.
+pub fn is_identifier(s: &str) -> bool {
+    s.starts_with(|c: char| c.is_alphabetic() || c == '_') && is_partial_identifier(s)
+}
+
+/// Only identifier characters - what an identifier being typed can be so far.
+pub fn is_partial_identifier(s: &str) -> bool {
+    s.chars().all(is_ident_char)
+}
+
+/// The matching `}` of the `{` at `open`, skipping braces inside `"..."`.
+pub fn matching_brace(text: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    for (i, c) in text[open..].char_indices() {
+        match c {
+            '"' => in_string = !in_string,
+            '{' if !in_string => depth += 1,
+            '}' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open + i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The first `keyword` in `text`, as a byte range - the start of the file
+/// where there is none.
+pub fn keyword_span(text: &str, keyword: &str) -> (usize, usize) {
+    text.find(keyword)
+        .map(|i| (i, i + keyword.len()))
+        .unwrap_or((0, 0))
+}
+
+/// `span` of `source`, both ends clamped to its length: where it starts, and
+/// its text.
+pub fn clamped(source: &str, span: (usize, usize)) -> (usize, &str) {
+    let (start, end) = (span.0.min(source.len()), span.1.min(source.len()));
+    (start, &source[start..end])
+}
+
+/// Whether a word right after `before` is the alias in `... as Alias`.
+pub fn follows_as(before: &str) -> bool {
+    before
+        .trim_end()
+        .strip_suffix("as")
+        .is_some_and(|rest| rest.ends_with(char::is_whitespace))
 }
 
 /// The identifier (alphanumerics + `_`) touching byte `offset`, as its byte

@@ -250,7 +250,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("comline-lsp-index-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        for (path, text) in [
+        crate::test_support::write_tree(&root, [
             ("a/config.idp", "congregation a\n"),
             ("a/src/types.ids", "struct A {\n    x: bool\n}\n"),
             ("a/src/chat/admin.ids", "struct Admin {\n    x: bool\n}\n"),
@@ -261,11 +261,7 @@ mod tests {
                 "a/.comline/src/hidden.ids",
                 "struct Hidden {\n    x: bool\n}\n",
             ),
-        ] {
-            let path = root.join(path);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, text).unwrap();
-        }
+        ]);
         root
     }
 

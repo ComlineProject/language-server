@@ -2,7 +2,7 @@
 
 use crate::analysis::project::{Project, Target};
 use crate::analysis::source::ProjectSource;
-use crate::util::{byte_range_to_lsp_range, position_to_offset, word_range_at};
+use crate::util::{byte_range_to_lsp_range, is_identifier, position_to_offset, word_range_at};
 use lsp_types::{Position, Range, TextEdit, Url, WorkspaceEdit};
 use std::collections::HashMap;
 
@@ -30,7 +30,7 @@ pub fn rename_symbol_with_project<S: ProjectSource>(
     new_name: &str,
     other_files: &[S],
 ) -> Option<WorkspaceEdit> {
-    if !is_valid_identifier(new_name) {
+    if !is_identifier(new_name) {
         return None;
     }
 
@@ -58,11 +58,7 @@ pub fn rename_symbol_with_project<S: ProjectSource>(
         }
     }
 
-    Some(WorkspaceEdit {
-        changes: Some(changes),
-        document_changes: None,
-        change_annotations: None,
-    })
+    Some(WorkspaceEdit::new(changes))
 }
 
 /// The range of the word a rename at `position` would start from, or
@@ -101,24 +97,6 @@ fn renameable_at(
     // `target_at_cursor` has already ruled out.
     (project.symbol(&target)?.name == word)
         .then(|| (target, byte_range_to_lsp_range(source, start, end)))
-}
-
-/// Check if a string is a valid Comline identifier
-fn is_valid_identifier(name: &str) -> bool {
-    if name.is_empty() {
-        return false;
-    }
-
-    // First character must be letter or underscore
-    let mut chars = name.chars();
-    if let Some(first) = chars.next() {
-        if !first.is_alphabetic() && first != '_' {
-            return false;
-        }
-    }
-
-    // Rest must be alphanumeric or underscore
-    chars.all(|c| c.is_alphanumeric() || c == '_')
 }
 
 #[cfg(test)]
@@ -195,14 +173,14 @@ struct Request {
 
     #[test]
     fn test_identifier_validation() {
-        assert!(is_valid_identifier("User"));
-        assert!(is_valid_identifier("_private"));
-        assert!(is_valid_identifier("Type123"));
+        assert!(is_identifier("User"));
+        assert!(is_identifier("_private"));
+        assert!(is_identifier("Type123"));
 
-        assert!(!is_valid_identifier("123Type"));
-        assert!(!is_valid_identifier("My-Type"));
-        assert!(!is_valid_identifier(""));
-        assert!(!is_valid_identifier("Type Name"));
+        assert!(!is_identifier("123Type"));
+        assert!(!is_identifier("My-Type"));
+        assert!(!is_identifier(""));
+        assert!(!is_identifier("Type Name"));
     }
 
     fn edits_by_file(edit: WorkspaceEdit) -> Vec<(String, u32, u32)> {

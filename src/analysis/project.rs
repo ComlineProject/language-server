@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use comline_core::package::config::ir::frozen::FrozenUnit as ConfigUnit;
 use comline_core::schema::idl::grammar::{
-    Annotation, AnnotationValue, Declaration, Document, Type,
+    Annotation, AnnotationValue, Declaration, Document, Field, Type,
 };
 use comline_core::schema::idl::module_docs::module_docs;
 use lsp_types::{Location, Url};
@@ -17,7 +17,7 @@ use crate::analysis::imports::{self, ProjectFile, ResolvedUse};
 use crate::analysis::parse_cache;
 use crate::analysis::source::{self, DeclaredDependency, ProjectSource};
 use crate::analysis::symbols::{self, Namespace, Symbol, SymbolTable};
-use crate::util::{byte_range_to_lsp_range, word_occurrences};
+use crate::util::{byte_range_to_lsp_range, clamped, follows_as, word_occurrences};
 
 /// One parsed project file.
 pub struct ProjectDoc<'a> {
@@ -120,12 +120,7 @@ impl<'a> Project<'a> {
     /// [`Project::unparsed`]). A manifest (`config.idp`) among them supplies
     /// [`Project::dependencies`].
     pub fn new<S: ProjectSource + 'a>(files: impl IntoIterator<Item = &'a S>) -> Self {
-        Self::build(files.into_iter().map(|file| Input {
-            uri: file.uri(),
-            text: file.text(),
-            namespace: file.namespace(),
-            dependency: file.dependency(),
-        }))
+        Self::build(files.into_iter().map(Input::of))
     }
 
     /// The active file first, then every other file - the shape every
@@ -141,14 +136,7 @@ impl<'a> Project<'a> {
             namespace: None,
             dependency: None,
         };
-        Self::build(
-            std::iter::once(active).chain(other_files.iter().map(|file| Input {
-                uri: file.uri(),
-                text: file.text(),
-                namespace: file.namespace(),
-                dependency: file.dependency(),
-            })),
-        )
+        Self::build(std::iter::once(active).chain(other_files.iter().map(Input::of)))
     }
 
     /// Like [`Project::new`], from schemas the caller already parsed.
@@ -160,6 +148,12 @@ impl<'a> Project<'a> {
             })
             .collect();
 
+        Self::empty(docs)
+    }
+
+    /// `docs` and nothing else: no manifest, so no dependencies, settings or
+    /// encodings.
+    fn empty(docs: Vec<ProjectDoc<'a>>) -> Self {
         Self {
             docs,
             unparsed: vec![],
@@ -185,22 +179,7 @@ impl<'a> Project<'a> {
         // happens to fall relative to them.
         let inputs: Vec<Input<'a>> = inputs.collect();
 
-        let mut project = Self {
-            docs: vec![],
-            unparsed: vec![],
-            has_manifest: false,
-            languages: vec![],
-            dependencies: vec![],
-            package_docs: BTreeMap::new(),
-            settings: Default::default(),
-            settings_error: None,
-            encodings: vec![],
-            config: None,
-            dependency_configs: vec![],
-            dependency_settings: BTreeMap::new(),
-            encodings_complete: false,
-            edition: comline_core::edition::Edition::LATEST,
-        };
+        let mut project = Self::empty(vec![]);
         // What the guarantee check needs of the manifests, noted as they pass.
         let mut own_frozen = false;
         // Each dependency manifest: its name, whether it froze whole, and
@@ -425,8 +404,12 @@ impl<'a> Project<'a> {
             let mut seen = BTreeSet::new();
 
             for span in type_spans(&doc.document) {
-                let mut names = BTreeSet::new();
-                collect_named(span.1, &mut names);
+                // The symbol each names: the last segment (`types::User`
+                // names `User`).
+                let names: BTreeSet<&str> = named_types(span.1)
+                    .into_iter()
+                    .filter_map(|name| name.rsplit("::").next())
+                    .collect();
 
                 for name in names {
                     // A type position, so the declaration namespace - a
@@ -434,12 +417,12 @@ impl<'a> Project<'a> {
                     // symbol and must not be swept up here.
                     // In scope only: a file naming `User` without importing
                     // it doesn't refer to this one, and rename mustn't edit it.
-                    if self.resolve(index, &name, Namespace::Declaration).as_ref() != Some(target) {
+                    if self.resolve(index, name, Namespace::Declaration).as_ref() != Some(target) {
                         continue;
                     }
-                    for offset in occurrences_in(doc.source, span.0, &name) {
+                    for offset in occurrences_in(doc.source, span.0, name) {
                         if seen.insert(offset) {
-                            found.push(self.reference(doc, offset, &name, name == target_name));
+                            found.push(self.reference(doc, offset, name, name == target_name));
                         }
                     }
                 }
@@ -473,7 +456,7 @@ impl<'a> Project<'a> {
             .flat_map(|u| {
                 occurrences_in(here.source, u.span, &target_name)
                     .into_iter()
-                    .filter(move |&offset| !follows_as(here.source, u.span.0, offset))
+                    .filter(move |&offset| !follows_as(&here.source[u.span.0..offset]))
             })
             .map(|offset| self.reference(here, offset, &target_name, true))
             .collect()
@@ -507,6 +490,17 @@ struct Input<'a> {
     text: &'a str,
     namespace: Option<&'a [String]>,
     dependency: Option<&'a str>,
+}
+
+impl<'a> Input<'a> {
+    fn of<S: ProjectSource>(file: &'a S) -> Self {
+        Input {
+            uri: file.uri(),
+            text: file.text(),
+            namespace: file.namespace(),
+            dependency: file.dependency(),
+        }
+    }
 }
 
 impl<'a> ProjectSource for Input<'a> {
@@ -560,8 +554,7 @@ impl<'a> ProjectDoc<'a> {
 /// namespace segment - i.e. not immediately followed by `::` (in
 /// `use User::User`, only the second one).
 fn occurrences_in(source: &str, span: (usize, usize), name: &str) -> Vec<usize> {
-    let (start, end) = (span.0.min(source.len()), span.1.min(source.len()));
-    let text = &source[start..end];
+    let (start, text) = clamped(source, span);
 
     word_occurrences(text, name)
         .into_iter()
@@ -570,35 +563,14 @@ fn occurrences_in(source: &str, span: (usize, usize), name: &str) -> Vec<usize> 
         .collect()
 }
 
-/// Whether the word at `offset` is the alias in `... as Alias`, looking
-/// back no further than `from`.
-fn follows_as(source: &str, from: usize, offset: usize) -> bool {
-    source[from..offset]
-        .trim_end()
-        .strip_suffix("as")
-        .is_some_and(|before| before.ends_with(|c: char| c.is_whitespace()))
-}
-
 /// Every type position in a document, with its byte span.
 fn type_spans(document: &Document) -> Vec<((usize, usize), &Type)> {
     let mut spans = Vec::new();
 
     for decl in &document.0 {
         match &**decl {
-            Declaration::Struct(s) => {
-                spans.extend(
-                    s.fields()
-                        .iter()
-                        .map(|f| (f.field_type_span(), f.field_type())),
-                );
-            }
-            Declaration::Error(e) => {
-                spans.extend(
-                    e.fields()
-                        .iter()
-                        .map(|f| (f.field_type_span(), f.field_type())),
-                );
-            }
+            Declaration::Struct(s) => spans.extend(field_type_spans(s.fields())),
+            Declaration::Error(e) => spans.extend(field_type_spans(e.fields())),
             Declaration::Validator(v) => {
                 spans.extend(
                     v.properties
@@ -632,18 +604,21 @@ fn type_spans(document: &Document) -> Vec<((usize, usize), &Type)> {
     spans
 }
 
-/// The symbol names a type refers to - the last segment of each named type
-/// (`types::User` names `User`), through arrays and unions.
-fn collect_named(ty: &Type, names: &mut BTreeSet<String>) {
+/// Each field's type, with its span.
+fn field_type_spans(
+    fields: &[rust_sitter::Spanned<Field>],
+) -> impl Iterator<Item = ((usize, usize), &Type)> {
+    fields.iter().map(|f| (f.field_type_span(), f.field_type()))
+}
+
+/// The named types `ty` refers to, as written (`User`, or qualified
+/// `types::User`), through arrays and unions.
+fn named_types(ty: &Type) -> BTreeSet<&str> {
     match ty {
-        Type::Named(name) => {
-            if let Some(last) = name.text.rsplit("::").next() {
-                names.insert(last.to_string());
-            }
-        }
-        Type::Array(array) => collect_named(array.elem_type(), names),
-        Type::Union(union) => union.members().iter().for_each(|m| collect_named(m, names)),
-        _ => {}
+        Type::Named(name) => BTreeSet::from([name.text.as_str()]),
+        Type::Array(array) => named_types(array.elem_type()),
+        Type::Union(union) => union.members().iter().flat_map(named_types).collect(),
+        _ => BTreeSet::new(),
     }
 }
 
@@ -654,15 +629,11 @@ pub(crate) fn named_type_sites(doc: &ProjectDoc) -> Vec<(String, usize)> {
     let mut sites = BTreeSet::new();
 
     for (span, ty) in type_spans(&doc.document) {
-        let mut names = BTreeSet::new();
-        collect_named_text(ty, &mut names);
-
-        let (start, end) = (span.0.min(doc.source.len()), span.1.min(doc.source.len()));
-        let text = &doc.source[start..end];
-        for name in names {
-            for i in word_occurrences(text, &name) {
+        let (start, text) = clamped(doc.source, span);
+        for name in named_types(ty) {
+            for i in word_occurrences(text, name) {
                 if !text[..i].ends_with("::") && !text[i + name.len()..].starts_with("::") {
-                    sites.insert((start + i, name.clone()));
+                    sites.insert((start + i, name.to_string()));
                 }
             }
         }
@@ -674,6 +645,13 @@ pub(crate) fn named_type_sites(doc: &ProjectDoc) -> Vec<(String, usize)> {
         .collect()
 }
 
+/// Each field's annotations, with the field's span.
+fn field_annotations(
+    fields: &[rust_sitter::Spanned<Field>],
+) -> impl Iterator<Item = ((usize, usize), Vec<&Annotation>)> {
+    fields.iter().map(|f| (f.span, f.annotations()))
+}
+
 /// Every validator a file names in a `@validators = [...]` list, called or
 /// bare, with the byte offset of each occurrence - on a field (of a struct or an error) or
 /// a `type` alias, the places core accepts the list.
@@ -681,12 +659,8 @@ pub(crate) fn validator_sites(doc: &ProjectDoc) -> Vec<(String, usize)> {
     let mut spans: Vec<((usize, usize), Vec<&Annotation>)> = Vec::new();
     for decl in &doc.document.0 {
         match &**decl {
-            Declaration::Struct(s) => {
-                spans.extend(s.fields().iter().map(|f| (f.span, f.annotations())))
-            }
-            Declaration::Error(e) => {
-                spans.extend(e.fields().iter().map(|f| (f.span, f.annotations())))
-            }
+            Declaration::Struct(s) => spans.extend(field_annotations(s.fields())),
+            Declaration::Error(e) => spans.extend(field_annotations(e.fields())),
             Declaration::TypeAlias(t) => spans.push((decl.span, t.annotations())),
             _ => {}
         }
@@ -706,8 +680,7 @@ pub(crate) fn validator_sites(doc: &ProjectDoc) -> Vec<(String, usize)> {
             .flatten()
             .collect();
 
-        let (start, end) = (span.0.min(doc.source.len()), span.1.min(doc.source.len()));
-        let text = &doc.source[start..end];
+        let (start, text) = clamped(doc.source, span);
         for name in names {
             for i in word_occurrences(text, name) {
                 // An entry in the list: `[Name(`, `, Name]`, a bare `Name,`.
@@ -726,21 +699,6 @@ pub(crate) fn validator_sites(doc: &ProjectDoc) -> Vec<(String, usize)> {
         .into_iter()
         .map(|(offset, name)| (name, offset))
         .collect()
-}
-
-/// Like [`collect_named`], but the full text as written (`types::User`).
-fn collect_named_text(ty: &Type, names: &mut BTreeSet<String>) {
-    match ty {
-        Type::Named(name) => {
-            names.insert(name.text.clone());
-        }
-        Type::Array(array) => collect_named_text(array.elem_type(), names),
-        Type::Union(union) => union
-            .members()
-            .iter()
-            .for_each(|m| collect_named_text(m, names)),
-        _ => {}
-    }
 }
 
 #[cfg(test)]

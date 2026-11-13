@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_support::{completions_at, test_uri};
 
 #[test]
 fn test_keyword_completions() {
@@ -14,7 +15,7 @@ fn test_keyword_completions() {
 }
 /// Completion labels at the end of `source`.
 fn labels_at_end(source: &str) -> Vec<String> {
-    let uri = Url::parse("file:///test.ids").unwrap();
+    let uri = test_uri();
     let line = source.lines().count().saturating_sub(1) as u32;
     let column = source.rsplit('\n').next().unwrap_or("").len() as u32;
     let line = if source.ends_with('\n') {
@@ -38,7 +39,7 @@ fn after_a_validators_name_only_for_is_offered() {
 }
 #[test]
 fn accepting_for_reopens_the_suggestions_on_the_types() {
-    let uri = Url::parse("file:///test.ids").unwrap();
+    let uri = test_uri();
     let item = get_completions("validator Positive ", &uri, Position::new(0, 19)).remove(0);
     assert_eq!(item.insert_text.as_deref(), Some("for "));
     assert_eq!(
@@ -174,7 +175,7 @@ fn length_is_offered_only_when_a_target_can_have_one() {
 }
 #[test]
 fn the_params_item_reopens_on_the_properties() {
-    let uri = Url::parse("file:///test.ids").unwrap();
+    let uri = test_uri();
     let source = "validator V for u8 {\n    validate {\n        assert(";
     let items = get_completions(source, &uri, Position::new(2, 15));
     let params = items.into_iter().find(|c| c.label == "params").unwrap();
@@ -227,7 +228,7 @@ fn typing_a_use_path_offers_path_starts_not_everything() {
     // Once fell through every specific check to `Unknown`, dumping
     // keywords + primitives + every known type after `use `.
     let source = "use pk";
-    let uri = Url::parse("file:///test.ids").unwrap();
+    let uri = test_uri();
     let position = Position::new(0, 6);
     let labels: Vec<String> = get_completions(source, &uri, position)
         .into_iter()
@@ -238,7 +239,7 @@ fn typing_a_use_path_offers_path_starts_not_everything() {
 #[test]
 fn test_completion_after_colon() {
     let source = "struct User {\n    name: ";
-    let uri = Url::parse("file:///test.ids").unwrap();
+    let uri = test_uri();
     let position = Position::new(1, 10); // After ":"
     let completions = get_completions(source, &uri, position);
     // Should include types
@@ -248,9 +249,7 @@ fn test_completion_after_colon() {
 #[test]
 fn test_completion_top_level() {
     let source = "\n";
-    let uri = Url::parse("file:///test.ids").unwrap();
-    let position = Position::new(0, 0);
-    let completions = get_completions(source, &uri, position);
+    let completions = completions_at(source, 0, 0);
     // Should include keywords
     assert!(completions.iter().any(|c| c.label == "struct"));
     assert!(completions.iter().any(|c| c.label == "enum"));
@@ -262,9 +261,7 @@ fn top_level_after_closed_declarations_still_offers_keywords() {
     // shape) fails to parse as a whole — context detection must not
     // depend on the document parsing successfully.
     let source = "enum Language {\n    English\n}\n\nstruct Greeting {\n    message: string\n}\n\nprotocol Thing {\n    function foo();\n}\n\nty";
-    let uri = Url::parse("file:///test.ids").unwrap();
-    let position = Position::new(11, 2);
-    let completions = get_completions(source, &uri, position);
+    let completions = completions_at(source, 11, 2);
     assert!(completions.iter().any(|c| c.label == "type"));
     assert!(completions.iter().any(|c| c.label == "struct"));
     // No primitive types at top level - "u32" etc. can never start a
@@ -274,9 +271,7 @@ fn top_level_after_closed_declarations_still_offers_keywords() {
 #[test]
 fn protocol_body_offers_function_not_types_or_top_level_keywords() {
     let source = "protocol Thing {\n    function foo();\n    f";
-    let uri = Url::parse("file:///test.ids").unwrap();
-    let position = Position::new(2, 5);
-    let completions = get_completions(source, &uri, position);
+    let completions = completions_at(source, 2, 5);
     assert!(completions.iter().any(|c| c.label == "function"));
     assert!(!completions.iter().any(|c| c.label == "struct"));
     assert!(!completions.iter().any(|c| c.label == "u32"));
@@ -284,13 +279,13 @@ fn protocol_body_offers_function_not_types_or_top_level_keywords() {
 #[test]
 fn typing_a_function_name_offers_nothing() {
     let source = "protocol Thing {\n    function f";
-    let uri = Url::parse("file:///test.ids").unwrap();
+    let uri = test_uri();
     let position = Position::new(1, 13);
     assert!(get_completions(source, &uri, position).is_empty());
 }
 #[test]
 fn typing_any_declaration_name_offers_nothing() {
-    let uri = Url::parse("file:///test.ids").unwrap();
+    let uri = test_uri();
     for source in ["struct Us", "enum Sta", "const MA", "type Use", "error No"] {
         let position = Position::new(0, source.chars().count() as u32);
         assert!(
@@ -302,7 +297,7 @@ fn typing_any_declaration_name_offers_nothing() {
 #[test]
 fn enum_body_offers_nothing() {
     let source = "enum Status {\n    Active\n    P";
-    let uri = Url::parse("file:///test.ids").unwrap();
+    let uri = test_uri();
     let position = Position::new(2, 5);
     assert!(get_completions(source, &uri, position).is_empty());
 }
@@ -316,9 +311,7 @@ fn named_settings_body_offers_catalog_keys_not_global_keywords() {
     // as anywhere else - "validator" (a declaration keyword) showed up
     // for a bare "v".
     let source = "settings Test {\n    v";
-    let uri = Url::parse("file:///test.ids").unwrap();
-    let position = Position::new(1, 5);
-    let completions = get_completions(source, &uri, position);
+    let completions = completions_at(source, 1, 5);
     assert!(
         completions
             .iter()
@@ -345,9 +338,7 @@ fn unnamed_settings_body_offers_catalog_keys() {
     // only Word between the keyword and `{` when there's no name),
     // landing one token too far back.
     let source = "settings {\n    an";
-    let uri = Url::parse("file:///test.ids").unwrap();
-    let position = Position::new(1, 6);
-    let completions = get_completions(source, &uri, position);
+    let completions = completions_at(source, 1, 6);
     assert!(
         completions
             .iter()
@@ -364,9 +355,7 @@ fn after_a_dot_only_the_remaining_segment_is_offered_not_the_whole_path_again() 
     // Accepting one of the old labels here would have printed
     // `validators.` twice.
     let source = "settings Test {\n    validators.";
-    let uri = Url::parse("file:///test.ids").unwrap();
-    let position = Position::new(1, 15);
-    let completions = get_completions(source, &uri, position);
+    let completions = completions_at(source, 1, 15);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(labels.contains(&"<name>.allowed"), "{labels:?}");
     assert!(labels.contains(&"allowed"), "{labels:?}");
@@ -384,9 +373,7 @@ fn a_partial_segment_after_a_dot_filters_by_its_own_prefix() {
     // form) or the start of a validator's own name (`<name>.allowed`)
     // — both stay candidates; unrelated catalog branches don't.
     let source = "settings Test {\n    validators.al";
-    let uri = Url::parse("file:///test.ids").unwrap();
-    let position = Position::new(1, 17);
-    let completions = get_completions(source, &uri, position);
+    let completions = completions_at(source, 1, 17);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(labels.contains(&"allowed"), "{labels:?}");
     assert!(labels.contains(&"<name>.allowed"), "{labels:?}");
@@ -395,9 +382,7 @@ fn a_partial_segment_after_a_dot_filters_by_its_own_prefix() {
 #[test]
 fn settings_insert_text_after_a_dot_only_fills_in_the_rest() {
     let source = "settings Test {\n    validators.";
-    let uri = Url::parse("file:///test.ids").unwrap();
-    let position = Position::new(1, 15);
-    let completions = get_completions(source, &uri, position);
+    let completions = completions_at(source, 1, 15);
     let allowed = completions
         .iter()
         .find(|c| c.label == "allowed")
@@ -410,9 +395,7 @@ fn settings_insert_text_after_a_dot_only_fills_in_the_rest() {
 #[test]
 fn settings_completions_are_sourced_from_the_catalog_as_snippets() {
     let source = "settings {\n    m";
-    let uri = Url::parse("file:///test.ids").unwrap();
-    let position = Position::new(1, 5);
-    let completions = get_completions(source, &uri, position);
+    let completions = completions_at(source, 1, 5);
     let mode = completions
         .iter()
         .find(|c| c.label == "mode")
@@ -466,9 +449,7 @@ fn framing_is_marked_forbidden_in_a_default_package() {
     // suggest an annotation that produces a hard build error the
     // moment it is accepted.
     let source = "@\nprotocol Thing {\n}\n";
-    let uri = Url::parse("file:///test.ids").unwrap();
-    let position = Position::new(0, 1);
-    let completions = get_completions(source, &uri, position);
+    let completions = completions_at(source, 0, 1);
     let framing = completions
         .iter()
         .find(|c| c.label == "framing")
@@ -491,9 +472,7 @@ fn framing_is_marked_forbidden_in_a_default_package() {
 fn framing_is_unmarked_once_the_schema_allows_it() {
     let source = "@\nprotocol Thing {\n}\n\n\
                   settings {\n    annotations.framing.allowed = true\n}\n";
-    let uri = Url::parse("file:///test.ids").unwrap();
-    let position = Position::new(0, 1);
-    let completions = get_completions(source, &uri, position);
+    let completions = completions_at(source, 0, 1);
     let framing = completions
         .iter()
         .find(|c| c.label == "framing")
@@ -503,9 +482,7 @@ fn framing_is_unmarked_once_the_schema_allows_it() {
 #[test]
 fn an_ordinary_annotation_is_not_marked() {
     let source = "protocol Thing {\n    @\n    function f();\n}\n";
-    let uri = Url::parse("file:///test.ids").unwrap();
-    let position = Position::new(1, 5);
-    let completions = get_completions(source, &uri, position);
+    let completions = completions_at(source, 1, 5);
     let idempotent = completions
         .iter()
         .find(|c| c.label == "idempotent")
@@ -519,7 +496,7 @@ fn a_decl_scoped_key_is_offered_once_a_decl_path_is_typed() {
     // unscoped patterns all start with a group name, so typing
     // `struct.` matched none of them.
     let source = "settings {\n    struct.field.";
-    let uri = Url::parse("file:///test.ids").unwrap();
+    let uri = test_uri();
     let position = Position::new(1, source.lines().last().unwrap().chars().count() as u32);
     let completions = get_completions(source, &uri, position);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
@@ -538,9 +515,7 @@ fn the_top_level_listing_is_not_buried_by_the_scoped_forms() {
     // common case, so the scoped forms appear only once a path is
     // typed.
     let source = "settings {\n    ";
-    let uri = Url::parse("file:///test.ids").unwrap();
-    let position = Position::new(1, 4);
-    let completions = get_completions(source, &uri, position);
+    let completions = completions_at(source, 1, 4);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         !labels.iter().any(|l| l.starts_with("struct.")),
@@ -554,9 +529,7 @@ fn the_diagnostics_level_key_inserts_a_usable_entry() {
     // no tab-stop, unquoted (so it did not parse), and `= true` where
     // one of five level strings is required.
     let source = "settings {\n    d";
-    let uri = Url::parse("file:///test.ids").unwrap();
-    let position = Position::new(1, 5);
-    let completions = get_completions(source, &uri, position);
+    let completions = completions_at(source, 1, 5);
     let level = completions
         .iter()
         .find(|c| c.label == "diagnostics.<code>.level")
@@ -575,7 +548,7 @@ fn the_diagnostics_level_key_survives_typing_past_its_group() {
     // wildcard, so this entry was filtered out the moment anything was
     // typed after `diagnostics.` - exactly when it is most wanted.
     let source = "settings {\n    diagnostics.\"validation::deprecated-type-usage\".";
-    let uri = Url::parse("file:///test.ids").unwrap();
+    let uri = test_uri();
     let position = Position::new(1, source.lines().last().unwrap().chars().count() as u32);
     let completions = get_completions(source, &uri, position);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
@@ -642,7 +615,7 @@ fn framings_choice_list_comes_from_core_not_a_local_copy() {
 }
 /// Completion labels at the end of `line` (0-based) of `source`.
 fn labels_at_end_of(source: &str, line: u32) -> Vec<String> {
-    let uri = Url::parse("file:///test.ids").unwrap();
+    let uri = test_uri();
     let text = source.lines().nth(line as usize).unwrap();
     let position = Position::new(line, text.chars().count() as u32);
     get_completions(source, &uri, position)
@@ -687,7 +660,7 @@ fn a_marker_annotation_inserts_no_value_half() {
 #[test]
 fn type_position_survives_interior_whitespace() {
     let source = "struct X {\n    test:  "; // two trailing spaces
-    let uri = Url::parse("file:///test.ids").unwrap();
+    let uri = test_uri();
     let position = Position::new(1, source.lines().last().unwrap().chars().count() as u32);
     let completions = get_completions(source, &uri, position);
     assert!(completions.iter().any(|c| c.label == "u32"));
@@ -695,7 +668,7 @@ fn type_position_survives_interior_whitespace() {
 #[test]
 fn type_position_survives_a_partial_type_name() {
     let source = "struct X {\n    test: u";
-    let uri = Url::parse("file:///test.ids").unwrap();
+    let uri = test_uri();
     let position = Position::new(1, source.lines().last().unwrap().chars().count() as u32);
     let completions = get_completions(source, &uri, position);
     assert!(completions.iter().any(|c| c.label == "u64"));
@@ -703,7 +676,7 @@ fn type_position_survives_a_partial_type_name() {
 #[test]
 fn union_member_position_offers_types() {
     let source = "struct X {\n    v: union(";
-    let uri = Url::parse("file:///test.ids").unwrap();
+    let uri = test_uri();
     let position = Position::new(1, source.lines().last().unwrap().chars().count() as u32);
     let completions = get_completions(source, &uri, position);
     assert!(completions.iter().any(|c| c.label == "u32"));
@@ -711,7 +684,7 @@ fn union_member_position_offers_types() {
 #[test]
 fn return_type_position_offers_types() {
     let source = "protocol P {\n    function f() -> ";
-    let uri = Url::parse("file:///test.ids").unwrap();
+    let uri = test_uri();
     let position = Position::new(1, source.lines().last().unwrap().chars().count() as u32);
     let completions = get_completions(source, &uri, position);
     assert!(completions.iter().any(|c| c.label == "string"));
@@ -720,7 +693,7 @@ fn return_type_position_offers_types() {
 fn function_arg_list_offers_types_not_declaration_keywords() {
     // No `name:` yet - a bare type is also valid grammar here.
     let source = "protocol P {\n    function f(";
-    let uri = Url::parse("file:///test.ids").unwrap();
+    let uri = test_uri();
     let position = Position::new(1, source.lines().last().unwrap().chars().count() as u32);
     let completions = get_completions(source, &uri, position);
     assert!(completions.iter().any(|c| c.label == "u32"));
@@ -729,9 +702,7 @@ fn function_arg_list_offers_types_not_declaration_keywords() {
 #[test]
 fn annotation_on_a_field_offers_validators() {
     let source = "struct X {\n    @";
-    let uri = Url::parse("file:///test.ids").unwrap();
-    let position = Position::new(1, 5);
-    let completions = get_completions(source, &uri, position);
+    let completions = completions_at(source, 1, 5);
     assert!(completions.iter().any(|c| c.label == "validators"));
     // Function/leading-only keys shouldn't leak into field scope.
     assert!(!completions.iter().any(|c| c.label == "timeout_ms"));
@@ -740,9 +711,7 @@ fn annotation_on_a_field_offers_validators() {
 #[test]
 fn annotation_on_a_function_offers_timeout_ms_and_idempotent() {
     let source = "protocol P {\n    @";
-    let uri = Url::parse("file:///test.ids").unwrap();
-    let position = Position::new(1, 5);
-    let completions = get_completions(source, &uri, position);
+    let completions = completions_at(source, 1, 5);
     assert!(completions.iter().any(|c| c.label == "timeout_ms"));
     assert!(!completions.iter().any(|c| c.label == "validators"));
     // `idempotent` is a bare marker — no `=value` snippet, just the
@@ -757,9 +726,7 @@ fn annotation_on_a_function_offers_timeout_ms_and_idempotent() {
 #[test]
 fn annotation_at_top_level_offers_framing() {
     let source = "@";
-    let uri = Url::parse("file:///test.ids").unwrap();
-    let position = Position::new(0, 1);
-    let completions = get_completions(source, &uri, position);
+    let completions = completions_at(source, 0, 1);
     assert!(completions.iter().any(|c| c.label == "framing"));
     assert!(!completions.iter().any(|c| c.label == "validators"));
     assert!(!completions.iter().any(|c| c.label == "timeout_ms"));
@@ -770,21 +737,19 @@ fn annotation_key_still_resolves_while_partially_typed() {
     // other in-progress word is, same as `type_position_survives_a_
     // partial_type_name` for `:`.
     let source = "protocol P {\n    @time";
-    let uri = Url::parse("file:///test.ids").unwrap();
-    let position = Position::new(1, 9);
-    let completions = get_completions(source, &uri, position);
+    let completions = completions_at(source, 1, 9);
     assert!(completions.iter().any(|c| c.label == "timeout_ms"));
 }
 #[test]
 fn annotation_in_an_enum_body_offers_nothing() {
     let source = "enum Status {\n    @";
-    let uri = Url::parse("file:///test.ids").unwrap();
+    let uri = test_uri();
     let position = Position::new(1, 5);
     assert!(get_completions(source, &uri, position).is_empty());
 }
 #[test]
 fn no_completions_inside_comments_or_strings() {
-    let uri = Url::parse("file:///test.ids").unwrap();
+    let uri = test_uri();
     // inside a `///` docstring
     let src = "/// Message that can be se\nstruct M {}\n";
     assert!(get_completions(src, &uri, Position::new(0, 25)).is_empty());
@@ -833,7 +798,7 @@ fn completion_works_right_after_a_multi_line_block_comment() {
     // declaration sitting earlier in the file must not throw off
     // completion context for real code afterward.
     let source = "/*\nerror Test {\n    message = \"\"\n}\n*/\nstruct M {\n    \n}\n";
-    let uri = Url::parse("file:///test.ids").unwrap();
+    let uri = test_uri();
     let items = get_completions(source, &uri, Position::new(6, 4));
     // StructBody context: the one modifier keyword a field can start
     // with. Confirms the commented-out `error Test { ... }` above

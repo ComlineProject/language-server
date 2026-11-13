@@ -19,7 +19,7 @@ use tower_lsp::{Client, LanguageServer};
 
 pub struct Backend {
     client: Client,
-    documents: Arc<DocumentStore>,
+    documents: DocumentStore,
     /// Every package schema on disk, open or not (see `workspace`).
     workspace: Arc<WorkspaceIndex>,
     /// The workspace folders, as filesystem paths.
@@ -37,7 +37,7 @@ impl Backend {
     pub fn new(client: Client) -> Self {
         Self {
             client,
-            documents: Arc::new(DocumentStore::new()),
+            documents: DocumentStore::new(),
             workspace: Arc::new(WorkspaceIndex::default()),
             roots: RwLock::new(Vec::new()),
         }
@@ -64,12 +64,7 @@ impl Backend {
     /// only the open files outside any package.
     fn package_view(&self, uri: &Url) -> Vec<SourceFile> {
         let root = workspace::package_root(uri);
-        let open: Vec<crate::document::Document> = self
-            .documents
-            .get_all_uris()
-            .into_iter()
-            .filter_map(|u| self.documents.get(&u))
-            .collect();
+        let open = self.documents.all();
         let open_text = |url: &Url| {
             let key = workspace::path_key(url);
             open.iter()
@@ -140,10 +135,7 @@ impl Backend {
     /// directory (its `config.idp`, schemas and dependencies), seen as one
     /// of the package's schemas would see it.
     fn comline_toml_context(&self, uri: &Url) -> comline_toml::Context {
-        let Some(dir) = uri
-            .to_file_path()
-            .ok()
-            .and_then(|p| p.parent().map(PathBuf::from))
+        let Some(dir) = file_dir(uri)
         else {
             return comline_toml::Context::default();
         };
@@ -162,11 +154,8 @@ impl Backend {
             .collect();
         // `package_view` finds the manifest from the schemas root; without a
         // `src/` on disk, read it from beside `comline.toml` instead.
-        if !view
-            .iter()
-            .any(|f| f.dependency.is_none() && crate::analysis::source::is_manifest(&f.uri))
-        {
-            if let Ok(manifest) = Url::from_file_path(dir.join(dependencies::MANIFEST)) {
+        if crate::analysis::source::own_manifest(&view).is_none() {
+            if let Some(manifest) = manifest_in(&dir) {
                 if let Some(text) = self.text_of(&manifest) {
                     view.push(SourceFile::local(manifest, text));
                 }
@@ -177,16 +166,18 @@ impl Backend {
 
     /// A file's text: its open buffer, else its disk copy.
     fn text_of(&self, url: &Url) -> Option<String> {
-        let key = workspace::path_key(url);
-        let open = self
-            .documents
+        self.open_text(&workspace::path_key(url))
+            .or_else(|| std::fs::read_to_string(url.to_file_path().ok()?).ok())
+    }
+
+    /// The text of the open buffer whose path key is `key`.
+    fn open_text(&self, key: &Option<String>) -> Option<String> {
+        self.documents
             .get_all_uris()
             .into_iter()
-            .find(|u| workspace::path_key(u) == key);
-        match open.and_then(|u| self.documents.get(&u)) {
-            Some(document) => Some(document.text),
-            None => std::fs::read_to_string(url.to_file_path().ok()?).ok(),
-        }
+            .find(|u| workspace::path_key(u) == *key)
+            .and_then(|u| self.documents.get(&u))
+            .map(|d| d.text)
     }
 
     /// Re-read the dependencies of the package whose `src/` is `src_root`,
@@ -196,15 +187,7 @@ impl Backend {
             .parent()
             .map(|dir| dir.join(dependencies::MANIFEST));
         let open_text = manifest.and_then(|path| {
-            let key = Url::from_file_path(&path)
-                .ok()
-                .and_then(|u| workspace::path_key(&u));
-            self.documents
-                .get_all_uris()
-                .into_iter()
-                .find(|u| workspace::path_key(u) == key)
-                .and_then(|u| self.documents.get(&u))
-                .map(|d| d.text)
+            self.open_text(&Url::from_file_path(&path).ok().and_then(|u| workspace::path_key(&u)))
         });
         self.workspace
             .index_dependencies(src_root, open_text.as_deref());
@@ -272,8 +255,17 @@ fn is_schema(uri: &Url) -> bool {
 /// The `config.idp` of `uri`'s package (next to its `src/`), if it has one.
 fn manifest_url(uri: &Url) -> Option<Url> {
     let path = uri.to_file_path().ok()?;
-    let package_dir = comline_core::package::layout::schemas_root_for(&path)?.parent()?;
-    Url::from_file_path(package_dir.join(dependencies::MANIFEST)).ok()
+    manifest_in(comline_core::package::layout::schemas_root_for(&path)?.parent()?)
+}
+
+/// The `config.idp` in `dir`.
+fn manifest_in(dir: &std::path::Path) -> Option<Url> {
+    Url::from_file_path(dir.join(dependencies::MANIFEST)).ok()
+}
+
+/// The directory of the file at `uri`.
+fn file_dir(uri: &Url) -> Option<PathBuf> {
+    uri.to_file_path().ok()?.parent().map(PathBuf::from)
 }
 
 /// For a package manifest (`config.idp`), its package's `src/` directory.
@@ -519,9 +511,8 @@ impl LanguageServer for Backend {
         let position = params.text_document_position_params.position;
 
         if is_idp(&uri) {
-            let document = match self.documents.get(&uri) {
-                Some(doc) => doc,
-                None => return Ok(None),
+            let Some(document) = self.documents.get(&uri) else {
+                return Ok(None);
             };
             // `None` (cursor isn't inside a `settings` block) falls
             // through to VS Code's own idpSchema.ts-backed client
@@ -544,9 +535,8 @@ impl LanguageServer for Backend {
 
         tracing::debug!("Hover request for {} at {:?}", uri, position);
 
-        let document = match self.documents.get(&uri) {
-            Some(doc) => doc,
-            None => return Ok(None),
+        let Some(document) = self.documents.get(&uri) else {
+            return Ok(None);
         };
 
         let other_files = self.other_project_files(&uri);
@@ -565,12 +555,7 @@ impl LanguageServer for Backend {
             // the package has unsaved changes (the buffer's, another open
             // file's, or `config.idp`'s).
             || {
-                let open: Vec<crate::document::Document> = self
-                    .documents
-                    .get_all_uris()
-                    .into_iter()
-                    .filter_map(|u| self.documents.get(&u))
-                    .collect();
+                let open = self.documents.all();
                 crate::handlers::protocol_summary::unsaved_in_package(
                     &uri,
                     open.iter().map(|d| (&d.uri, d.text.as_str())),
@@ -598,9 +583,8 @@ impl LanguageServer for Backend {
 
         tracing::debug!("Completion request for {} at {:?}", uri, position);
 
-        let document = match self.documents.get(&uri) {
-            Some(doc) => doc,
-            None => return Ok(None),
+        let Some(document) = self.documents.get(&uri) else {
+            return Ok(None);
         };
 
         // Use our completion handler
@@ -612,11 +596,7 @@ impl LanguageServer for Backend {
             &self.other_project_files(&uri),
         );
 
-        if completions.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(CompletionResponse::Array(completions)))
-        }
+        Ok((!completions.is_empty()).then_some(CompletionResponse::Array(completions)))
     }
 
     async fn goto_definition(
@@ -632,9 +612,8 @@ impl LanguageServer for Backend {
 
         tracing::debug!("Go-to-definition request for {} at {:?}", uri, position);
 
-        let document = match self.documents.get(&uri) {
-            Some(doc) => doc,
-            None => return Ok(None),
+        let Some(document) = self.documents.get(&uri) else {
+            return Ok(None);
         };
 
         let other_files = self.other_project_files(&uri);
@@ -660,9 +639,8 @@ impl LanguageServer for Backend {
 
         tracing::debug!("Find references request for {} at {:?}", uri, position);
 
-        let document = match self.documents.get(&uri) {
-            Some(doc) => doc,
-            None => return Ok(None),
+        let Some(document) = self.documents.get(&uri) else {
+            return Ok(None);
         };
 
         // Use our references handler
@@ -675,11 +653,7 @@ impl LanguageServer for Backend {
             &self.other_project_files(&uri),
         );
 
-        if refs.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(refs))
-        }
+        Ok((!refs.is_empty()).then_some(refs))
     }
 
     async fn document_symbol(
@@ -694,20 +668,15 @@ impl LanguageServer for Backend {
 
         tracing::debug!("Document symbols request for {}", uri);
 
-        let document = match self.documents.get(&uri) {
-            Some(doc) => doc,
-            None => return Ok(None),
+        let Some(document) = self.documents.get(&uri) else {
+            return Ok(None);
         };
 
         // Use our symbols handler
         use crate::handlers::symbols;
         let doc_symbols = symbols::get_document_symbols(&document.text, &uri);
 
-        if doc_symbols.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(DocumentSymbolResponse::Nested(doc_symbols)))
-        }
+        Ok((!doc_symbols.is_empty()).then_some(DocumentSymbolResponse::Nested(doc_symbols)))
     }
 
     async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
@@ -723,20 +692,15 @@ impl LanguageServer for Backend {
         }
         tracing::debug!("Format request for {}", uri);
 
-        let document = match self.documents.get(&uri) {
-            Some(doc) => doc,
-            None => return Ok(None),
+        let Some(document) = self.documents.get(&uri) else {
+            return Ok(None);
         };
 
         // Use our formatting handler
         use crate::handlers::formatting;
         let edits = formatting::format_document(&document.text);
 
-        if edits.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(edits))
-        }
+        Ok((!edits.is_empty()).then_some(edits))
     }
 
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
@@ -755,9 +719,8 @@ impl LanguageServer for Backend {
             new_name
         );
 
-        let document = match self.documents.get(&uri) {
-            Some(doc) => doc,
-            None => return Ok(None),
+        let Some(document) = self.documents.get(&uri) else {
+            return Ok(None);
         };
 
         // Use our rename handler
@@ -781,9 +744,8 @@ impl LanguageServer for Backend {
             return Ok(None);
         }
 
-        let document = match self.documents.get(&uri) {
-            Some(doc) => doc,
-            None => return Ok(None),
+        let Some(document) = self.documents.get(&uri) else {
+            return Ok(None);
         };
 
         use crate::handlers::rename;
@@ -799,16 +761,12 @@ impl LanguageServer for Backend {
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
         let uri = params.text_document.uri.clone();
 
-        let document = match self.documents.get(&uri) {
-            Some(doc) => doc,
-            None => return Ok(None),
+        let Some(document) = self.documents.get(&uri) else {
+            return Ok(None);
         };
 
         if is_comline_toml(&uri) {
-            let manifest = uri
-                .to_file_path()
-                .ok()
-                .and_then(|p| Url::from_file_path(p.parent()?.join(dependencies::MANIFEST)).ok());
+            let manifest = file_dir(&uri).and_then(|dir| manifest_in(&dir));
             let manifest_text = manifest.as_ref().and_then(|m| self.text_of(m));
             let actions = crate::handlers::comline_toml::code_actions(
                 &document.text,
@@ -820,10 +778,7 @@ impl LanguageServer for Backend {
         }
 
         if is_idp(&uri) {
-            let Some(package_dir) = uri
-                .to_file_path()
-                .ok()
-                .and_then(|p| p.parent().map(PathBuf::from))
+            let Some(package_dir) = file_dir(&uri)
             else {
                 return Ok(None);
             };
@@ -855,9 +810,8 @@ impl LanguageServer for Backend {
 
         tracing::debug!("Semantic tokens request for {}", uri);
 
-        let document = match self.documents.get(&uri) {
-            Some(doc) => doc,
-            None => return Ok(None),
+        let Some(document) = self.documents.get(&uri) else {
+            return Ok(None);
         };
 
         // Use our semantic tokens handler directly
@@ -903,10 +857,9 @@ impl Backend {
 
         let open: Vec<crate::document::Document> = self
             .documents
-            .get_all_uris()
+            .all()
             .into_iter()
-            .filter(|u| is_schema(u) && !stdlib::is_std(u))
-            .filter_map(|u| self.documents.get(&u))
+            .filter(|d| is_schema(&d.uri) && !stdlib::is_std(&d.uri))
             .collect();
 
         let mut packages: BTreeMap<Option<String>, Vec<&crate::document::Document>> =
@@ -980,7 +933,7 @@ impl Backend {
         use crate::analysis::diagnostics;
         use crate::analysis::project::Project;
         use crate::parser;
-        use crate::util::byte_range_to_lsp_range;
+        use crate::util::keyword_span;
 
         let document = match self.documents.get(uri) {
             Some(doc) => doc,
@@ -992,10 +945,7 @@ impl Backend {
                 let mut lsp_diagnostics =
                     diagnostics::generate_diagnostics(&document.text, &result.errors);
                 if !result.has_errors() {
-                    if let Some(package_dir) = uri
-                        .to_file_path()
-                        .ok()
-                        .and_then(|p| p.parent().map(PathBuf::from))
+                    if let Some(package_dir) = file_dir(uri)
                     {
                         lsp_diagnostics.extend(dependencies::manifest_diagnostics(
                             &package_dir,
@@ -1034,13 +984,12 @@ impl Backend {
                                 &document.text,
                                 &message,
                             );
-                            lsp_diagnostics.push(Diagnostic {
-                                range: byte_range_to_lsp_range(&document.text, start, end),
-                                severity: Some(DiagnosticSeverity::ERROR),
-                                source: Some("comline".to_string()),
+                            lsp_diagnostics.push(dependencies::diagnostic(
+                                &document.text,
+                                (start, end),
+                                DiagnosticSeverity::ERROR,
                                 message,
-                                ..Default::default()
-                            });
+                            ));
                         }
                     }
 
@@ -1052,30 +1001,19 @@ impl Backend {
                     let view = self.package_view(uri);
                     let project = Project::new(view.iter());
                     if let Some(message) = project.settings_error {
-                        let at = document
-                            .text
-                            .find("settings")
-                            .map(|i| (i, i + "settings".len()))
-                            .unwrap_or((0, 0));
-                        lsp_diagnostics.push(Diagnostic {
-                            range: byte_range_to_lsp_range(&document.text, at.0, at.1),
-                            severity: Some(DiagnosticSeverity::ERROR),
-                            source: Some("comline".to_string()),
+                        lsp_diagnostics.push(dependencies::diagnostic(
+                            &document.text,
+                            keyword_span(&document.text, "settings"),
+                            DiagnosticSeverity::ERROR,
                             message,
-                            ..Default::default()
-                        });
+                        ));
                     }
 
                     // The declared languages themselves, as `comline build`
                     // proves them: a generator for each version, none below
                     // a dependency's, and past the verified range a warning.
-                    let dependency_languages = uri
-                        .to_file_path()
-                        .ok()
-                        .and_then(|p| {
-                            p.parent()
-                                .map(|dir| dependencies::dependency_languages(dir, &document.text))
-                        })
+                    let dependency_languages = file_dir(uri)
+                        .map(|dir| dependencies::dependency_languages(&dir, &document.text))
                         .unwrap_or_default();
                     lsp_diagnostics.extend(crate::analysis::generation::declaration_diagnostics(
                         &document.text,

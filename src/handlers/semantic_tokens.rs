@@ -261,12 +261,17 @@ fn block_comment_end(chars: &[char], from: usize) -> Option<usize> {
 mod tests {
     use super::*;
 
-    fn types_on(src: &str) -> Vec<u32> {
+    /// The tokens of `src`, a file on its own.
+    fn semantic(src: &str) -> SemanticTokens {
         let r = get_semantic_tokens(src, &Url::parse("file:///t.ids").unwrap()).unwrap();
         let SemanticTokensResult::Tokens(t) = r else {
             panic!()
         };
-        t.data.iter().map(|x| x.token_type).collect()
+        t
+    }
+
+    fn types_on(src: &str) -> Vec<u32> {
+        semantic(src).data.iter().map(|x| x.token_type).collect()
     }
 
     fn tokens_on(src: &str) -> Vec<(u32, u32, u32)> {
@@ -316,10 +321,7 @@ mod tests {
     #[test]
     fn type_alias_keyword_classifies_as_keyword_not_type() {
         let src = "type UserId = u64\n";
-        let r = get_semantic_tokens(src, &Url::parse("file:///t.ids").unwrap()).unwrap();
-        let SemanticTokensResult::Tokens(t) = r else {
-            panic!()
-        };
+        let t = semantic(src);
         // First token on the line is `type` itself - must classify as
         // KEYWORD (it's in the declaration-keyword list), not TYPE (which
         // `UserId`/`u64` later on the same line correctly do get).
@@ -328,20 +330,14 @@ mod tests {
 
     #[test]
     fn empty_source_yields_no_tokens() {
-        let r = get_semantic_tokens("", &Url::parse("file:///t.ids").unwrap()).unwrap();
-        let SemanticTokensResult::Tokens(t) = r else {
-            panic!()
-        };
+        let t = semantic("");
         assert!(t.data.is_empty());
     }
 
     #[test]
     fn use_path_prefix_keywords_highlight() {
         let src = "use parent::common\n";
-        let r = get_semantic_tokens(src, &Url::parse("file:///t.ids").unwrap()).unwrap();
-        let SemanticTokensResult::Tokens(t) = r else {
-            panic!()
-        };
+        let t = semantic(src);
         // `use` (Declaration) and `parent` (PathPrefix) both colour as
         // KEYWORD; `common` is a lowercase identifier, so it gets no token
         // at all (not every word on the line is one of the three tokens).
@@ -389,14 +385,7 @@ mod tests {
 
     #[test]
     fn a_block_comment_on_one_line_highlights_as_a_single_comment_token() {
-        let r = get_semantic_tokens(
-            "/* note */ struct S {}\n",
-            &Url::parse("file:///t.ids").unwrap(),
-        )
-        .unwrap();
-        let SemanticTokensResult::Tokens(t) = r else {
-            panic!()
-        };
+        let t = semantic("/* note */ struct S {}\n");
         // The comment token covers exactly `/* note */` (0..10), then
         // `struct`/`S` highlight normally afterward.
         assert_eq!(t.data[0].token_type, COMMENT);
@@ -413,10 +402,7 @@ mod tests {
         // from the opener through the closer must come back as COMMENT,
         // never as real `error`/`message` keyword tokens.
         let src = "/*\nerror Test {\n    message = \"\"\n}\n*/\nstruct S {}\n";
-        let r = get_semantic_tokens(src, &Url::parse("file:///t.ids").unwrap()).unwrap();
-        let SemanticTokensResult::Tokens(t) = r else {
-            panic!()
-        };
+        let t = semantic(src);
         // Every token through the closing `*/` line is COMMENT; the last
         // two (struct, S) are the real code after it.
         assert_eq!(t.data.len(), 7, "{t:?}");
@@ -440,10 +426,7 @@ mod tests {
     #[test]
     fn message_before_equals_highlights_as_keyword() {
         let src = "error E {\n    message = \"x\"\n}\n";
-        let r = get_semantic_tokens(src, &Url::parse("file:///t.ids").unwrap()).unwrap();
-        let SemanticTokensResult::Tokens(t) = r else {
-            panic!()
-        };
+        let t = semantic(src);
         assert!(t
             .data
             .iter()
@@ -456,10 +439,7 @@ mod tests {
         assert!(s32.contains(&TYPE));
 
         let i32_src = "struct S {\n    f: i32\n}\n";
-        let r = get_semantic_tokens(i32_src, &Url::parse("file:///t.ids").unwrap()).unwrap();
-        let SemanticTokensResult::Tokens(t) = r else {
-            panic!()
-        };
+        let t = semantic(i32_src);
         // Only `struct` and `S` get tokens — `f` and `i32` are untouched
         // since `i32` isn't a real Comline primitive (lowercase, no token).
         assert_eq!(t.data.len(), 2);
@@ -467,14 +447,7 @@ mod tests {
 
     #[test]
     fn deltas_are_relative() {
-        let r = get_semantic_tokens(
-            "struct A {}\nstruct B {}\n",
-            &Url::parse("file:///t.ids").unwrap(),
-        )
-        .unwrap();
-        let SemanticTokensResult::Tokens(t) = r else {
-            panic!()
-        };
+        let t = semantic("struct A {}\nstruct B {}\n");
         let second = t
             .data
             .iter()
