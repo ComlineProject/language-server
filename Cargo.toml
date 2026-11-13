@@ -45,7 +45,7 @@ comline-core = { git = "https://github.com/ComlineProject/core", rev = "e4c54404
 # same commits as the CLI, so a build has one `comline-codegen`.
 comline-codegen = { git = "https://github.com/ComlineProject/generation", rev = "332e0f0357a67b12e335a89a3036b2cd0bf1a7be" }
 comline-codegen-rust = { git = "https://github.com/ComlineProject/comline-rust", rev = "2659fbf6daf6da96d320905604dc2b88a48f31d8" }
-comline-codegen-typescript = { git = "https://github.com/ComlineProject/comline-typescript", rev = "ca62ea81753d799b717f27413a88fab76264b8a6" }
+comline-codegen-typescript = { git = "https://github.com/ComlineProject/comline-typescript", rev = "c5d80c772631de17b03c0b039321887707a80e4d" }
 
 # `server`-only.
 tower-lsp = { version = "0.20.0", optional = true }
