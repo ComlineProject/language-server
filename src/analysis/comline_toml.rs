@@ -1557,7 +1557,8 @@ mod tests {
                             "calls": {{ "value": "by_name", "proven_by": [] }},
                             "directions": {{ "value": "both", "proven_by": [] }},
                             "errors": {{ "value": "by_name", "proven_by": [] }},
-                            "payload": {{ "value": "{payload}", "proven_by": [] }}
+                            "payload": {{ "value": "{payload}", "proven_by": [] }},
+                            "protocol": {{ "value": "unnamed", "proven_by": [] }}
                         }} }}"#
                     ),
                 )
