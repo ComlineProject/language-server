@@ -16,7 +16,7 @@ use lsp_types::Url;
 
 use crate::analysis::imports;
 use crate::analysis::project::{Project, ProjectDoc};
-use crate::util::{in_comment_or_string, path_at};
+use crate::util::{follows_as, in_comment_or_string, path_at};
 
 /// What a path segment names.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -261,7 +261,7 @@ pub fn path_module_at(
     let at = path_at(source, offset)?;
     let keyword = statement_keyword(source, offset);
     // A lone word is a path only in a `use` line (`use types`).
-    if !(at.continues || at.segments.len() > 1 || keyword.is_some()) || is_alias(source, at.range.0)
+    if !(at.continues || at.segments.len() > 1 || keyword.is_some()) || follows_as(&source[..at.range.0])
     {
         return None;
     }
@@ -290,14 +290,6 @@ fn statement_keyword(source: &str, offset: usize) -> Option<&'static str> {
         line.strip_prefix(keyword)
             .is_some_and(|rest| rest.starts_with(char::is_whitespace))
     })
-}
-
-/// Whether the word starting at `start` is the alias in `... as Alias`.
-fn is_alias(source: &str, start: usize) -> bool {
-    source[..start]
-        .trim_end()
-        .strip_suffix("as")
-        .is_some_and(|before| before.ends_with(char::is_whitespace))
 }
 
 #[cfg(test)]

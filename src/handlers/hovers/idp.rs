@@ -13,11 +13,12 @@
 // against the raw parsed `Congregation`, the same way `.ids`'s hover.rs
 // works against the raw `Document`, never touching `FrozenUnit`/IR.
 
+use crate::handlers::{code, hover, recognized_keys};
 use crate::parser;
 use crate::util::{in_comment_or_string, position_to_offset};
 use comline_core::package::config::idl::grammar::{Assignment, Key, Value};
 use comline_core::settings::catalog;
-use lsp_types::{Hover, HoverContents, MarkedString, Position};
+use lsp_types::{Hover, MarkedString, Position};
 use rust_sitter::Spanned;
 
 pub fn get_idp_hover_info(source: &str, position: Position) -> Option<Hover> {
@@ -26,7 +27,7 @@ pub fn get_idp_hover_info(source: &str, position: Position) -> Option<Hover> {
         return None;
     }
 
-    let congregation = parser::parse_idp(source).ok()?.document?;
+    let congregation = parser::parse_congregation(source)?;
 
     if let Some(hover) = language_hover(&congregation.assignments, offset) {
         return Some(hover);
@@ -39,25 +40,15 @@ pub fn get_idp_hover_info(source: &str, position: Position) -> Option<Hover> {
     })?;
 
     let mut path = vec!["settings".to_string()];
-    let mut current = top;
-    while let Value::Dictionary(dict) = &current.value.value {
-        match dict
-            .assignments
-            .iter()
-            .find(|a| offset >= a.span.0 && offset < a.span.1)
-        {
-            Some(child) => {
-                path.push(key_text(&child.value.key));
-                current = child;
-            }
-            None => break,
-        }
+    let mut current = &top.value;
+    while let Some(child) = dictionary(current).and_then(|d| containing(d, offset, None)) {
+        path.push(child.key.text());
+        current = child;
     }
 
-    Some(if matches!(&current.value.value, Value::Dictionary(_)) {
-        group_hover(&path)
-    } else {
-        entry_hover(&path, &current.value.value)
+    Some(match dictionary(current) {
+        Some(_) => group_hover(&path),
+        None => entry_hover(&path, &current.value),
     })
 }
 
@@ -68,13 +59,10 @@ fn language_hover(assignments: &[Spanned<Assignment>], offset: usize) -> Option<
     let generation = dictionary(containing(assignments, offset, Some("code_generation"))?)?;
     let languages = dictionary(containing(generation, offset, Some("languages"))?)?;
     let entry = containing(languages, offset, None)?;
-    let key = key_text(&entry.key);
+    let key = entry.key.text();
     let (language, version) = key.split_once('#')?;
     let summary = crate::analysis::generation::summary(language, version)?;
-    Some(Hover {
-        contents: HoverContents::Array(vec![MarkedString::from_markdown(summary)]),
-        range: None,
-    })
+    Some(hover(vec![MarkedString::from_markdown(summary)]))
 }
 
 /// The assignment in `assignments` the cursor is in - named `key`, if given.
@@ -88,7 +76,7 @@ fn containing<'a>(
         .find(|a| {
             offset >= a.span.0
                 && offset < a.span.1
-                && key.is_none_or(|k| key_text(&a.value.key) == k)
+                && key.is_none_or(|k| a.value.key.text() == k)
         })
         .map(|a| &a.value)
 }
@@ -99,10 +87,6 @@ fn dictionary(assignment: &Assignment) -> Option<&[Spanned<Assignment>]> {
         Value::Dictionary(d) => Some(&d.assignments),
         _ => None,
     }
-}
-
-fn key_text(key: &Key) -> String {
-    key.text()
 }
 
 /// A rendering of a `Value` that never panics on anything, unlike
@@ -129,10 +113,7 @@ fn render_value(value: &Value) -> String {
 /// deferred decision) actually layers underneath this.
 fn entry_hover(path: &[String], value: &Value) -> Hover {
     let key = path.join(".");
-    let mut contents = vec![MarkedString::from_language_code(
-        "comline".to_string(),
-        format!("{key} = {}", render_value(value)),
-    )];
+    let mut contents = vec![code(format!("{key} = {}", render_value(value)))];
 
     // `path`'s leading `settings` is synthetic - it names the `.idp`
     // assignment this dict hangs off, and exists for the signature line
@@ -150,35 +131,20 @@ fn entry_hover(path: &[String], value: &Value) -> Hover {
         ));
     }
 
-    Hover {
-        contents: HoverContents::Array(contents),
-        range: None,
-    }
+    hover(contents)
 }
 
 /// Cursor on `settings` itself or on any intermediate group key (e.g.
 /// `validators`) — not a specific leaf. Shows the recognized-shapes
 /// catalog, the same listing `.ids`'s block-level settings hover shows.
 fn group_hover(path: &[String]) -> Hover {
-    let signature = path.join(".");
-    let catalog_lines: Vec<String> = catalog::block_summary()
-        .iter()
-        .map(|f| format!("- `{}` - {}", f.key_pattern, f.summary))
-        .collect();
-
-    let contents = vec![
-        MarkedString::from_language_code("comline".to_string(), signature),
-        MarkedString::from_markdown(format!("**recognized keys**\n{}", catalog_lines.join("\n"))),
-    ];
-
-    Hover {
-        contents: HoverContents::Array(contents),
-        range: None,
-    }
+    hover(vec![code(path.join(".")), recognized_keys()])
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::hover_text;
+    use lsp_types::HoverContents;
 
     #[test]
     fn hovering_a_declared_language_shows_what_its_generator_supports() {
@@ -201,22 +167,6 @@ mod tests {
 
     use super::*;
     use crate::util::offset_to_position;
-
-    fn hover_text(hover: Hover) -> String {
-        match hover.contents {
-            HoverContents::Array(parts) => parts
-                .into_iter()
-                .map(|p| match p {
-                    MarkedString::String(s) => s,
-                    MarkedString::LanguageString(ls) => ls.value,
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-            HoverContents::Scalar(MarkedString::String(s)) => s,
-            HoverContents::Scalar(MarkedString::LanguageString(ls)) => ls.value,
-            HoverContents::Markup(m) => m.value,
-        }
-    }
 
     #[test]
     fn hover_on_the_settings_keyword_shows_the_group_catalog() {

@@ -16,6 +16,9 @@ pub mod util;
 pub mod analysis;
 pub mod handlers;
 
+#[cfg(test)]
+mod test_support;
+
 #[cfg(feature = "server")]
 pub mod acceptance;
 #[cfg(feature = "server")]

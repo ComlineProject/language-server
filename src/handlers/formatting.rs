@@ -42,31 +42,19 @@ fn basic_format(source: &str) -> String {
 
         // A full-line comment is text: a `{` or `}` in one (a code example in a
         // `///` or `//!` doc) doesn't change the nesting.
-        if trimmed.starts_with("//") {
-            for _ in 0..indent_level {
-                result.push_str(INDENT);
-            }
-            result.push_str(trimmed);
-            result.push('\n');
-            continue;
-        }
+        let code = !trimmed.starts_with("//");
 
         // Decrease indent before closing brace
-        if trimmed.starts_with('}') {
+        if code && trimmed.starts_with('}') {
             indent_level = indent_level.saturating_sub(1);
         }
 
-        // Add indentation
-        for _ in 0..indent_level {
-            result.push_str(INDENT);
-        }
-
-        // Add the line
+        result.push_str(&INDENT.repeat(indent_level as usize));
         result.push_str(trimmed);
         result.push('\n');
 
         // Increase indent after opening brace
-        if trimmed.ends_with('{') {
+        if code && trimmed.ends_with('{') {
             indent_level += 1;
         }
     }

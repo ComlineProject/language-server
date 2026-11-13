@@ -90,6 +90,13 @@ pub fn is_manifest(uri: &Url) -> bool {
     uri.path().ends_with(".idp")
 }
 
+/// The package's own `config.idp` among `files`, not a dependency's.
+pub fn own_manifest<S: ProjectSource>(files: &[S]) -> Option<&S> {
+    files
+        .iter()
+        .find(|file| is_manifest(file.uri()) && file.dependency().is_none())
+}
+
 /// A dependency declared in the package's `config.idp`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclaredDependency {
@@ -109,7 +116,7 @@ pub enum DependencyKind {
 /// own parser, so the editor and `comline check` agree on what's declared.
 /// Empty when the manifest doesn't parse (mid-edit) or declares none.
 pub fn declared_dependencies(manifest: &str) -> Vec<DeclaredDependency> {
-    let Some(congregation) = parser::parse_idp(manifest).ok().and_then(|r| r.document) else {
+    let Some(congregation) = parser::parse_congregation(manifest) else {
         return vec![];
     };
     let Ok(dependencies) = DependencyConfig::parse_dependencies(&congregation.assignments) else {
@@ -141,38 +148,26 @@ pub struct DeclaredLanguage {
     pub version: String,
 }
 
-/// Every language `config.idp`'s text declares, read with core's own
-/// interpreter, as `comline generation` reads them. Empty when the manifest
-/// doesn't parse (mid-edit) or doesn't interpret.
 /// The edition `config.idp` names (core#102), as core reads it: the newest
 /// when the manifest names none it knows or doesn't parse - `config.idp`'s
 /// own diagnostics say what's wrong with it.
 pub fn declared_edition(manifest: &str) -> comline_core::edition::Edition {
     use comline_core::package::config::ir::context::ProjectContext;
-    parser::parse_idp(manifest)
-        .ok()
-        .and_then(|r| r.document)
+    parser::parse_congregation(manifest)
         .map(|congregation| ProjectContext::with_config(congregation).edition())
         .unwrap_or(comline_core::edition::Edition::LATEST)
 }
 
+/// Every language `config.idp`'s text declares, read with core's own
+/// interpreter, as `comline generation` reads them. Empty when the manifest
+/// doesn't parse (mid-edit) or doesn't interpret.
 pub fn declared_languages(manifest: &str) -> Vec<DeclaredLanguage> {
-    use comline_core::package::config::idl::grammar::Key;
-    use comline_core::package::config::ir::context::ProjectContext;
     use comline_core::package::config::ir::frozen::FrozenUnit;
-    use comline_core::package::config::ir::interpreter::interpret::interpret_context;
 
-    let Some(mut congregation) = parser::parse_idp(manifest).ok().and_then(|r| r.document) else {
-        return vec![];
-    };
     // `settings` has nothing to do with the languages, and a cross-package
     // reference there can't be interpreted on its own (see
-    // `declared_settings`), so it's left out.
-    congregation
-        .assignments
-        .retain(|a| !matches!(&a.value.key, Key::Identifier(id) if id.value == "settings"));
-    without_encodings(&mut congregation);
-    let Ok(units) = interpret_context(&ProjectContext::with_config(congregation), None) else {
+    // `declared_settings`); `declared_config` leaves it out.
+    let Some(units) = declared_config(manifest) else {
         return vec![];
     };
     units
@@ -192,6 +187,18 @@ pub fn declared_languages(manifest: &str) -> Vec<DeclaredLanguage> {
         .collect()
 }
 
+/// The settings every package has underneath its own, whether or not a
+/// manifest is in view: Comline's built-in defaults.
+///
+/// The editor used to fall back to an *empty* dict when it could not see a
+/// manifest, which made it disagree with every build. `@framing` is the
+/// visible case - it is forbidden by the built-in default, so hover
+/// called it "allowed by default" and completion offered it without
+/// comment, and accepting that suggestion produced a hard build error.
+pub fn base_settings() -> comline_core::settings::SettingsDict {
+    comline_core::settings::defaults::built_in()
+}
+
 /// The package-level `settings` dict `config.idp`'s text declares - read
 /// with core's own interpreter, so the editor and `comline build` agree
 /// on what's forbidden. Empty when the manifest doesn't parse (mid-edit),
@@ -206,18 +213,6 @@ pub fn declared_languages(manifest: &str) -> Vec<DeclaredLanguage> {
 /// (by design - see its own doc comment), so this has to recognize and
 /// skip a reference up front rather than let that panic happen. See
 /// [`resolve_cross_package_settings`] for resolving one for real.
-/// The settings every package has underneath its own, whether or not a
-/// manifest is in view: Comline's built-in defaults.
-///
-/// The editor used to fall back to an *empty* dict when it could not see a
-/// manifest, which made it disagree with every build. `@framing` is the
-/// visible case - it is forbidden by the built-in default, so hover
-/// called it "allowed by default" and completion offered it without
-/// comment, and accepting that suggestion produced a hard build error.
-pub fn base_settings() -> comline_core::settings::SettingsDict {
-    comline_core::settings::defaults::built_in()
-}
-
 pub fn declared_settings(manifest: &str) -> comline_core::settings::SettingsDict {
     use comline_core::package::config::idl::grammar::{Key, Value};
     use comline_core::package::config::ir::context::ProjectContext;
@@ -230,7 +225,7 @@ pub fn declared_settings(manifest: &str) -> comline_core::settings::SettingsDict
     // floor every package has underneath its own. Falling back to empty
     // made the editor claim `@framing` was allowed by default in exactly
     // the situations where it could not tell.
-    let Some(mut congregation) = parser::parse_idp(manifest).ok().and_then(|r| r.document) else {
+    let Some(mut congregation) = parser::parse_congregation(manifest) else {
         return base_settings();
     };
     without_encodings(&mut congregation);
@@ -266,7 +261,7 @@ pub fn manifest_error(manifest: &str, path: Option<&std::path::Path>) -> Option<
     use comline_core::package::config::ir::context::{Origin, ProjectContext};
     use comline_core::package::config::ir::interpreter::interpret::interpret_context;
 
-    let mut congregation = parser::parse_idp(manifest).ok().and_then(|r| r.document)?;
+    let mut congregation = parser::parse_congregation(manifest)?;
     let context = match path {
         // On disk, `encodings` is checked as a build checks it: each
         // profile read from beside the manifest.
@@ -293,9 +288,7 @@ pub fn manifest_error_span(manifest: &str, message: &str) -> (usize, usize) {
     if !message.contains(about) {
         return (0, 0);
     }
-    parser::parse_idp(manifest)
-        .ok()
-        .and_then(|r| r.document)
+    parser::parse_congregation(manifest)
         .and_then(|congregation| {
             congregation
                 .assignments
@@ -333,7 +326,7 @@ pub fn frozen_config(manifest: &str, path: Option<&std::path::Path>) -> FrozenCo
     use comline_core::package::config::ir::context::{Origin, ProjectContext};
     use comline_core::package::config::ir::interpreter::interpret::interpret_context;
 
-    let Some(mut congregation) = parser::parse_idp(manifest).ok().and_then(|r| r.document) else {
+    let Some(mut congregation) = parser::parse_congregation(manifest) else {
         return FrozenConfig {
             units: None,
             complete: false,
@@ -423,7 +416,7 @@ pub fn declared_encoding_details(manifest: &str) -> Vec<DeclaredEncoding> {
     use comline_core::encodings::{EncodingKind, EncodingMapping};
     use comline_core::package::config::idl::grammar::Value;
 
-    let Some(congregation) = parser::parse_idp(manifest).ok().and_then(|r| r.document) else {
+    let Some(congregation) = parser::parse_congregation(manifest) else {
         return vec![];
     };
     let text = |value: &Value| match value {
@@ -531,6 +524,26 @@ pub fn declared_wire(manifest: &str) -> DeclaredWire {
     }
 }
 
+/// An encoding as declared, before its profile is read: name, kind and
+/// map, and nothing the profile states.
+pub fn bare_encoding(
+    name: String,
+    kind: comline_core::encodings::EncodingKind,
+    map: comline_core::encodings::EncodingMap,
+) -> comline_core::package::config::ir::frozen::FrozenUnit {
+    comline_core::package::config::ir::frozen::FrozenUnit::Encoding {
+        name,
+        kind,
+        profile_hash: String::new(),
+        map,
+        establishes: Vec::new(),
+        has_vectors: false,
+        grammar: None,
+        calls: None,
+        directions: None,
+    }
+}
+
 /// `config.idp`'s text frozen as core freezes it, but for `settings` and
 /// `encodings`, which need what the editor may not have (a dependency's
 /// schemas, the profile files). What core's
@@ -543,7 +556,7 @@ pub fn declared_config(
     use comline_core::package::config::ir::context::ProjectContext;
     use comline_core::package::config::ir::interpreter::interpret::interpret_context;
 
-    let mut congregation = parser::parse_idp(manifest).ok().and_then(|r| r.document)?;
+    let mut congregation = parser::parse_congregation(manifest)?;
     congregation
         .assignments
         .retain(|a| !matches!(&a.value.key, Key::Identifier(id) if id.value == "settings"));
@@ -568,7 +581,7 @@ pub fn declared_encoding_units(
 
     let frozen_one = |name: &str| -> Option<ConfigUnit> {
         let path = path?;
-        let mut congregation = parser::parse_idp(manifest).ok().and_then(|r| r.document)?;
+        let mut congregation = parser::parse_congregation(manifest)?;
         let mut encodings = congregation
             .assignments
             .iter()
@@ -589,17 +602,7 @@ pub fn declared_encoding_units(
     declared_encoding_details(manifest)
         .into_iter()
         .map(|e| {
-            frozen_one(&e.name).unwrap_or(ConfigUnit::Encoding {
-                name: e.name,
-                kind: e.kind,
-                profile_hash: String::new(),
-                map: e.map,
-                establishes: Vec::new(),
-                has_vectors: false,
-                grammar: None,
-                calls: None,
-                directions: None,
-            })
+            frozen_one(&e.name).unwrap_or_else(|| bare_encoding(e.name, e.kind, e.map))
         })
         .collect()
 }
@@ -623,7 +626,7 @@ pub fn resolve_cross_package_settings<S: ProjectSource>(
 ) -> Option<Result<comline_core::settings::SettingsDict, String>> {
     use comline_core::package::config::idl::grammar::{Key, Value};
 
-    let congregation = parser::parse_idp(manifest).ok().and_then(|r| r.document)?;
+    let congregation = parser::parse_congregation(manifest)?;
     let assignment = congregation.assignments.iter().find_map(|a| {
         let a = &a.value;
         matches!(&a.key, Key::Identifier(id) if id.value == "settings").then_some(a)
@@ -674,7 +677,7 @@ fn resolve_named_settings_block<S: ProjectSource>(
         if file.dependency() != Some(dep_name) || !file.uri().path().ends_with(".ids") {
             continue;
         }
-        let Some(document) = parser::parse(file.text()).ok().and_then(|r| r.document) else {
+        let Some(document) = parser::parse_document(file.text()) else {
             continue;
         };
         let units = IncrementalInterpreter::from_declarations(document.0);

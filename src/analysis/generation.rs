@@ -16,14 +16,15 @@ use std::sync::OnceLock;
 use comline_codegen::features::{self, Feature, Options, State, Support};
 use comline_codegen::versions::LangVersion;
 use comline_codegen::{Registry, Resolved, Unresolved};
-use comline_core::diagnostics::{Diagnostic as CoreDiagnostic, DiagnosticCode, Severity};
+use comline_core::diagnostics::{Diagnostic as CoreDiagnostic, DiagnosticCode};
 use comline_core::schema::ir::compiler::settings::severity::resolve_diagnostic_overrides;
 use comline_core::schema::ir::frozen::unit::FrozenUnit;
 use comline_core::settings::{SettingsDict, SettingsSpans};
-use lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString};
+use lsp_types::{Diagnostic, DiagnosticSeverity};
 
 use crate::analysis::source::DeclaredLanguage;
-use crate::util::byte_range_to_lsp_range;
+use crate::analysis::diagnostics::lsp_severity;
+use crate::util::{byte_range_to_lsp_range, comline_diagnostic};
 
 /// A use of a feature the declared language's generator refuses.
 pub const UNSUPPORTED_FEATURE: &str = "generation::unsupported-feature";
@@ -101,17 +102,12 @@ pub fn feature_diagnostics(
                 ),
                 State::Supported | State::Partial => continue,
             };
-            diagnostics.push(Diagnostic {
-                range: byte_range_to_lsp_range(source, span.0, span.1),
-                severity: Some(severity),
-                code: Some(NumberOrString::String(code.to_string())),
-                code_description: None,
-                source: Some("comline".to_string()),
+            diagnostics.push(comline_diagnostic(
+                byte_range_to_lsp_range(source, span.0, span.1),
+                severity,
+                Some(code),
                 message,
-                related_information: None,
-                tags: None,
-                data: None,
-            });
+            ));
         }
     }
     diagnostics
@@ -152,14 +148,12 @@ pub fn declaration_diagnostics(
         let target = format!("{}#{}", declared.language, declared.version);
         let range = entry_range(manifest, &target);
         let mut push = |severity, code: &str, message: String| {
-            diagnostics.push(Diagnostic {
-                range: byte_range_to_lsp_range(manifest, range.0, range.1),
-                severity: Some(severity),
-                code: Some(NumberOrString::String(code.to_string())),
-                source: Some("comline".to_string()),
+            diagnostics.push(comline_diagnostic(
+                byte_range_to_lsp_range(manifest, range.0, range.1),
+                severity,
+                Some(code),
                 message,
-                ..Default::default()
-            })
+            ))
         };
         let resolved = match resolve(&declared.language, &declared.version) {
             Ok(resolved) => resolved,
@@ -211,12 +205,7 @@ pub fn declaration_diagnostics(
             );
             let severity = match (fatal.first(), warnings.first()) {
                 (Some(_), _) => Some(DiagnosticSeverity::ERROR),
-                (None, Some(w)) => Some(match w.effective_severity() {
-                    Severity::Error => DiagnosticSeverity::ERROR,
-                    Severity::Warning => DiagnosticSeverity::WARNING,
-                    Severity::Info => DiagnosticSeverity::INFORMATION,
-                    Severity::Hint => DiagnosticSeverity::HINT,
-                }),
+                (None, Some(w)) => Some(lsp_severity(w.effective_severity())),
                 (None, None) => None,
             };
             if let Some(severity) = severity {

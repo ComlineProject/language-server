@@ -9,11 +9,14 @@ use crate::analysis::project::Project;
 use crate::analysis::source::{self, ProjectSource};
 use crate::analysis::symbols;
 use crate::handlers::annotation_hover::AnnotationHover;
+use crate::handlers::{code, hover, recognized_keys};
 use crate::parser;
-use crate::util::{byte_range_to_lsp_range, in_comment_or_string, position_to_offset};
+use crate::util::{byte_range_to_lsp_range, in_comment_or_string, position_to_offset, word_range_at};
+
 use comline_core::schema::idl::annotations;
 use comline_core::schema::idl::grammar::{
-    Declaration, Document, Expression, Field, Settings, Type,
+    ArraySize, Declaration, Document, Expression, Field, Setting, Settings, SizeValue, Struct,
+    TypeAlias, Type,
 };
 use comline_core::schema::idl::module_docs::summary;
 use comline_core::schema::idl::size::{self, Range, SizeLookup, SizeTarget, Sizes};
@@ -26,6 +29,7 @@ use comline_core::settings::effective::{
     effective_declaration_settings, effective_schema_settings, schema_settings,
 };
 use lsp_types::{Hover, HoverContents, MarkedString, Position, Url};
+
 
 /// Get hover information at a position, considering only this file.
 pub fn get_hover_info(source: &str, uri: &Url, position: Position) -> Option<Hover> {
@@ -69,32 +73,13 @@ pub fn get_hover_info_with_project<S: ProjectSource>(
         return Some(hover);
     }
 
-    // Parse the document
-    let parse_result = parser::parse(source).ok()?;
-    let document = parse_result.document?;
-
-    // Build symbol table
-    let symbol_table = symbols::build_symbol_table(&document, uri, source);
-
-    // Find what's at this position
-    let word = get_word_at_offset(source, offset)?;
-
-    // An annotation key (`@timeout_ms`) — checked first since `@`
-    // immediately before the word is an unambiguous signal, independent of
-    // whether the same text happens to also name a symbol or a field
-    // elsewhere (a field literally named `timeout_ms` is a real,
-    // if confusing, possibility).
-    if is_annotation_key(source, offset) {
-        return Some(match annotations::lookup(&word) {
-            Some(info) => create_annotation_hover(info),
-            None => create_unknown_annotation_hover(&word),
-        });
-    }
+    let document = parser::parse_document(source)?;
 
     // Cursor is literally inside a `settings { ... }` block's own text
     // (named or unnamed) — checked directly by span, not through the
     // symbol table (which only tracks *named* settings blocks, since an
     // unnamed one has no name to be a symbol under — see `symbols.rs`).
+    // Ahead of the word and `@` annotation lookups.
     // This only needs `other_files` directly (for the manifest's package-
     // level settings), not any parsed sibling `Document`.
     if let Some(settings) = settings_block_at(&document, offset) {
@@ -104,6 +89,22 @@ pub fn get_hover_info_with_project<S: ProjectSource>(
             &document,
             other_files,
         ));
+    }
+
+    // Find what's at this position
+    let (word_start, word_end) = word_range_at(source, offset)?;
+    let word = &source[word_start..word_end];
+
+    // An annotation key (`@timeout_ms`) — checked first since `@`
+    // immediately before the word is an unambiguous signal, independent of
+    // whether the same text happens to also name a symbol or a field
+    // elsewhere (a field literally named `timeout_ms` is a real,
+    // if confusing, possibility).
+    if source[..word_start].ends_with('@') {
+        return Some(match annotations::lookup(word) {
+            Some(info) => create_annotation_hover(info),
+            None => create_unknown_annotation_hover(word),
+        });
     }
 
     // Parse every sibling file once, up front, and keep them all alive for
@@ -118,7 +119,7 @@ pub fn get_hover_info_with_project<S: ProjectSource>(
         .iter()
         .filter(|file| !source::is_manifest(file.uri()))
         .filter_map(|file| {
-            let document = parser::parse(file.text()).ok()?.document?;
+            let document = parser::parse_document(file.text())?;
             let namespace = file
                 .namespace()
                 .map(<[String]>::to_vec)
@@ -159,6 +160,8 @@ pub fn get_hover_info_with_project<S: ProjectSource>(
         formats: size_formats(&package_format(other_files)),
     };
 
+    let symbol_table = symbols::build_symbol_table(&document, uri, source);
+
     // A symbol in this file. The cursor sitting on a declaration's own
     // name resolves by position; anything else is a reference, resolved in
     // whatever namespace its position allows.
@@ -168,7 +171,7 @@ pub fn get_hover_info_with_project<S: ProjectSource>(
     // kept - so hovering the struct showed the settings block.
     let own = symbol_table
         .at_offset(offset)
-        .or_else(|| symbol_table.get_in(&word, symbols::namespace_at(source, offset)));
+        .or_else(|| symbol_table.get_in(word, symbols::namespace_at(source, offset)));
     if let Some(symbol) = own {
         return Some(create_symbol_hover(symbol, &document, &lookup));
     }
@@ -183,7 +186,7 @@ pub fn get_hover_info_with_project<S: ProjectSource>(
         })
         .collect();
 
-    if let Some(resolved) = imports::resolve_symbol(&word, &own_imports, &siblings) {
+    if let Some(resolved) = imports::resolve_symbol(word, &own_imports, &siblings) {
         let sibling = resolved.file;
         if let Some((_, _, other_document)) =
             other_docs.iter().find(|(u, _, _)| **u == *sibling.uri)
@@ -204,12 +207,12 @@ pub fn get_hover_info_with_project<S: ProjectSource>(
     }
 
     // Check if it's a type reference
-    if let Some(type_info) = find_type_at_position(&document, &word) {
-        return Some(create_type_hover(&word, type_info));
+    if let Some(type_info) = find_type_at_position(&document, word) {
+        return Some(create_type_hover(word, type_info));
     }
 
     // Check if it's a field reference
-    if let Some(field_info) = find_field_info(&document, &word, offset, &lookup) {
+    if let Some(field_info) = find_field_info(&document, word, offset, &lookup) {
         return Some(create_field_hover(&field_info));
     }
 
@@ -239,8 +242,33 @@ type Origin = Vec<String>;
 /// and carries the formats those sizes are shown in.
 struct HoverSizeLookup<'a> {
     local: &'a Document,
-    others: &'a [(&'a Url, &'a str, Document)],
+    others: &'a [Sibling<'a>],
     formats: Vec<SizeFormat>,
+}
+
+impl HoverSizeLookup<'_> {
+    /// The documents a name is searched in, in order: local, then `others`.
+    fn documents(&self) -> impl Iterator<Item = &Document> {
+        std::iter::once(self.local).chain(self.others.iter().map(|(_, _, doc)| doc))
+    }
+
+    /// Follow a type through any `type` alias chain it starts as, to the
+    /// final non-alias type - same search order as `resolve`, for the same
+    /// reason (a chain can cross files). A small depth cap guards against a
+    /// cyclic alias that somehow reached hover without going through
+    /// `core`'s own cycle check.
+    fn resolve_alias_chain(&self, ty: &Type) -> Type {
+        let mut current = ty.clone();
+        for _ in 0..16 {
+            let Type::Named(id) = &current else { break };
+            let name = id.to_string();
+            match self.documents().find_map(|doc| type_alias_named(doc, &name)) {
+                Some(t) => current = t.target_type().clone(),
+                None => break,
+            }
+        }
+        current
+    }
 }
 
 /// A format the hover shows sizes in, with its size rules.
@@ -275,66 +303,32 @@ fn size_formats(own: &str) -> Vec<SizeFormat> {
 
 /// The `wire.format` the package's `config.idp` states, else core's default.
 fn package_format<S: ProjectSource>(other_files: &[S]) -> String {
-    other_files
-        .iter()
-        .find(|file| source::is_manifest(file.uri()) && file.dependency().is_none())
+    source::own_manifest(other_files)
         .map(|manifest| source::declared_wire(manifest.text()).format)
-        .unwrap_or_else(|| comline_core::schema::idl::annotations::DEFAULT_FORMAT.to_string())
+        .unwrap_or_else(|| annotations::DEFAULT_FORMAT.to_string())
 }
 
-impl<'a> SizeLookup for HoverSizeLookup<'a> {
+impl SizeLookup for HoverSizeLookup<'_> {
     fn resolve(&self, bare_name: &str) -> Option<SizeTarget<'_>> {
-        if let Some(s) = find_struct_declaration(self.local, bare_name) {
-            return Some(SizeTarget::Struct(s));
-        }
-        if let Some(e) = find_enum_declaration(self.local, bare_name) {
-            return Some(SizeTarget::Enum(e));
-        }
-        if let Some(t) = find_type_alias_declaration(self.local, bare_name) {
-            return Some(SizeTarget::Alias(t.target_type()));
-        }
-        for (_, _, doc) in self.others {
-            if let Some(s) = find_struct_declaration(doc, bare_name) {
-                return Some(SizeTarget::Struct(s));
-            }
-            if let Some(e) = find_enum_declaration(doc, bare_name) {
-                return Some(SizeTarget::Enum(e));
-            }
-            if let Some(t) = find_type_alias_declaration(doc, bare_name) {
-                return Some(SizeTarget::Alias(t.target_type()));
-            }
-        }
-        None
+        self.documents().find_map(|doc| {
+            doc.0.iter().find_map(|decl| match &**decl {
+                Declaration::Struct(s) if s.name() == bare_name => Some(SizeTarget::Struct(s)),
+                Declaration::Enum(e) if e.name() == bare_name => Some(SizeTarget::Enum(e)),
+                Declaration::TypeAlias(t) if t.name() == bare_name => {
+                    Some(SizeTarget::Alias(t.target_type()))
+                }
+                _ => None,
+            })
+        })
     }
 }
 
-/// Follow a type through any `type` alias chain it starts as, to the final
-/// non-alias type - same local-then-others search order as
-/// `HoverSizeLookup::resolve`, for the same reason (a chain can cross
-/// files). A small depth cap guards against a cyclic alias that somehow
-/// reached hover without going through `core`'s own cycle check.
-fn fully_resolve_alias_chain(
-    ty: &Type,
-    local: &Document,
-    others: &[(&Url, &str, Document)],
-) -> Type {
-    let mut current = ty.clone();
-    for _ in 0..16 {
-        let Type::Named(id) = &current else { break };
-        let name = id.to_string();
-        let next = find_type_alias_declaration(local, &name)
-            .or_else(|| {
-                others
-                    .iter()
-                    .find_map(|(_, _, doc)| find_type_alias_declaration(doc, &name))
-            })
-            .map(|t| t.target_type().clone());
-        match next {
-            Some(t) => current = t,
-            None => break,
-        }
-    }
-    current
+/// The `type` alias `doc` declares under `name`.
+fn type_alias_named<'a>(doc: &'a Document, name: &str) -> Option<&'a TypeAlias> {
+    doc.0.iter().find_map(|decl| match &**decl {
+        Declaration::TypeAlias(t) if t.name() == name => Some(t),
+        _ => None,
+    })
 }
 
 /// No constant has a value here: a size that names one has none.
@@ -381,14 +375,6 @@ fn render_size_block(ranges: &[(&str, Range)]) -> Option<String> {
     (!ranges.is_empty()).then(|| format!("**Wire size**\n\n{}", render_format_ranges(ranges)))
 }
 
-/// A field's own range in each format. `optional` is the field's, so it
-/// counts for the absent value too.
-fn field_size(f: &Field, lookup: &HoverSizeLookup) -> Vec<(&'static str, Range)> {
-    ranges_by_format(lookup, |rules| {
-        size::range_of_field(f, rules, lookup, &no_constants)
-    })
-}
-
 /// A struct's size block: its total in each format, then a per-field
 /// breakdown in the first (the package's own), one field per line,
 /// prefixed with its wire index - the position `comline-rust`'s positional
@@ -396,27 +382,22 @@ fn field_size(f: &Field, lookup: &HoverSizeLookup) -> Vec<(&'static str, Range)>
 /// append-only field discipline (see Versioning rules) protects.
 /// `- #0 name: 8 B` / `- #1 name: 1 B–unbounded`; a field with no size
 /// in that format is listed without one.
-fn render_struct_size_block(
-    s: &comline_core::schema::idl::grammar::Struct,
-    lookup: &HoverSizeLookup,
-) -> Option<String> {
+fn render_struct_size_block(s: &Struct, lookup: &HoverSizeLookup) -> Option<String> {
     let totals = ranges_by_format(lookup, |rules| {
         size::range_of_struct(s, rules, lookup, &no_constants)
     });
+
     let fields = render_field_sizes(s, lookup);
-    match (render_size_block(&totals), fields.is_empty()) {
-        (Some(total), true) => Some(total),
-        (Some(total), false) => Some(format!("{total}\n\n{fields}")),
-        (None, false) => Some(fields),
-        (None, true) => None,
-    }
+    let parts: Vec<String> = render_size_block(&totals)
+        .into_iter()
+        .chain((!fields.is_empty()).then_some(fields))
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
-fn render_field_sizes(
-    s: &comline_core::schema::idl::grammar::Struct,
-    lookup: &HoverSizeLookup,
-) -> String {
+fn render_field_sizes(s: &Struct, lookup: &HoverSizeLookup) -> String {
     let own = lookup.formats.first();
+
     s.fields()
         .iter()
         .enumerate()
@@ -466,11 +447,13 @@ fn module_contents(module: &Module) -> Vec<MarkedString> {
         "comline".to_string(),
         format!("{kind} {}", module.namespace.join("::")),
     )];
+
     if let Some(docs) = &module.docs {
         contents.push(MarkedString::from_markdown(docs.clone()));
     }
 
     let mut lists = Vec::new();
+
     if !module.modules.is_empty() {
         let entries: Vec<(String, Option<&str>)> = module
             .modules
@@ -479,6 +462,7 @@ fn module_contents(module: &Module) -> Vec<MarkedString> {
             .collect();
         lists.push(entries_list("Modules", &entries));
     }
+
     if !module.declarations.is_empty() {
         let entries: Vec<(String, Option<&str>)> = module
             .declarations
@@ -492,9 +476,11 @@ fn module_contents(module: &Module) -> Vec<MarkedString> {
             .collect();
         lists.push(entries_list("Declares", &entries));
     }
+
     if !lists.is_empty() {
         contents.push(MarkedString::from_markdown(lists.join("\n\n")));
     }
+
     contents
 }
 
@@ -502,252 +488,186 @@ fn module_contents(module: &Module) -> Vec<MarkedString> {
 /// its docs. Long lists are cut.
 fn entries_list(heading: &str, entries: &[(String, Option<&str>)]) -> String {
     let mut lines = vec![format!("**{heading}**"), String::new()];
+
     for (label, docs) in entries.iter().take(LISTED) {
         match docs.map(summary).filter(|s| !s.is_empty()) {
             Some(summary) => lines.push(format!("- {label} — {summary}")),
             None => lines.push(format!("- {label}")),
         }
     }
+
     if entries.len() > LISTED {
         lines.push(format!("- …and {} more", entries.len() - LISTED));
     }
+
     lines.join("\n")
 }
 
-/// Create hover for a symbol (struct, enum, protocol, const)
+/// Create hover for a symbol (struct, enum, protocol, const, ...), from its
+/// declaration in `document` - found by span, so a `struct Test` beside a
+/// `settings Test` can't answer for the other.
 fn create_symbol_hover(
     symbol: &symbols::Symbol,
     document: &Document,
     lookup: &HoverSizeLookup,
 ) -> Hover {
-    use lsp_types::SymbolKind;
+    let name = &symbol.name;
+    let declaration = document.0.iter().find(|d| d.span == symbol.decl_span);
 
-    let mut contents = vec![];
-
-    // Add symbol signature, its doc-comment when present, and (struct/enum
-    // only — where "total size" is meaningful) a wire-size estimate block.
-    let (signature, doc, size_block) = match symbol.kind {
-        SymbolKind::STRUCT => {
-            // Find the struct to get its fields
-            if let Some(s) = find_struct_declaration(document, &symbol.name) {
-                let fields: Vec<String> = s
-                    .fields()
-                    .iter()
-                    .map(|f| {
-                        let opt = if f.optional() { "optional " } else { "" };
-                        format!("  {}{}: {}", opt, f.name(), format_type(f.field_type()))
-                    })
-                    .collect();
-
-                (
-                    format!("struct {} {{\n{}\n}}", symbol.name, fields.join("\n")),
-                    s.docstring(),
-                    render_struct_size_block(s, lookup),
-                )
-            } else {
-                (format!("struct {}", symbol.name), None, None)
-            }
-        }
-        SymbolKind::ENUM => {
-            if let Some(e) = find_enum_declaration(document, &symbol.name) {
-                let variants: Vec<String> = e
-                    .variants()
+    // Its signature, its doc-comment when present, (struct/enum/const only -
+    // where "total size" is meaningful) a wire-size estimate block, and what
+    // its children are called.
+    let (signature, doc, size_block, children) = match declaration.map(|d| &**d) {
+        Some(Declaration::Struct(s)) => (
+            block(&format!("struct {name}"), field_lines(s.fields())),
+            s.docstring(),
+            render_struct_size_block(s, lookup),
+            "fields",
+        ),
+        Some(Declaration::Enum(e)) => (
+            block(
+                &format!("enum {name}"),
+                e.variants()
                     .iter()
                     .map(|v| format!("  {}", v.identifier().text))
-                    .collect();
-
-                let size_block =
-                    render_size_block(&ranges_by_format(lookup, |rules| size::range_of_enum(e, rules)));
-
-                (
-                    format!("enum {} {{\n{}\n}}", symbol.name, variants.join("\n")),
-                    e.docstring(),
-                    size_block,
-                )
-            } else {
-                (format!("enum {}", symbol.name), None, None)
-            }
+                    .collect(),
+            ),
+            e.docstring(),
+            render_size_block(&ranges_by_format(lookup, |rules| size::range_of_enum(e, rules))),
+            "variants",
+        ),
+        Some(Declaration::Protocol(p)) => {
+            let functions = p
+                .functions()
+                .iter()
+                .map(|f| {
+                    let args = f
+                        .args()
+                        .as_ref()
+                        .map(|args| {
+                            std::iter::once(args.first().arg_type())
+                                .chain(args.rest().iter().map(|ca| ca.arg_type().arg_type()))
+                                .map(format_type)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .unwrap_or_default();
+                    let ret = f
+                        .return_type()
+                        .as_ref()
+                        .map(|rt| format!(" -> {}", format_type(rt.return_type())))
+                        .unwrap_or_default();
+                    format!("  function {}({args}){ret}", f.name())
+                })
+                .collect();
+            (block(&format!("protocol {name}"), functions), p.docstring(), None, "functions")
         }
-        SymbolKind::INTERFACE => {
-            if let Some(p) = find_protocol_declaration(document, &symbol.name) {
-                let functions: Vec<String> = p
-                    .functions()
-                    .iter()
-                    .map(|f| {
-                        let args = if let Some(args_list) = f.args() {
-                            let mut arg_types = vec![format_type(args_list.first().arg_type())];
-                            arg_types.extend(
-                                args_list
-                                    .rest()
-                                    .iter()
-                                    .map(|ca| format_type(ca.arg_type().arg_type())),
-                            );
-                            arg_types.join(", ")
-                        } else {
-                            String::new()
-                        };
-
-                        let ret = if let Some(rt) = f.return_type() {
-                            format!(" -> {}", format_type(rt.return_type()))
-                        } else {
-                            String::new()
-                        };
-
-                        format!("  function {}({}){}", f.name(), args, ret)
-                    })
-                    .collect();
-
-                (
-                    format!("protocol {} {{\n{}\n}}", symbol.name, functions.join("\n")),
-                    p.docstring(),
-                    None,
-                )
-            } else {
-                (format!("protocol {}", symbol.name), None, None)
-            }
-        }
-        SymbolKind::CONSTANT => {
-            if let Some(c) = find_const_declaration(document, &symbol.name) {
-                let size_display = render_size_block(&ranges_by_format(lookup, |rules| {
-                    size::range_of_type(&c.type_def, rules, lookup, &no_constants)
-                }));
-
-                (
-                    format!("const {}: {}", c.name(), format_type(c.type_def())),
-                    c.docstring(),
-                    size_display,
-                )
-            } else {
-                (format!("const {}", symbol.name), None, None)
-            }
-        }
-        SymbolKind::TYPE_PARAMETER => {
-            if let Some(t) = find_type_alias_declaration(document, &symbol.name) {
-                let target = t.target_type();
-                let target_text = format_type(target);
-                // Its annotations above it, as written - an alias's
-                // `@validators` run wherever it's used, so they belong in
-                // what it is.
-                let annotations: String = t
-                    .annotations()
+        Some(Declaration::Const(c)) => (
+            format!("const {}: {}", c.name(), format_type(c.type_def())),
+            c.docstring(),
+            render_size_block(&ranges_by_format(lookup, |rules| {
+                size::range_of_type(&c.type_def, rules, lookup, &no_constants)
+            })),
+            "",
+        ),
+        Some(Declaration::TypeAlias(t)) => (
+            // Its annotations above it, as written - an alias's
+            // `@validators` run wherever it's used, so they belong in
+            // what it is.
+            format!(
+                "{}type {name} = {}",
+                t.annotations()
                     .iter()
                     .map(|a| match a.value() {
                         Some(value) => format!("@{} = {value}\n", a.key()),
                         None => format!("@{}\n", a.key()),
                     })
-                    .collect();
-                let signature = format!("{annotations}type {} = {}", symbol.name, target_text);
-                let resolved_text = format_type(&fully_resolve_alias_chain(
-                    target,
-                    lookup.local,
-                    lookup.others,
-                ));
-
-                // Only call out the fully-resolved type when it differs from
-                // the one-level target written in the source - matching
-                // Rust-IDE hover-reveals-the-aliased-type behavior, without
-                // a redundant second line for the common `type X =
-                // <primitive>` case.
-                let doc = if resolved_text != target_text {
-                    let resolves_to = format!("*resolves to* `{}`", resolved_text);
-                    Some(match t.docstring() {
-                        Some(d) => format!("{}\n\n{}", d, resolves_to),
-                        None => resolves_to,
-                    })
-                } else {
-                    t.docstring()
-                };
-                
-                (signature, doc, None)
-            } else {
-                (format!("type {}", symbol.name), None, None)
-            }
+                    .collect::<String>(),
+                format_type(t.target_type()),
+            ),
+            alias_doc(t, lookup),
+            None,
+            "",
+        ),
+        Some(Declaration::Error(e)) => (
+            block(&format!("error {name}"), field_lines(e.fields())),
+            e.docstring(),
+            None,
+            "fields",
+        ),
+        Some(Declaration::Validator(v)) => {
+            let params: Vec<String> = v
+                .properties()
+                .iter()
+                .map(|p| format!("{}: {}", p.name(), format_type(p.property_type())))
+                .collect();
+            (
+                format!("validator {name}({})", params.join(", ")),
+                v.docstring(),
+                None,
+                "parameters",
+            )
         }
-        SymbolKind::EVENT => {
-            if let Some(e) = find_error_declaration(document, &symbol.name) {
-                let fields: Vec<String> = e
-                    .fields()
-                    .iter()
-                    .map(|f| {
-                        let opt = if f.optional() { "optional " } else { "" };
-                        format!("  {}{}: {}", opt, f.name(), format_type(f.field_type()))
-                    })
-                    .collect();
-                (
-                    format!("error {} {{\n{}\n}}", symbol.name, fields.join("\n")),
-                    e.docstring(),
-                    None,
-                )
-            } else {
-                (format!("error {}", symbol.name), None, None)
-            }
-        }
-        SymbolKind::FUNCTION => {
-            if let Some(v) = find_validator_declaration(document, &symbol.name) {
-                let params: Vec<String> = v
-                    .properties()
-                    .iter()
-                    .map(|p| format!("{}: {}", p.name(), format_type(p.property_type())))
-                    .collect();
-                (
-                    format!("validator {}({})", symbol.name, params.join(", ")),
-                    v.docstring(),
-                    None,
-                )
-            } else {
-                (format!("validator {}", symbol.name), None, None)
-            }
-        }
-        SymbolKind::OBJECT => {
-            if let Some(s) = find_settings_declaration(document, &symbol.name) {
-                let entries: Vec<String> = s
-                    .entries()
-                    .iter()
-                    .map(|e| format!("  {} = {}", e.key(), e.value_string()))
-                    .collect();
-                (
-                    format!("settings {} {{\n{}\n}}", symbol.name, entries.join("\n")),
-                    s.docstring(),
-                    None,
-                )
-            } else {
-                (format!("settings {}", symbol.name), None, None)
-            }
-        }
-        _ => (symbol.name.clone(), None, None),
+        Some(Declaration::Settings(s)) => (settings_signature(s), s.docstring(), None, "settings"),
+        _ => (name.clone(), None, None, ""),
     };
 
-    contents.push(MarkedString::from_language_code(
-        "comline".to_string(),
-        signature,
-    ));
-    if let Some(doc) = doc {
-        contents.push(MarkedString::from_markdown(doc));
+    let mut contents = vec![code(signature)];
+    contents.extend(doc.into_iter().chain(size_block).map(MarkedString::from_markdown));
+    if !symbol.children.is_empty() && !children.is_empty() {
+        contents.push(MarkedString::from_markdown(format!(
+            "*{} {children}*",
+            symbol.children.len()
+        )));
     }
-    if let Some(size_block) = size_block {
-        contents.push(MarkedString::from_markdown(size_block));
-    }
+    hover(contents)
+}
 
-    // Add detail
-    if !symbol.children.is_empty() {
-        let detail = match symbol.kind {
-            SymbolKind::STRUCT => format!("{} fields", symbol.children.len()),
-            SymbolKind::ENUM => format!("{} variants", symbol.children.len()),
-            SymbolKind::INTERFACE => format!("{} functions", symbol.children.len()),
-            SymbolKind::EVENT => format!("{} fields", symbol.children.len()),
-            SymbolKind::FUNCTION => format!("{} parameters", symbol.children.len()),
-            SymbolKind::OBJECT => format!("{} settings", symbol.children.len()),
-            _ => String::new(),
-        };
-        if !detail.is_empty() {
-            contents.push(MarkedString::from_markdown(format!("*{}*", detail)));
-        }
+/// A type alias's doc-comment, then the type it fully resolves to - only
+/// called out when that differs from the one-level target written in the
+/// source, matching Rust-IDE hover-reveals-the-aliased-type behavior,
+/// without a redundant second line for the common `type X = <primitive>`
+/// case.
+fn alias_doc(t: &TypeAlias, lookup: &HoverSizeLookup) -> Option<String> {
+    let resolved = format_type(&lookup.resolve_alias_chain(t.target_type()));
+    if resolved == format_type(t.target_type()) {
+        return t.docstring();
     }
+    let resolves_to = format!("*resolves to* `{resolved}`");
+    Some(match t.docstring() {
+        Some(d) => format!("{d}\n\n{resolves_to}"),
+        None => resolves_to,
+    })
+}
 
-    Hover {
-        contents: HoverContents::Array(contents),
-        range: None,
-    }
+/// `head {`, one line per entry, `}`.
+fn block(head: &str, lines: Vec<String>) -> String {
+    format!("{head} {{\n{}\n}}", lines.join("\n"))
+}
+
+/// A struct's or error's fields, one `  optional name: type` line each.
+fn field_lines(fields: &[rust_sitter::Spanned<Field>]) -> Vec<String> {
+    fields
+        .iter()
+        .map(|f| {
+            let opt = if f.optional() { "optional " } else { "" };
+            format!("  {opt}{}: {}", f.name(), format_type(f.field_type()))
+        })
+        .collect()
+}
+
+/// A settings block as written, named or not.
+fn settings_signature(settings: &Settings) -> String {
+    let head = match settings.name() {
+        Some(name) => format!("settings {name}"),
+        None => "settings".to_string(),
+    };
+    let entries = settings
+        .entries()
+        .iter()
+        .map(|e| format!("  {} = {}", e.key(), e.value_string()))
+        .collect();
+    block(&head, entries)
 }
 
 /// Find the `settings { ... }` (or `settings Name { ... }`) declaration
@@ -787,52 +707,22 @@ fn create_settings_hover<S: ProjectSource>(
 }
 
 /// Block-level: the same raw signature/entries rendering the symbol-table
-/// path already built for named blocks (`SymbolKind::OBJECT`,
-/// `find_settings_declaration`) — now also reachable for unnamed ones —
-/// plus a "what's recognized here" catalog listing.
+/// path uses for named blocks ([`settings_signature`]) — also reachable for
+/// unnamed ones here — plus a "what's recognized here" catalog listing.
 fn create_settings_block_hover(settings: &Settings) -> Hover {
-    let entries: Vec<String> = settings
-        .entries()
-        .iter()
-        .map(|e| format!("  {} = {}", e.key(), e.value_string()))
-        .collect();
-    let label = settings.name().unwrap_or_default();
-    let signature = format!(
-        "settings {}{{\n{}\n}}",
-        if label.is_empty() {
-            String::new()
-        } else {
-            format!("{label} ")
-        },
-        entries.join("\n")
-    );
-
-    let mut contents = vec![MarkedString::from_language_code(
-        "comline".to_string(),
-        signature,
-    )];
+    let mut contents = vec![code(settings_signature(settings))];
     if let Some(doc) = settings.docstring() {
         contents.push(MarkedString::from_markdown(doc));
     }
 
-    let catalog_lines: Vec<String> = catalog::block_summary()
-        .iter()
-        .map(|f| format!("- `{}` - {}", f.key_pattern, f.summary))
-        .collect();
-    contents.push(MarkedString::from_markdown(format!(
-        "**recognized keys**\n{}",
-        catalog_lines.join("\n")
-    )));
+    contents.push(recognized_keys());
 
     contents.push(MarkedString::from_markdown(format!(
         "*{} settings*",
         settings.entries().len()
     )));
 
-    Hover {
-        contents: HoverContents::Array(contents),
-        range: None,
-    }
+    hover(contents)
 }
 
 /// Entry-level: the raw as-written `key = value` (unchanged content), a
@@ -841,15 +731,12 @@ fn create_settings_block_hover(settings: &Settings) -> Hover {
 /// value after package+schema(+preset) layering — not just the raw one.
 fn create_settings_entry_hover<S: ProjectSource>(
     settings: &Settings,
-    entry: &rust_sitter::Spanned<comline_core::schema::idl::grammar::Setting>,
+    entry: &rust_sitter::Spanned<Setting>,
     document: &Document,
     other_files: &[S],
 ) -> Hover {
     let key = entry.key();
-    let mut contents = vec![MarkedString::from_language_code(
-        "comline".to_string(),
-        format!("{} = {}", key, entry.value_string()),
-    )];
+    let mut contents = vec![code(format!("{} = {}", key, entry.value_string()))];
 
     let key_path = entry.key_path();
     let segments: Vec<&str> = key_path.iter().map(String::as_str).collect();
@@ -859,9 +746,7 @@ fn create_settings_entry_hover<S: ProjectSource>(
         ));
     }
 
-    let package_settings = other_files
-        .iter()
-        .find(|f| f.dependency().is_none() && source::is_manifest(f.uri()))
+    let package_settings = source::own_manifest(other_files)
         .map(
             |f| match source::resolve_cross_package_settings(f.text(), other_files) {
                 Some(Ok(dict)) => dict,
@@ -890,37 +775,15 @@ fn create_settings_entry_hover<S: ProjectSource>(
     };
     contents.push(MarkedString::from_markdown(effective_line));
 
-    Hover {
-        contents: HoverContents::Array(contents),
-        range: None,
-    }
+    hover(contents)
 }
 
 /// Create hover for a type reference
 fn create_type_hover(type_name: &str, type_kind: &str) -> Hover {
-    let contents = vec![
-        MarkedString::from_language_code("comline".to_string(), type_name.to_string()),
-        MarkedString::from_markdown(format!("*{}*", type_kind)),
-    ];
-
-    Hover {
-        contents: HoverContents::Array(contents),
-        range: None,
-    }
-}
-
-/// Whether the word at `offset` is immediately preceded by `@` — i.e. this
-/// is an annotation key (`@timeout_ms`), not a coincidental identifier
-/// that happens to share its text with one (a field literally named
-/// `timeout_ms`, say). Same start-boundary scan as
-/// [`get_word_at_offset`], so it agrees with it on where the word begins.
-fn is_annotation_key(source: &str, offset: usize) -> bool {
-    let offset = offset.min(source.len());
-    let start = source[..offset]
-        .rfind(|c: char| !c.is_alphanumeric() && c != '_')
-        .map(|i| i + 1)
-        .unwrap_or(0);
-    start > 0 && source.as_bytes().get(start - 1) == Some(&b'@')
+    hover(vec![
+        code(type_name.to_string()),
+        MarkedString::from_markdown(format!("*{type_kind}*")),
+    ])
 }
 
 /// Hover for a known `@key` — its own name, description, default when
@@ -946,17 +809,14 @@ fn create_annotation_hover(info: &annotations::AnnotationInfo) -> Hover {
 /// `@key=value` is an open namespace — an unrecognised key is still
 /// perfectly valid, just not one this server knows the meaning of (yet).
 fn create_unknown_annotation_hover(key: &str) -> Hover {
-    Hover {
-        contents: HoverContents::Array(vec![
-            MarkedString::from_language_code("comline".to_string(), format!("@{key}")),
-            MarkedString::from_markdown(
-                "Not a recognised annotation — still parses and freezes fine (`@key=value` is \
-                 an open namespace), but nothing this server knows about reads it."
-                    .to_string(),
-            ),
-        ]),
-        range: None,
-    }
+    hover(vec![
+        code(format!("@{key}")),
+        MarkedString::from_markdown(
+            "Not a recognised annotation — still parses and freezes fine (`@key=value` is \
+             an open namespace), but nothing this server knows about reads it."
+                .to_string(),
+        ),
+    ])
 }
 
 /// Everything a field's own hover shows, resolved at the hovered offset.
@@ -985,11 +845,7 @@ fn create_field_hover(info: &FieldHoverInfo) -> Hover {
         .as_ref()
         .map(|d| format!(" = {d}"))
         .unwrap_or_default();
-    let signature = format!("{opt}{}: {}{default}", info.name, info.type_text);
-    contents.push(MarkedString::from_language_code(
-        "comline".to_string(),
-        signature,
-    ));
+    contents.push(code(format!("{opt}{}: {}{default}", info.name, info.type_text)));
 
     if let Some(doc) = &info.docstring {
         contents.push(MarkedString::from_markdown(doc.clone()));
@@ -1014,16 +870,12 @@ fn create_field_hover(info: &FieldHoverInfo) -> Hover {
     }
     contents.push(MarkedString::from_markdown(detail.join("\n\n")));
 
-    Hover {
-        contents: HoverContents::Array(contents),
-        range: None,
-    }
+    hover(contents)
 }
 
 /// A size as written: `N` (exactly N) or `max N` (at most N, a bound),
 /// N being an integer or a constant's name.
-fn format_size(size: &comline_core::schema::idl::grammar::ArraySize) -> String {
-    use comline_core::schema::idl::grammar::{ArraySize, SizeValue};
+fn format_size(size: &ArraySize) -> String {
     let value = |v: &SizeValue| match v {
         SizeValue::Integer(i) => i.value().to_string(),
         SizeValue::Constant(c) => c.text.clone(),
@@ -1063,31 +915,8 @@ fn format_type(ty: &Type) -> String {
     }
 }
 
-/// Get word at byte offset
-fn get_word_at_offset(source: &str, offset: usize) -> Option<String> {
-    if offset >= source.len() {
-        return None;
-    }
-
-    // Find word boundaries
-    let start = source[..offset]
-        .rfind(|c: char| !c.is_alphanumeric() && c != '_')
-        .map(|i| i + 1)
-        .unwrap_or(0);
-
-    let end = source[offset..]
-        .find(|c: char| !c.is_alphanumeric() && c != '_')
-        .map(|i| offset + i)
-        .unwrap_or(source.len());
-
-    Some(source[start..end].to_string())
-}
-
 /// Find type at position
-fn find_type_at_position(
-    document: &comline_core::schema::idl::grammar::Document,
-    word: &str,
-) -> Option<&'static str> {
+fn find_type_at_position(document: &Document, word: &str) -> Option<&'static str> {
     // Check if it's a primitive type — delegates to `vocabulary` so this
     // can't list a name the grammar doesn't actually have (it used to
     // hand-roll this match, independently of the one in `completion.rs`
@@ -1124,17 +953,11 @@ fn find_field_info(
     offset: usize,
     lookup: &HoverSizeLookup,
 ) -> Option<FieldHoverInfo> {
-    for decl in &document.0 {
-        let found = match &**decl {
-            Declaration::Struct(s) => field_info_in(s.name(), s.fields(), word, offset, lookup),
-            Declaration::Error(e) => field_info_in(e.name(), e.fields(), word, offset, lookup),
-            _ => None,
-        };
-        if found.is_some() {
-            return found;
-        }
-    }
-    None
+    document.0.iter().find_map(|decl| match &**decl {
+        Declaration::Struct(s) => field_info_in(s.name(), s.fields(), word, offset, lookup),
+        Declaration::Error(e) => field_info_in(e.name(), e.fields(), word, offset, lookup),
+        _ => None,
+    })
 }
 
 /// Shared by `Struct` and `Error` — both carry a flat `Vec<Spanned<Field>>`
@@ -1169,7 +992,10 @@ fn field_info_in(
                     None => format!("@{}", a.key()),
                 })
                 .collect(),
-            size: field_size(spanned, lookup),
+            // `optional` is the field's, so it counts for the absent value too.
+            size: ranges_by_format(lookup, |rules| {
+                size::range_of_field(spanned, rules, lookup, &no_constants)
+            }),
         })
     })
 }
@@ -1185,117 +1011,4 @@ fn format_expression(e: &Expression) -> String {
         Expression::Path(p) => p.text.clone(),
         Expression::Identifier(i) => i.text.clone(),
     }
-}
-
-// Helper functions to find declarations
-fn find_struct_declaration<'a>(
-    document: &'a comline_core::schema::idl::grammar::Document,
-    name: &str,
-) -> Option<&'a comline_core::schema::idl::grammar::Struct> {
-    for decl in &document.0 {
-        if let Declaration::Struct(s) = &**decl {
-            if s.name() == name {
-                return Some(s);
-            }
-        }
-    }
-    None
-}
-
-fn find_enum_declaration<'a>(
-    document: &'a comline_core::schema::idl::grammar::Document,
-    name: &str,
-) -> Option<&'a comline_core::schema::idl::grammar::Enum> {
-    for decl in &document.0 {
-        if let Declaration::Enum(e) = &**decl {
-            if e.name() == name {
-                return Some(e);
-            }
-        }
-    }
-    None
-}
-
-fn find_protocol_declaration<'a>(
-    document: &'a comline_core::schema::idl::grammar::Document,
-    name: &str,
-) -> Option<&'a comline_core::schema::idl::grammar::Protocol> {
-    for decl in &document.0 {
-        if let Declaration::Protocol(p) = &**decl {
-            if p.name() == name {
-                return Some(p);
-            }
-        }
-    }
-    None
-}
-
-fn find_const_declaration<'a>(
-    document: &'a comline_core::schema::idl::grammar::Document,
-    name: &str,
-) -> Option<&'a comline_core::schema::idl::grammar::Const> {
-    for decl in &document.0 {
-        if let Declaration::Const(c) = &**decl {
-            if c.name() == name {
-                return Some(c);
-            }
-        }
-    }
-    None
-}
-
-fn find_type_alias_declaration<'a>(
-    document: &'a comline_core::schema::idl::grammar::Document,
-    name: &str,
-) -> Option<&'a comline_core::schema::idl::grammar::TypeAlias> {
-    for decl in &document.0 {
-        if let Declaration::TypeAlias(t) = &**decl {
-            if t.name() == name {
-                return Some(t);
-            }
-        }
-    }
-    None
-}
-
-fn find_error_declaration<'a>(
-    document: &'a comline_core::schema::idl::grammar::Document,
-    name: &str,
-) -> Option<&'a comline_core::schema::idl::grammar::Error> {
-    for decl in &document.0 {
-        if let Declaration::Error(e) = &**decl {
-            if e.name() == name {
-                return Some(e);
-            }
-        }
-    }
-    None
-}
-
-fn find_validator_declaration<'a>(
-    document: &'a comline_core::schema::idl::grammar::Document,
-    name: &str,
-) -> Option<&'a comline_core::schema::idl::grammar::Validator> {
-    for decl in &document.0 {
-        if let Declaration::Validator(v) = &**decl {
-            if v.name() == name {
-                return Some(v);
-            }
-        }
-    }
-    None
-}
-
-fn find_settings_declaration<'a>(
-    document: &'a comline_core::schema::idl::grammar::Document,
-    name: &str,
-) -> Option<&'a comline_core::schema::idl::grammar::Settings> {
-    for decl in &document.0 {
-        if let Declaration::Settings(s) = &**decl {
-            if s.name().as_deref() == Some(name) {
-                return Some(s);
-            }
-        }
-    }
-    None
 }

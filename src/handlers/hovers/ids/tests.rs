@@ -1,4 +1,5 @@
 use super::*;
+    use crate::test_support::{hover_at, hover_text, test_uri};
     use crate::util::offset_to_position;
 
     #[test]
@@ -9,11 +10,8 @@ struct User {
     age: i32
 }
 "#;
-        let uri = Url::parse("file:///test.ids").unwrap();
         // Hover over "User" on line 1
-        let position = Position::new(1, 8);
-
-        let hover = get_hover_info(source, &uri, position);
+        let hover = hover_at(source, 1, 8);
         assert!(hover.is_some());
 
         let hover = hover.unwrap();
@@ -25,11 +23,8 @@ struct User {
     #[test]
     fn test_hover_shows_fixed_struct_size() {
         let source = "struct Point {\n    x: u32\n    y: u32\n}\n";
-        let uri = Url::parse("file:///test.ids").unwrap();
         // Hover over "Point" on line 0.
-        let position = Position::new(0, 8);
-
-        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let hover = hover_at(source, 0, 8).expect("hover should resolve");
         let text = hover_text(hover);
         // The package's own format first, then the other official ones.
         assert!(text.contains("packed@1: 8 B"), "got: {text}");
@@ -44,11 +39,8 @@ struct User {
     #[test]
     fn test_hover_shows_variable_size_for_a_string_field() {
         let source = "struct Note {\n    body: string\n}\n";
-        let uri = Url::parse("file:///test.ids").unwrap();
         // Hover over "Note" on line 0.
-        let position = Position::new(0, 7);
-
-        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let hover = hover_at(source, 0, 7).expect("hover should resolve");
         let text = hover_text(hover);
         assert!(text.contains("packed@1: 1 B\u{2013}unbounded"), "got: {text}");
     }
@@ -56,11 +48,8 @@ struct User {
     #[test]
     fn test_hover_shows_variable_size_for_an_optional_field() {
         let source = "struct Thing {\n    optional id: u64\n}\n";
-        let uri = Url::parse("file:///test.ids").unwrap();
         // Hover over "Thing" on line 0.
-        let position = Position::new(0, 8);
-
-        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let hover = hover_at(source, 0, 8).expect("hover should resolve");
         let text = hover_text(hover);
         // Absent (a tag byte), or the tag and the `u64`.
         assert!(text.contains("packed@1: 1\u{2013}9 B"), "got: {text}");
@@ -70,11 +59,8 @@ struct User {
     fn test_struct_hover_shows_field_indices() {
         let source =
             "struct Greeting {\n    message: string\n    language: string\n    test: bool\n}\n";
-        let uri = Url::parse("file:///test.ids").unwrap();
         // Hover over "Greeting" on line 0.
-        let position = Position::new(0, 8);
-
-        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let hover = hover_at(source, 0, 8).expect("hover should resolve");
         let text = hover_text(hover);
         assert!(text.contains("#0 message"), "got: {text}");
         assert!(text.contains("#1 language"), "got: {text}");
@@ -85,7 +71,7 @@ struct User {
     fn a_bounded_field_shows_its_maximum_as_written() {
         let source =
             "struct Order {\n    sku: char[8]\n    note: char[max 280]\n    tags: u32[max 10]\n}\n";
-        let uri = Url::parse("file:///test.ids").unwrap();
+        let uri = test_uri();
         for (line, written) in [
             (1, "sku: char[8]"),
             (2, "note: char[max 280]"),
@@ -102,11 +88,8 @@ struct User {
     fn test_hover_on_a_field_name_shows_its_own_info() {
         let source =
             "struct Greeting {\n    message: string\n    language: string\n    test: bool\n}\n";
-        let uri = Url::parse("file:///test.ids").unwrap();
         // Hover over "language" (the field name) on line 2.
-        let position = Position::new(2, 6);
-
-        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let hover = hover_at(source, 2, 6).expect("hover should resolve");
         let text = hover_text(hover);
         assert!(text.contains("language: string"), "got: {text}");
         assert!(text.contains("#1"), "got: {text}");
@@ -121,11 +104,8 @@ struct User {
     fn a_one_byte_field_says_1_byte_not_1_bytes() {
         let source =
             "struct Greeting {\n    message: string\n    language: string\n    test: bool\n}\n";
-        let uri = Url::parse("file:///test.ids").unwrap();
         // Hover over "test" (the `bool` field, 1 byte wide) on line 3.
-        let position = Position::new(3, 6);
-
-        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let hover = hover_at(source, 3, 6).expect("hover should resolve");
         let text = hover_text(hover);
         assert!(text.contains("packed@1: 1 B"), "got: {text}");
     }
@@ -133,11 +113,8 @@ struct User {
     #[test]
     fn a_one_byte_struct_says_1_byte_not_1_bytes() {
         let source = "struct Flag {\n    on: bool\n}\n";
-        let uri = Url::parse("file:///test.ids").unwrap();
         // Hover over "Flag" on line 0.
-        let position = Position::new(0, 8);
-
-        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let hover = hover_at(source, 0, 8).expect("hover should resolve");
         let text = hover_text(hover);
         assert!(text.contains("packed@1: 1 B"), "got: {text}");
     }
@@ -145,11 +122,8 @@ struct User {
     #[test]
     fn hover_on_timeout_ms_annotation_shows_its_description() {
         let source = "protocol Thing {\n    @timeout_ms = 100\n    function foo();\n}\n";
-        let uri = Url::parse("file:///test.ids").unwrap();
         // Hover over "timeout_ms" on line 1.
-        let position = Position::new(1, 7);
-
-        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let hover = hover_at(source, 1, 7).expect("hover should resolve");
         let text = hover_text(hover);
         assert!(text.contains("@timeout_ms"), "got: {text}");
         assert!(text.contains("waits"), "got: {text}");
@@ -160,10 +134,7 @@ struct User {
     #[test]
     fn hover_on_framing_annotation_shows_its_default() {
         let source = "@framing = \"jsonrpc\"\nprotocol Thing {\n}\n";
-        let uri = Url::parse("file:///test.ids").unwrap();
-        let position = Position::new(0, 3);
-
-        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let hover = hover_at(source, 0, 3).expect("hover should resolve");
         let text = hover_text(hover);
         assert!(text.contains("@framing"), "got: {text}");
         assert!(text.contains("datagram@2"), "got: {text}");
@@ -172,10 +143,7 @@ struct User {
     #[test]
     fn hover_on_validators_annotation_shows_its_description() {
         let source = "struct X {\n    @validators = [Foo()]\n    name: string\n}\n";
-        let uri = Url::parse("file:///test.ids").unwrap();
-        let position = Position::new(1, 7);
-
-        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let hover = hover_at(source, 1, 7).expect("hover should resolve");
         let text = hover_text(hover);
         assert!(text.contains("@validators"), "got: {text}");
         assert!(text.contains("validator"), "got: {text}");
@@ -184,10 +152,7 @@ struct User {
     #[test]
     fn hover_on_idempotent_annotation_says_not_consumed_yet() {
         let source = "protocol P {\n    @idempotent\n    function f();\n}\n";
-        let uri = Url::parse("file:///test.ids").unwrap();
-        let position = Position::new(1, 8);
-
-        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let hover = hover_at(source, 1, 8).expect("hover should resolve");
         let text = hover_text(hover);
         assert!(text.contains("@idempotent"), "got: {text}");
         assert!(text.contains("not consumed anywhere yet"), "got: {text}");
@@ -196,10 +161,7 @@ struct User {
     #[test]
     fn hover_on_an_unrecognised_annotation_still_shows_something() {
         let source = "protocol P {\n    @custom_key = 1\n    function f();\n}\n";
-        let uri = Url::parse("file:///test.ids").unwrap();
-        let position = Position::new(1, 8);
-
-        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let hover = hover_at(source, 1, 8).expect("hover should resolve");
         let text = hover_text(hover);
         assert!(text.contains("@custom_key"), "got: {text}");
         assert!(text.contains("open namespace"), "got: {text}");
@@ -211,7 +173,7 @@ struct User {
         // annotation - must not come back as "not a recognised annotation"
         // (or any hover at all).
         let source = "//@settings = Test\nstruct Greeting {\n    test: bool\n}\n";
-        let uri = Url::parse("file:///test.ids").unwrap();
+        let uri = test_uri();
         let position = Position::new(0, 4);
 
         assert!(get_hover_info(source, &uri, position).is_none());
@@ -226,7 +188,7 @@ struct User {
         // or interfere with the real `Greeting` declaration below it.
         let source =
             "/*\nerror Test {\n    message = \"\"\n}\n*/\nstruct Greeting {\n    name: string\n}\n";
-        let uri = Url::parse("file:///test.ids").unwrap();
+        let uri = test_uri();
         let position = Position::new(5, 10); // "Greeting"
 
         let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
@@ -237,13 +199,10 @@ struct User {
     #[test]
     fn hover_on_a_field_named_like_an_annotation_key_gets_field_hover_not_annotation_hover() {
         // No `@` prefix — "timeout_ms" here is an ordinary field name, not
-        // the annotation. Disambiguated by `is_annotation_key`'s preceding-
-        // `@` check, not by the word's text.
+        // the annotation. Disambiguated by the preceding-`@` check, not by
+        // the word's text.
         let source = "struct X {\n    timeout_ms: u32\n}\n";
-        let uri = Url::parse("file:///test.ids").unwrap();
-        let position = Position::new(1, 6);
-
-        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let hover = hover_at(source, 1, 6).expect("hover should resolve");
         let text = hover_text(hover);
         assert!(text.contains("timeout_ms: u32"), "got: {text}");
         assert!(!text.contains("waits indefinitely"), "got: {text}");
@@ -252,11 +211,8 @@ struct User {
     #[test]
     fn test_hover_on_an_optional_field_shows_optional_and_default() {
         let source = "struct Thing {\n    optional id: u64 = 0\n}\n";
-        let uri = Url::parse("file:///test.ids").unwrap();
         // Hover over "id" (the field name) on line 1.
-        let position = Position::new(1, 14);
-
-        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let hover = hover_at(source, 1, 14).expect("hover should resolve");
         let text = hover_text(hover);
         assert!(text.contains("optional id: u64 = 0"), "got: {text}");
         assert!(text.contains("optional: yes"), "got: {text}");
@@ -268,11 +224,8 @@ struct User {
     #[test]
     fn test_hover_on_a_field_shows_its_annotations() {
         let source = "struct Message {\n    @timeout_ms=1000\n    body: string\n}\n";
-        let uri = Url::parse("file:///test.ids").unwrap();
         // Hover over "body" (the field name) on line 2.
-        let position = Position::new(2, 6);
-
-        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let hover = hover_at(source, 2, 6).expect("hover should resolve");
         let text = hover_text(hover);
         assert!(text.contains("@timeout_ms=1000"), "got: {text}");
     }
@@ -280,11 +233,8 @@ struct User {
     #[test]
     fn test_hover_on_a_field_in_an_error_shows_its_own_info() {
         let source = "error Rejected {\n    message = \"no\"\n    reason: string\n}\n";
-        let uri = Url::parse("file:///test.ids").unwrap();
         // Hover over "reason" (the field name) on line 2.
-        let position = Position::new(2, 6);
-
-        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let hover = hover_at(source, 2, 6).expect("hover should resolve");
         let text = hover_text(hover);
         assert!(text.contains("reason: string"), "got: {text}");
         assert!(text.contains("of `Rejected`"), "got: {text}");
@@ -298,10 +248,7 @@ enum Status {
     Inactive
 }
 "#;
-        let uri = Url::parse("file:///test.ids").unwrap();
-        let position = Position::new(1, 6);
-
-        let hover = get_hover_info(source, &uri, position);
+        let hover = hover_at(source, 1, 6);
         assert!(hover.is_some());
     }
 
@@ -312,11 +259,8 @@ struct User {
     name: string
 }
 "#;
-        let uri = Url::parse("file:///test.ids").unwrap();
         // Hover over "string" type
-        let position = Position::new(2, 11);
-
-        let hover = get_hover_info(source, &uri, position);
+        let hover = hover_at(source, 2, 11);
         assert!(hover.is_some());
     }
 
@@ -331,7 +275,7 @@ struct User {
         // The reported bug: hovering `struct Test` showed the tooltip for
         // `settings Test`, because the symbol table was keyed by name and
         // the settings block was declared last.
-        let uri = Url::parse("file:///test.ids").unwrap();
+        let uri = test_uri();
         let offset = SHARED_NAME.find("struct Test").unwrap() + "struct ".len();
         let position = offset_to_position(SHARED_NAME, offset);
 
@@ -346,7 +290,7 @@ struct User {
 
     #[test]
     fn hover_on_a_settings_preset_still_shows_the_settings_block() {
-        let uri = Url::parse("file:///test.ids").unwrap();
+        let uri = test_uri();
         let offset = SHARED_NAME.find("settings Test").unwrap() + "settings ".len();
         let position = offset_to_position(SHARED_NAME, offset);
 
@@ -360,7 +304,7 @@ struct User {
         let source = "struct Test {\n    a: string\n}\n\n\
                       settings Test {\n    validators.allowed = true\n}\n\n\
                       struct Holder {\n    t: Test\n}\n";
-        let uri = Url::parse("file:///test.ids").unwrap();
+        let uri = test_uri();
         let offset = source.find("t: Test").unwrap() + "t: ".len();
         let position = offset_to_position(source, offset);
 
@@ -368,22 +312,6 @@ struct User {
         let text = hover_text(hover);
         assert!(text.contains("struct"), "got: {text}");
         assert!(!text.contains("validators.allowed"), "got: {text}");
-    }
-
-    fn hover_text(hover: Hover) -> String {
-        match hover.contents {
-            HoverContents::Array(parts) => parts
-                .into_iter()
-                .map(|p| match p {
-                    MarkedString::String(s) => s,
-                    MarkedString::LanguageString(ls) => ls.value,
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-            HoverContents::Scalar(MarkedString::String(s)) => s,
-            HoverContents::Scalar(MarkedString::LanguageString(ls)) => ls.value,
-            HoverContents::Markup(m) => m.value,
-        }
     }
 
     #[test]
@@ -518,7 +446,7 @@ protocol Chat {
     /// An enum is sized in each format by itself; a `const` by its type.
     #[test]
     fn an_enum_and_a_constant_show_their_sizes() {
-        let uri = Url::parse("file:///test.ids").unwrap();
+        let uri = test_uri();
         let hover = |source: &str, line, character| {
             get_hover_info(source, &uri, Position::new(line, character))
                 .map(hover_text)
@@ -584,11 +512,8 @@ protocol Chat {
     #[test]
     fn test_hover_shows_docstring() {
         let source = "/// Hello\nstruct Message {\n    text: string\n}\n";
-        let uri = Url::parse("file:///test.ids").unwrap();
         // Hover over "Message" in the declaration itself.
-        let position = Position::new(1, 8);
-
-        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let hover = hover_at(source, 1, 8).expect("hover should resolve");
         let text = hover_text(hover);
         assert!(text.contains("Hello"), "got: {text}");
     }
@@ -596,11 +521,8 @@ protocol Chat {
     #[test]
     fn test_hover_on_signed_int_keyword() {
         let source = "struct Sample {\n    value: s16\n}\n";
-        let uri = Url::parse("file:///test.ids").unwrap();
         // Hover over "s16" on line 1.
-        let position = Position::new(1, 12);
-
-        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let hover = hover_at(source, 1, 12).expect("hover should resolve");
         let text = hover_text(hover);
         // Now the specific vocabulary description, not a generic category
         // — "16-bit signed integer" rather than "integer type".
@@ -610,11 +532,8 @@ protocol Chat {
     #[test]
     fn test_hover_on_type_alias_shows_signature() {
         let source = "type UserId = u64\n";
-        let uri = Url::parse("file:///test.ids").unwrap();
         // Hover over "UserId" in the declaration itself.
-        let position = Position::new(0, 7);
-
-        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let hover = hover_at(source, 0, 7).expect("hover should resolve");
         let text = hover_text(hover);
         assert!(
             text.contains("type UserId") && text.contains("u64"),
@@ -625,10 +544,7 @@ protocol Chat {
     #[test]
     fn hover_on_a_type_alias_shows_its_validators() {
         let source = "@validators = [Bounds(max = 8)]\ntype Handle = string\n";
-        let uri = Url::parse("file:///test.ids").unwrap();
-        let position = Position::new(1, 7);
-
-        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let hover = hover_at(source, 1, 7).expect("hover should resolve");
         let text = hover_text(hover);
         assert!(
             text.contains("@validators = [Bounds(max = 8)]\ntype Handle = string"),
@@ -639,12 +555,9 @@ protocol Chat {
     #[test]
     fn test_hover_on_type_alias_chain_shows_fully_resolved_type() {
         let source = "type A = B\ntype B = u32\nstruct X {\n    id: A\n}\n";
-        let uri = Url::parse("file:///test.ids").unwrap();
         // Hover over "A" in its own declaration ("type A = B", "A" at
         // column 5).
-        let position = Position::new(0, 5);
-
-        let hover = get_hover_info(source, &uri, position).expect("hover should resolve");
+        let hover = hover_at(source, 0, 5).expect("hover should resolve");
         let text = hover_text(hover);
         // The one-level signature names "B"; the fully-resolved chain
         // should also surface "u32" since it differs from the written
@@ -1022,7 +935,7 @@ protocol Chat {
     #[test]
     fn hover_on_a_validator_reference_shows_its_parameters() {
         let source = "validator StringBounds for string {\n    min: u32\n    max: u32\n}\n\nstruct S {\n    @validators = [StringBounds(min=3, max=10)]\n    name: string\n}\n";
-        let uri = Url::parse("file:///test.ids").unwrap();
+        let uri = test_uri();
         let offset = source.rfind("StringBounds").unwrap();
         let position = crate::util::offset_to_position(source, offset);
 
@@ -1038,7 +951,7 @@ protocol Chat {
     #[test]
     fn hover_on_an_error_reference_shows_its_fields() {
         let source = "error NotFound {\n    message = \"missing\"\n    id: u64\n}\n\nprotocol P {\n    function f() ! NotFound;\n}\n";
-        let uri = Url::parse("file:///test.ids").unwrap();
+        let uri = test_uri();
         let offset = source.rfind("NotFound").unwrap();
         let position = crate::util::offset_to_position(source, offset);
 
@@ -1052,7 +965,7 @@ protocol Chat {
     #[test]
     fn hover_on_a_settings_declaration_shows_its_entries() {
         let source = "settings AAA {\n    k = true\n}\n";
-        let uri = Url::parse("file:///test.ids").unwrap();
+        let uri = test_uri();
         let offset = source.find("AAA").unwrap();
         let position = crate::util::offset_to_position(source, offset);
 
@@ -1068,7 +981,7 @@ protocol Chat {
         // symbol under, so the old symbol-table-only path returned no
         // hover at all here.
         let source = "settings {\n    k = true\n}\n";
-        let uri = Url::parse("file:///test.ids").unwrap();
+        let uri = test_uri();
         let offset = source.find("settings").unwrap();
         let position = crate::util::offset_to_position(source, offset);
 
@@ -1081,7 +994,7 @@ protocol Chat {
     #[test]
     fn hover_on_a_settings_entry_shows_the_catalog_doc_and_its_raw_value() {
         let source = "settings {\n    validators.allowed = false\n}\n";
-        let uri = Url::parse("file:///test.ids").unwrap();
+        let uri = test_uri();
         let offset = source.find("allowed").unwrap();
         let position = crate::util::offset_to_position(source, offset);
 
@@ -1098,7 +1011,7 @@ protocol Chat {
         // recognizes still gets raw + effective, just no catalog doc —
         // the catalog section should be conditional, not always-on noise.
         let source = "settings {\n    timeout_ms = 500\n}\n";
-        let uri = Url::parse("file:///test.ids").unwrap();
+        let uri = test_uri();
         let offset = source.find("timeout_ms").unwrap();
         let position = crate::util::offset_to_position(source, offset);
 

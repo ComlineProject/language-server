@@ -15,18 +15,18 @@
 //! The fix is never marked preferred: accepting is a choice the consumer
 //! writes down, so it shouldn't be applied by a "fix all".
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 
-use crate::util::byte_range_to_lsp_range;
+use crate::util::{byte_range_to_lsp_range, comline_diagnostic, file_edit};
 
 use comline_core::package::config::dependency::DependencyConfig;
 use comline_core::schema::ir::frozen::unit::Guarantee;
 use comline_core::schema::ir::unverified;
 use lsp_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams, Diagnostic,
-    DiagnosticSeverity, NumberOrString, TextEdit, Url, WorkspaceEdit,
+    DiagnosticSeverity, NumberOrString, TextEdit, Url,
 };
 use serde_json::json;
 
@@ -111,13 +111,13 @@ pub fn diagnostics(
                 ),
             };
             Diagnostic {
-                range: byte_range_to_lsp_range(manifest, range.0, range.1),
-                severity: Some(DiagnosticSeverity::ERROR),
-                code: Some(NumberOrString::String(UNACCEPTED.to_string())),
-                source: Some("comline".to_string()),
-                message: format!("{what} — `comline check` refuses it until it's accepted"),
                 data: Some(json!({ "dependency": dependency.name, "protocol": u.protocol })),
-                ..Default::default()
+                ..comline_diagnostic(
+                    byte_range_to_lsp_range(manifest, range.0, range.1),
+                    DiagnosticSeverity::ERROR,
+                    Some(UNACCEPTED),
+                    format!("{what} — `comline check` refuses it until it's accepted"),
+                )
             }
         })
         .collect()
@@ -132,9 +132,7 @@ pub fn code_actions(
     manifest: &str,
     params: &CodeActionParams,
 ) -> Vec<CodeActionOrCommand> {
-    let Some(dependencies) = crate::parser::parse_idp(manifest)
-        .ok()
-        .and_then(|r| r.document)
+    let Some(dependencies) = crate::parser::parse_congregation(manifest)
         .and_then(|congregation| {
             DependencyConfig::parse_dependencies(&congregation.assignments).ok()
         })
@@ -197,14 +195,7 @@ fn action(
         title,
         kind: Some(CodeActionKind::QUICKFIX),
         diagnostics: Some(vec![diagnostic.clone()]),
-        edit: Some(WorkspaceEdit {
-            changes: Some(HashMap::from([(
-                uri.clone(),
-                vec![edit_between(manifest, &updated)],
-            )])),
-            document_changes: None,
-            change_annotations: None,
-        }),
+        edit: Some(file_edit(uri, vec![edit_between(manifest, &updated)])),
         is_preferred: Some(false),
         ..Default::default()
     }))
@@ -411,6 +402,7 @@ fn indent_of(text: &str, at: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::apply_edit;
     use lsp_types::Position;
 
     const HEAD: &str = "congregation app\nspecification_version = 1\n";
@@ -420,23 +412,6 @@ mod tests {
             "Billing".to_string(),
             vec![Guarantee::SchemaAgreement, Guarantee::EncodingAgreement],
         )])
-    }
-
-    fn apply(manifest: &str, edit: &TextEdit) -> String {
-        let offset = |p: Position| {
-            let line_start: usize = manifest
-                .split_inclusive('\n')
-                .take(p.line as usize)
-                .map(str::len)
-                .sum();
-            line_start + p.character as usize
-        };
-        format!(
-            "{}{}{}",
-            &manifest[..offset(edit.range.start)],
-            edit.new_text,
-            &manifest[offset(edit.range.end)..]
-        )
     }
 
     #[test]
@@ -451,7 +426,7 @@ mod tests {
             )
         );
         assert_eq!(
-            apply(&manifest, &edit_between(&manifest, &updated)),
+            apply_edit(&manifest, &edit_between(&manifest, &updated)),
             updated
         );
     }

@@ -24,13 +24,13 @@ use comline_core::schema::idl::annotations;
 use comline_core::schema::ir::compiler::interpreter::incremental::IncrementalInterpreter;
 use comline_core::schema::ir::compiler::Compile;
 use comline_core::schema::ir::package_wire::apply_package_wire;
-use lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Url};
+use lsp_types::{Diagnostic, DiagnosticSeverity, Url};
 use serde_json::{json, Value as Json};
 use toml_edit::{ImDocument, Item, TableLike, Value};
 
 use crate::analysis::generation;
 use crate::analysis::source::{self, DeclaredLanguage, ProjectSource};
-use crate::util::byte_range_to_lsp_range;
+use crate::util::{byte_range_to_lsp_range, comline_diagnostic};
 
 /// The text isn't TOML.
 pub const SYNTAX: &str = "comline-toml::syntax";
@@ -161,13 +161,7 @@ impl Context {
             {
                 continue;
             }
-            match crate::parser::parse(text).ok().and_then(|r| {
-                if r.errors.is_empty() {
-                    r.document
-                } else {
-                    None
-                }
-            }) {
+            match crate::parser::parse_document(text) {
                 Some(document) => {
                     let units = IncrementalInterpreter::from_declarations(document.0.clone());
                     schemas.push((
@@ -267,6 +261,19 @@ struct Problem {
     data: Option<Json>,
 }
 
+impl Problem {
+    /// An error with no fix data; anything else is set on top with `..`.
+    fn error(span: (usize, usize), code: &'static str, message: String) -> Self {
+        Problem {
+            span,
+            code,
+            severity: DiagnosticSeverity::ERROR,
+            message,
+            data: None,
+        }
+    }
+}
+
 impl Analysis {
     /// The entry whose key or value is at `offset`, innermost first.
     pub fn entry_at(&self, offset: usize) -> Option<&Entry> {
@@ -301,13 +308,7 @@ pub fn analyse(text: &str) -> Analysis {
         Ok(document) => document,
         Err(e) => {
             let span = e.span().map_or((0, 0), |r| (r.start, r.end.max(r.start)));
-            analysis.problems.push(Problem {
-                span,
-                code: SYNTAX,
-                severity: DiagnosticSeverity::ERROR,
-                message: e.message().trim().to_string(),
-                data: None,
-            });
+            analysis.problems.push(Problem::error(span, SYNTAX, e.message().trim().to_string()));
             return analysis;
         }
     };
@@ -528,11 +529,8 @@ impl Walk<'_, '_> {
         data: Option<Json>,
     ) {
         self.analysis.problems.push(Problem {
-            span,
-            code,
-            severity: DiagnosticSeverity::ERROR,
-            message,
             data,
+            ..Problem::error(span, code, message)
         });
     }
 
@@ -721,10 +719,7 @@ impl Walk<'_, '_> {
                 if let Some(allowed) = node.get("enum").and_then(Json::as_array) {
                     let allowed: Vec<&str> = allowed.iter().filter_map(Json::as_str).collect();
                     if !allowed.contains(&s) {
-                        let candidates: Vec<String> = closest(s, &allowed)
-                            .into_iter()
-                            .map(|c| format!("\"{c}\""))
-                            .collect();
+                        let candidates = quoted_closest(s, &allowed);
                         self.problem(
                             span,
                             BAD_VALUE,
@@ -789,6 +784,15 @@ fn header_span(text: &str, span: (usize, usize)) -> (usize, usize) {
     (start, end.min(span.1.max(start)).max(start))
 }
 
+/// [`closest`], each quoted as a TOML string - what a "replace with" fix
+/// writes.
+fn quoted_closest(written: &str, names: &[&str]) -> Vec<String> {
+    closest(written, names)
+        .into_iter()
+        .map(|c| format!("\"{c}\""))
+        .collect()
+}
+
 /// Up to three of `names` closest to `written` by edit distance, within a
 /// threshold that grows with the name's length; nearest first.
 pub fn closest(written: &str, names: &[&str]) -> Vec<String> {
@@ -847,13 +851,7 @@ pub fn diagnostics(text: &str, context: &Context) -> Vec<Diagnostic> {
         if shape_problems == 0 {
             if let Err(e) = ComlineToml::parse(text) {
                 let span = e.span().map_or((0, 0), range);
-                analysis.problems.push(Problem {
-                    span,
-                    code: INVALID,
-                    severity: DiagnosticSeverity::ERROR,
-                    message: e.message().trim().to_string(),
-                    data: None,
-                });
+                analysis.problems.push(Problem::error(span, INVALID, e.message().trim().to_string()));
             }
         }
     }
@@ -861,29 +859,19 @@ pub fn diagnostics(text: &str, context: &Context) -> Vec<Diagnostic> {
         .problems
         .into_iter()
         .map(|p| Diagnostic {
-            range: byte_range_to_lsp_range(text, p.span.0, p.span.1),
-            severity: Some(p.severity),
-            code: Some(NumberOrString::String(p.code.to_string())),
-            source: Some("comline".to_string()),
-            message: p.message,
             data: p.data,
-            ..Default::default()
+            ..comline_diagnostic(
+                byte_range_to_lsp_range(text, p.span.0, p.span.1),
+                p.severity,
+                Some(p.code),
+                p.message,
+            )
         })
         .collect()
 }
 
 fn semantic(analysis: &mut Analysis, context: &Context) {
     let mut problems = Vec::new();
-    let mut push = |span, code, severity, message: String, data: Option<Json>| {
-        problems.push(Problem {
-            span,
-            code,
-            severity,
-            message,
-            data,
-        });
-    };
-    let error = DiagnosticSeverity::ERROR;
     let declared_names: Vec<&str> = context
         .languages
         .iter()
@@ -891,29 +879,13 @@ fn semantic(analysis: &mut Analysis, context: &Context) {
         .collect();
     let check_declared = context.has_manifest && !context.languages.is_empty();
 
-    let undeclared = |language: &str,
-                      span: (usize, usize),
-                      message: String,
-                      push: &mut dyn FnMut(
-        (usize, usize),
-        &'static str,
-        DiagnosticSeverity,
-        String,
-        Option<Json>,
-    )| {
-        let candidates: Vec<String> = closest(language, &declared_names)
-            .into_iter()
-            .map(|c| format!("\"{c}\""))
-            .collect();
-        push(
-            span,
-            UNDECLARED_LANGUAGE,
-            error,
-            message,
-            Some(
-                json!({ "fix": FIX_DECLARE_LANGUAGE, "language": language, "candidates": candidates }),
-            ),
-        );
+    let undeclared = |language: &str, span: (usize, usize), message: String| Problem {
+        data: Some(json!({
+            "fix": FIX_DECLARE_LANGUAGE,
+            "language": language,
+            "candidates": quoted_closest(language, &declared_names),
+        })),
+        ..Problem::error(span, UNDECLARED_LANGUAGE, message)
     };
 
     // `[generate] only`.
@@ -924,12 +896,11 @@ fn semantic(analysis: &mut Analysis, context: &Context) {
     {
         let language = entry.text.as_deref().unwrap_or_default();
         if check_declared && context.declares(language).is_none() {
-            undeclared(
+            problems.push(undeclared(
                 language,
                 entry.key,
                 format!("`[generate] only` names `{language}`, which config.idp does not declare"),
-                &mut push,
-            );
+            ));
         }
     }
 
@@ -941,25 +912,22 @@ fn semantic(analysis: &mut Analysis, context: &Context) {
         let language_text = language.and_then(|e| e.text.clone()).unwrap_or_default();
 
         if language_text.is_empty() && generator.is_none() {
-            push(
+            problems.push(Problem::error(
                 block.header,
                 INVALID,
-                error,
                 "a `[[generate.target]]` sets no `language`".to_string(),
-                None,
-            );
+            ));
         }
         if let (Some(entry), true) = (language, !language_text.is_empty()) {
             if check_declared && context.declares(&language_text).is_none() {
-                undeclared(
+                problems.push(undeclared(
                     &language_text,
                     entry.value.unwrap_or(entry.key),
                     format!(
                         "`[[generate.target]]` names `{language_text}`, which config.idp does not declare - add \
                          `{language_text}#<version> = {{}}` to `code_generation.languages`, or drop the block"
                     ),
-                    &mut push,
-                );
+                ));
             }
         }
 
@@ -979,10 +947,9 @@ fn semantic(analysis: &mut Analysis, context: &Context) {
                     LangVersion::parse(&declared.version),
                 ) {
                     if r < d {
-                        push(
+                        problems.push(Problem::error(
                             at,
                             LANG_VERSION,
-                            error,
                             format!(
                                 "target `{language_text}` sets `lang_version = \"{raised}\"`, below config.idp's \
                                  `{language_text}#{}` - {} can raise a target's version, never lower it: the \
@@ -991,36 +958,29 @@ fn semantic(analysis: &mut Analysis, context: &Context) {
                                 config::FILE_NAME,
                                 declared.version
                             ),
-                            None,
-                        );
+                        ));
                     }
                 }
             }
             let version = raised.or_else(|| declared.map(|d| d.version.clone()));
             if let Some(version) = version {
                 if let Err(e) = generation::resolve(&language_text, &version) {
-                    push(at, LANG_VERSION, error, e.to_string(), None);
+                    problems.push(Problem::error(at, LANG_VERSION, e.to_string()));
                 }
             }
         }
 
         // `timeout` limits an external generator.
-        if let Some(timeout) = analysis
-            .entries
-            .iter()
-            .find(|e| e.target == Some(index) && e.path == ["generate", "target", "timeout"])
-        {
+        if let Some(timeout) = analysis.target_value(index, "timeout") {
             if generator.is_none() {
-                push(
+                problems.push(Problem::error(
                     timeout.key,
                     INVALID,
-                    error,
                     format!(
                         "target `{language_text}`: `timeout` limits an external `generator`, and this target uses the \
                          built-in one"
                     ),
-                    None,
-                );
+                ));
             }
         }
 
@@ -1038,13 +998,11 @@ fn semantic(analysis: &mut Analysis, context: &Context) {
                 )),
             };
             if let Some(message) = message {
-                push(
+                problems.push(Problem::error(
                     entry.value.unwrap_or(entry.key),
                     GENERATOR_PATH,
-                    error,
                     message,
-                    None,
-                );
+                ));
             }
         }
     }
@@ -1059,20 +1017,19 @@ fn semantic(analysis: &mut Analysis, context: &Context) {
     for entry in analysis.entries.iter().filter(|e| is_encoding_key(&e.path)) {
         let name = entry.path.last().map(String::as_str).unwrap_or_default();
         if context.encoding(name).is_none() {
-            let candidates: Vec<String> = closest(name, &known_refs)
-                .into_iter()
-                .map(|c| format!("\"{c}\""))
-                .collect();
-            push(
-                entry.key,
-                UNDECLARED_ENCODING,
-                DiagnosticSeverity::WARNING,
-                format!(
-                    "no package in view declares the encoding `{name}` - not this package's config.idp, its \
-                     dependencies', nor the official ones"
-                ),
-                Some(json!({ "fix": FIX_REPLACE, "candidates": candidates })),
-            );
+            let candidates = quoted_closest(name, &known_refs);
+            problems.push(Problem {
+                severity: DiagnosticSeverity::WARNING,
+                data: Some(json!({ "fix": FIX_REPLACE, "candidates": candidates })),
+                ..Problem::error(
+                    entry.key,
+                    UNDECLARED_ENCODING,
+                    format!(
+                        "no package in view declares the encoding `{name}` - not this package's config.idp, its \
+                         dependencies', nor the official ones"
+                    ),
+                )
+            });
         }
     }
 
@@ -1082,17 +1039,7 @@ fn semantic(analysis: &mut Analysis, context: &Context) {
         let declared_units: Vec<ConfigUnit> = context
             .encodings
             .iter()
-            .map(|e| ConfigUnit::Encoding {
-                name: e.name.clone(),
-                kind: e.kind,
-                profile_hash: String::new(),
-                map: e.map.clone(),
-                establishes: Vec::new(),
-                has_vectors: false,
-                grammar: None,
-                calls: None,
-                directions: None,
-            })
+            .map(|e| source::bare_encoding(e.name.clone(), e.kind, e.map.clone()))
             .collect();
         let overrides = |target: Option<usize>| {
             analysis
@@ -1161,15 +1108,12 @@ fn semantic(analysis: &mut Analysis, context: &Context) {
                     let suggested = context
                         .encoding(&name)
                         .and_then(|enc| enc.map.get(&language).cloned());
-                    push(
-                        at,
-                        UNMAPPED_ENCODING,
-                        error,
-                        line.to_string(),
-                        Some(
+                    problems.push(Problem {
+                        data: Some(
                             json!({ "encoding": name, "language": language, "suggested": suggested.map(|s| s.ty) }),
                         ),
-                    );
+                        ..Problem::error(at, UNMAPPED_ENCODING, line.to_string())
+                    });
                 }
             }
         }
@@ -1217,6 +1161,7 @@ pub fn describe_encoding(encoding: &KnownEncoding) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lsp_types::NumberOrString;
 
     fn codes(text: &str, context: &Context) -> Vec<(String, String)> {
         diagnostics(text, context)

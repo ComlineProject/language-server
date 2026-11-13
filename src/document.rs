@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use dashmap::DashMap;
 use lsp_types::Url;
 
@@ -27,13 +26,13 @@ impl Document {
 
 /// Thread-safe document store
 pub struct DocumentStore {
-    documents: Arc<DashMap<Url, Document>>,
+    documents: DashMap<Url, Document>,
 }
 
 impl DocumentStore {
     pub fn new() -> Self {
         Self {
-            documents: Arc::new(DashMap::new()),
+            documents: DashMap::new(),
         }
     }
 
@@ -66,6 +65,11 @@ impl DocumentStore {
             .iter()
             .map(|entry| entry.key().clone())
             .collect()
+    }
+
+    /// Every open document.
+    pub fn all(&self) -> Vec<Document> {
+        self.documents.iter().map(|entry| entry.value().clone()).collect()
     }
 
     /// Check if a document exists

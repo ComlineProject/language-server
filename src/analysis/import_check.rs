@@ -30,7 +30,7 @@ use crate::analysis::project::{named_type_sites, validator_sites, Project, Proje
 use crate::analysis::source::DependencyKind;
 use crate::analysis::stdlib;
 use crate::analysis::symbols::Namespace;
-use crate::util::{closest, word_occurrences};
+use crate::util::{clamped, closest, follows_as, word_occurrences};
 
 /// What [`check`] found for one file.
 pub struct ImportCheck {
@@ -283,7 +283,7 @@ fn resolution(project: &Project, doc: usize) -> (Vec<UnresolvedImport>, Vec<Unve
             continue;
         };
         let span = decl.span;
-        let text = &here.source[span.0.min(here.source.len())..span.1.min(here.source.len())];
+        let (_, text) = clamped(here.source, span);
 
         let resolved = match resolver.resolve_namespace(&use_stmt.path, &here.namespace) {
             Ok(resolved) => resolved,
@@ -389,24 +389,13 @@ fn unknown_std_path(
     span: (usize, usize),
     namespace: &[String],
 ) -> UnresolvedImport {
-    let written = namespace
-        .iter()
-        .take(2)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join("::");
+    let first_two = |namespace: &[String]| namespace[..namespace.len().min(2)].join("::");
+    let written = first_two(namespace);
     let std_namespaces: BTreeSet<String> = project
         .docs
         .iter()
         .filter(|d| d.dependency == Some(stdlib::NAME))
-        .map(|d| {
-            d.namespace
-                .iter()
-                .take(2)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("::")
-        })
+        .map(|d| first_two(&d.namespace))
         .collect();
     let range = text
         .find(&written)
@@ -438,11 +427,7 @@ fn find_in(text: &str, base: usize, word: &str, segment: bool) -> Option<(usize,
         .into_iter()
         .find(|&i| {
             let followed_by_path = text[i + word.len()..].starts_with("::");
-            let after_as = text[..i]
-                .trim_end()
-                .strip_suffix("as")
-                .is_some_and(|before| before.ends_with(char::is_whitespace));
-            followed_by_path == segment && !after_as
+            followed_by_path == segment && !follows_as(&text[..i])
         })
         .map(|i| (base + i, base + i + word.len()))
 }

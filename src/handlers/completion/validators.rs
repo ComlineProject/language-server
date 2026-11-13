@@ -17,12 +17,12 @@ use comline_core::schema::ir::frozen::types::TypeRef;
 use lsp_types::{CompletionItem, CompletionItemKind, InsertTextFormat, Url};
 use std::collections::BTreeSet;
 
-use super::{origin, uses_in};
+use super::{imported_detail, unimported_item, uses_in};
 use crate::analysis::import_check::{self, declares_validator, Target};
-use crate::analysis::imports::add_use_edit;
 use crate::analysis::project::{Project, ProjectDoc};
 use crate::analysis::source::ProjectSource;
 use crate::parser;
+use crate::util::matching_brace;
 
 /// Validator names for an entry of the list.
 pub(super) fn names<S: ProjectSource>(
@@ -54,10 +54,7 @@ pub(super) fn names<S: ProjectSource>(
             continue;
         };
         if in_scope.insert(label.clone()) {
-            let detail = match label == real {
-                true => format!("from {}", origin(doc)),
-                false => format!("`{real}` from {}", origin(doc)),
-            };
+            let detail = imported_detail(doc, &label, &real);
             items.push(item(validator, label, detail));
         }
     }
@@ -68,19 +65,9 @@ pub(super) fn names<S: ProjectSource>(
             if in_scope.contains(&name) || imported.contains(&(index, name.clone())) {
                 continue;
             }
-            let path = format!("{}::{}", doc.namespace.join("::"), name);
-            let mut item = item(
-                validator,
-                name.clone(),
-                format!("from {} — adds `use {path}`", origin(doc)),
-            );
-            // After everything in scope; a dependency's after the package's own.
-            item.sort_text = Some(match doc.dependency {
-                Some(_) => format!("~~{name}"),
-                None => format!("~{name}"),
-            });
-            item.additional_text_edits = Some(vec![add_use_edit(source, &path)]);
-            items.push(item);
+            items.push(unimported_item(doc, &name, source, |detail| {
+                item(validator, name.clone(), detail)
+            }));
         }
     }
 
@@ -190,9 +177,7 @@ fn local_validators(source: &str) -> Vec<Validator> {
         let Some(end) = block_end(&cleaned, start) else {
             continue;
         };
-        let Some(document) = parser::parse(&source[start..end])
-            .ok()
-            .and_then(|r| r.document)
+        let Some(document) = parser::parse_document(&source[start..end])
         else {
             continue;
         };
@@ -207,20 +192,7 @@ fn local_validators(source: &str) -> Vec<Validator> {
 /// The byte just past the `}` closing the first `{` after `start`.
 fn block_end(cleaned: &str, start: usize) -> Option<usize> {
     let open = start + cleaned[start..].find('{')?;
-    let mut depth = 0usize;
-    for (i, c) in cleaned[open..].char_indices() {
-        match c {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(open + i + 1);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
+    matching_brace(cleaned, open).map(|close| close + 1)
 }
 
 fn validators_of<'d>(doc: &'d ProjectDoc) -> impl Iterator<Item = &'d Validator> {

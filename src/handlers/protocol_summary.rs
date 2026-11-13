@@ -23,7 +23,7 @@ use comline_core::schema::idl::annotations::{self, HandshakeValue};
 use comline_core::schema::idl::grammar::{Declaration, Document};
 use lsp_types::{Hover, HoverContents, MarkedString, Position, Url};
 
-use crate::util::position_to_offset;
+use crate::util::{position_to_offset, word_range_at};
 
 /// The protocol a hover at `offset` is about: its name, or an `@framing` /
 /// `@handshake` written on it. `word` is the word under the cursor and
@@ -216,20 +216,10 @@ pub fn extend(
 ) -> Option<Hover> {
     let Some(summary) = (|| {
         let offset = position_to_offset(source, position)?;
-        if offset >= source.len() {
-            return None;
-        }
-        let start = source[..offset]
-            .rfind(|c: char| !c.is_alphanumeric() && c != '_')
-            .map(|i| i + 1)
-            .unwrap_or(0);
-        let end = source[offset..]
-            .find(|c: char| !c.is_alphanumeric() && c != '_')
-            .map(|i| offset + i)
-            .unwrap_or(source.len());
+        let (start, end) = word_range_at(source, offset)?;
         let word = &source[start..end];
-        let annotation_key = start > 0 && source.as_bytes()[start - 1] == b'@';
-        let document = crate::parser::parse(source).ok()?.document?;
+        let annotation_key = source[..start].ends_with('@');
+        let document = crate::parser::parse_document(source)?;
         let name = target(&document, source, offset, word, annotation_key)?;
         let package_dir = package_dir(uri)?;
         let schema = crate::analysis::imports::namespace_of(uri).join("::");
@@ -258,10 +248,7 @@ pub fn extend(
         }) => vec![MarkedString::from_markdown(markup.value)],
     };
     parts.push(summary);
-    Some(Hover {
-        contents: HoverContents::Array(parts),
-        range: None,
-    })
+    Some(super::hover(parts))
 }
 
 /// The package directory a schema file at `uri` belongs to: the parent of
@@ -376,22 +363,8 @@ mod tests {
 
     fn target_at(offset: usize) -> Option<String> {
         let document = crate::parser::parse(SCHEMA).unwrap().document.unwrap();
-        let start = SCHEMA[..offset]
-            .rfind(|c: char| !c.is_alphanumeric() && c != '_')
-            .map(|i| i + 1)
-            .unwrap_or(0);
-        let end = SCHEMA[offset..]
-            .find(|c: char| !c.is_alphanumeric() && c != '_')
-            .map(|i| offset + i)
-            .unwrap();
-        let annotation_key = start > 0 && SCHEMA.as_bytes()[start - 1] == b'@';
-        target(
-            &document,
-            SCHEMA,
-            offset,
-            &SCHEMA[start..end],
-            annotation_key,
-        )
+        let (start, end) = crate::util::word_range_at(SCHEMA, offset).unwrap();
+        target(&document, SCHEMA, offset, &SCHEMA[start..end], SCHEMA[..start].ends_with('@'))
     }
 
     #[test]
@@ -452,12 +425,7 @@ mod tests {
         let offset = at("handshake", 0);
         let line = SCHEMA[..offset].matches('\n').count() as u32;
         let character = (offset - SCHEMA[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32;
-        let before = Hover {
-            contents: HoverContents::Array(vec![MarkedString::from_markdown(
-                "`@handshake`".into(),
-            )]),
-            range: None,
-        };
+        let before = super::super::hover(vec![MarkedString::from_markdown("`@handshake`".into())]);
         let Some(Hover {
             contents: HoverContents::Array(parts),
             ..
