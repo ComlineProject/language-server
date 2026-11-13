@@ -79,7 +79,7 @@ pub fn get_hover_info_with_project<S: ProjectSource>(
     // (named or unnamed) — checked directly by span, not through the
     // symbol table (which only tracks *named* settings blocks, since an
     // unnamed one has no name to be a symbol under — see `symbols.rs`).
-    // Ahead of the word lookup, so blank space in the block hovers too.
+    // Ahead of the word and `@` annotation lookups.
     // This only needs `other_files` directly (for the manifest's package-
     // level settings), not any parsed sibling `Document`.
     if let Some(settings) = settings_block_at(&document, offset) {

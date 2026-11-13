@@ -284,8 +284,6 @@ fn uses_in(source: &str, uri: &Url) -> Vec<ResolvedUse> {
         .collect()
 }
 
-/// Where a type comes from, for an item's detail: `` `types.ids` ``, or
-/// `` `models.ids` (dependency `shared_types`) ``.
 /// The detail of `label`, which a `use` here imports from `doc`: where it's
 /// from, and its declared name `real` when that's not `label`.
 fn imported_detail(doc: &ProjectDoc, label: &str, real: &str) -> String {
@@ -314,6 +312,8 @@ fn unimported_item(
     item
 }
 
+/// Where a type comes from, for an item's detail: `` `types.ids` ``, or
+/// `` `models.ids` (dependency `shared_types`) ``.
 fn origin(doc: &ProjectDoc) -> String {
     match doc.dependency {
         Some(dependency) => format!("`{}` ({})", file_name(doc), stdlib::owner(dependency)),
