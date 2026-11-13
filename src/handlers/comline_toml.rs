@@ -424,6 +424,8 @@ mod tests {
                 )]),
             }],
             used: Some(Default::default()),
+            schemas: None,
+            wire_format: String::new(),
             base_dir: None,
         }
     }

@@ -631,6 +631,7 @@ pub fn project_diagnostics(project: &Project, doc: usize) -> Vec<Diagnostic> {
             &units,
             &project.languages,
         ));
+        diagnostics.extend(generation::connection_diagnostics(project, doc));
     }
     diagnostics.extend(reserved_name_diagnostic(here));
     // What the package's edition deprecates or removes. A dependency's
