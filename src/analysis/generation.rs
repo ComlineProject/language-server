@@ -1,9 +1,15 @@
 //! What the package's declared languages can generate, from each
 //! generator's own `SUPPORT` table (`comline_codegen::features`), at the
 //! declared version: a warning at each use of a feature a declared
-//! language's generator refuses, a note at one it generates without, the
-//! summary hovering the language in `config.idp` shows, and the problems
-//! with a declaration itself that `comline build` refuses.
+//! language's generator refuses or generates without, the summary hovering
+//! the language in `config.idp` shows, and the problems with a declaration
+//! itself that `comline build` refuses.
+//!
+//! It also shows what `comline generation` says about the package's
+//! connection beyond generating (`comline_codegen::checks`): the protocols
+//! that disagree on one, and the bare method names that clash. The rest of
+//! those checks are about one target, and `comline.toml` shows them
+//! (`comline_toml`), over the same schemas ([`request`]).
 //!
 //! The tables are the generators' own, proven by their conformance suite;
 //! nothing is generated here. A declared language this build has no
@@ -13,23 +19,31 @@
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
+use comline_codegen::docs::{self, Topic};
 use comline_codegen::features::{self, Feature, Options, State, Support};
+use comline_codegen::protocol::EncodingMapping;
 use comline_codegen::versions::LangVersion;
-use comline_codegen::{Registry, Resolved, Unresolved};
+use comline_codegen::{
+    checks, GenerateRequest, Mode, PackageMeta, Registry, Resolved, TargetLanguage, Unresolved,
+};
 use comline_core::diagnostics::{Diagnostic as CoreDiagnostic, DiagnosticCode};
+use comline_core::package::config::ir::frozen::{self as config, FrozenUnit as ConfigUnit};
+use comline_core::schema::ir::compiler::interpreter::incremental::IncrementalInterpreter;
 use comline_core::schema::ir::compiler::settings::severity::resolve_diagnostic_overrides;
+use comline_core::schema::ir::compiler::Compile;
 use comline_core::schema::ir::frozen::unit::FrozenUnit;
+use comline_core::schema::ir::package_wire::apply_package_wire;
 use comline_core::settings::{SettingsDict, SettingsSpans};
-use lsp_types::{Diagnostic, DiagnosticSeverity};
+use lsp_types::{Diagnostic, DiagnosticSeverity, SymbolKind};
 
-use crate::analysis::source::DeclaredLanguage;
 use crate::analysis::diagnostics::lsp_severity;
+use crate::analysis::project::Project;
+use crate::analysis::source::DeclaredLanguage;
+use crate::analysis::symbols::Namespace;
 use crate::util::{byte_range_to_lsp_range, comline_diagnostic};
 
 /// A use of a feature the declared language's generator refuses.
 pub const UNSUPPORTED_FEATURE: &str = "generation::unsupported-feature";
-/// A use of a feature the declared language's generator generates without.
-pub const IGNORED_FEATURE: &str = "generation::ignored-feature";
 /// A declaration no generator handles: an unknown language, a version that
 /// isn't one, or one below the generator's floor.
 pub const UNRESOLVED_TARGET: &str = "generation::unresolved-target";
@@ -96,8 +110,8 @@ pub fn feature_diagnostics(
                     ),
                 ),
                 State::Ignored => (
-                    DiagnosticSeverity::INFORMATION,
-                    IGNORED_FEATURE,
+                    lsp_severity(checks::IGNORED_FEATURE.severity),
+                    checks::IGNORED_FEATURE.id,
                     format!("`{target}` generates this without its {}{}", u.feature.title(), detail(&declared.language, &s)),
                 ),
                 State::Supported | State::Partial => continue,
@@ -111,6 +125,176 @@ pub fn feature_diagnostics(
         }
     }
     diagnostics
+}
+
+/// The page the generator for `language#version` names for its connections
+/// (`Topic::Connections`), if this build has the generator and it has one.
+pub fn connections_doc(language: &str, version: &str) -> Option<&'static str> {
+    let resolved = resolve(language, version).ok()?;
+    docs::link(resolved.generator.docs, Topic::Connections)
+}
+
+/// What each framing the package can see states, by canonical name: the
+/// encodings `configs` declare (the package's `config.idp` and its
+/// dependencies'), as `comline generation` reads them for its checks.
+pub fn framings<'a>(
+    configs: impl IntoIterator<Item = &'a ConfigUnit>,
+) -> BTreeMap<String, EncodingMapping> {
+    configs
+        .into_iter()
+        .filter_map(|unit| match unit {
+            ConfigUnit::Encoding {
+                name,
+                grammar,
+                calls,
+                ..
+            } => Some((
+                comline_codegen::encodings::canonical(name),
+                EncodingMapping {
+                    grammar: grammar.clone(),
+                    calls: calls.clone(),
+                    ..Default::default()
+                },
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The package's own schemas as `comline generation` hands them to its
+/// checks: each by its namespace (`a/b`), frozen with the package's framing
+/// and handshake in every protocol that doesn't write its own, in namespace
+/// order so that "the first protocol" doesn't depend on which file the
+/// editor listed first. `None` where the view isn't the whole package - no
+/// manifest to say what its wire is, or a schema that doesn't parse, which
+/// might hold the protocol that decides - and so can't be judged.
+pub fn package_schemas(project: &Project) -> Option<Vec<(String, Vec<FrozenUnit>)>> {
+    let config = project.config.as_deref()?;
+    if !project.unparsed.is_empty() {
+        return None;
+    }
+
+    let mut schemas: Vec<(String, Vec<FrozenUnit>)> = project
+        .docs
+        .iter()
+        .filter(|d| d.dependency.is_none())
+        .map(|d| {
+            (
+                d.namespace.join("/"),
+                IncrementalInterpreter::from_declarations(d.document.0.clone()),
+            )
+        })
+        .collect();
+    schemas.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut units: Vec<&mut [FrozenUnit]> = schemas
+        .iter_mut()
+        .map(|(_, units)| units.as_mut_slice())
+        .collect();
+    apply_package_wire(&mut units, config);
+    Some(schemas)
+}
+
+/// A generation request for `schemas` (as [`package_schemas`] has them) in
+/// a package whose `wire.format` is `wire_format`, with `framings` and
+/// `async_api` as one target would have them. It's what
+/// `comline_codegen::checks` reads of a request: the target, the package's
+/// name and version, and the options no check looks at are placeholders.
+pub fn request(
+    schemas: Vec<(String, Vec<FrozenUnit>)>,
+    wire_format: &str,
+    framings: BTreeMap<String, EncodingMapping>,
+    async_api: bool,
+) -> GenerateRequest {
+    GenerateRequest {
+        mode: Mode::Code,
+        schemas,
+        package: PackageMeta {
+            name: String::new(),
+            version: "0.0.0".to_string(),
+        },
+        target: TargetLanguage {
+            language: String::new(),
+            version: String::new(),
+        },
+        wire_format: wire_format.to_string(),
+        external_std: false,
+        validate_on_decode: Default::default(),
+        async_api,
+        encodings: framings,
+        facts: None,
+    }
+}
+
+/// What `comline generation` says about the package's connection that
+/// doesn't depend on a target, at the protocol it's about in `docs[doc]`: a
+/// warning where the protocols on a connection disagree on its framing or
+/// handshake ([`checks::NO_PACKAGE_CONNECTION`], at the first that
+/// disagrees), an error where two protocols one side provides have bare
+/// method names that clash ([`checks::METHOD_NAME_CLASH`], at the second).
+/// Each is in the schema that declares its protocol and nowhere else, so a
+/// protocol in another file leaves this one without it, however many
+/// languages the package declares.
+pub fn connection_diagnostics(project: &Project, doc: usize) -> Vec<Diagnostic> {
+    let here = &project.docs[doc];
+    let Some(config) = project.config.as_deref() else {
+        return vec![];
+    };
+    // Nothing to show in a file with no protocol, and nothing to work out for it.
+    if !here
+        .symbols
+        .all_symbols()
+        .iter()
+        .any(|s| s.kind == SymbolKind::INTERFACE)
+    {
+        return vec![];
+    }
+    let Some(schemas) = package_schemas(project) else {
+        return vec![];
+    };
+
+    let framings = framings(
+        config.iter().chain(
+            project
+                .dependency_configs
+                .iter()
+                .flat_map(|(_, units)| units),
+        ),
+    );
+    let request = request(
+        schemas,
+        config::wire_format(config),
+        framings.clone(),
+        false,
+    );
+    let mut found: Vec<CoreDiagnostic> = checks::generation(&request, None, None)
+        .into_iter()
+        .filter(|d| d.code == checks::NO_PACKAGE_CONNECTION)
+        .collect();
+    found.extend(checks::method_name_clashes(&request.schemas, &framings));
+
+    // The check names a protocol by path (`app::Chat`); here it's the name in
+    // this file's own namespace.
+    let namespace = here.namespace.join("/");
+    found
+        .into_iter()
+        .filter_map(|d| {
+            let (schema, name) = d.unit.as_deref()?.rsplit_once("::")?;
+            if schema != namespace {
+                return None;
+            }
+            let symbol = here
+                .symbols
+                .get_in(name, Namespace::Declaration)
+                .filter(|s| s.kind == SymbolKind::INTERFACE)?;
+            Some(comline_diagnostic(
+                byte_range_to_lsp_range(here.source, symbol.name_span.0, symbol.name_span.1),
+                lsp_severity(d.code.severity),
+                Some(d.code.id),
+                d.message,
+            ))
+        })
+        .collect()
 }
 
 /// `: note (tracking)`, or as much of it as there is; for a feature gated
@@ -290,30 +474,44 @@ mod tests {
     use crate::analysis::diagnostics::project_diagnostics;
     use crate::analysis::project::Project;
 
-    /// The package's diagnostics for `schema`, with `languages` declared.
-    fn diagnostics(languages: &str, schema: &str) -> Vec<(String, String, u32, u32)> {
+    /// The generation diagnostics of the package's `files` (a manifest is
+    /// added, declaring `languages`) for the one named `shown`.
+    fn found_in(
+        languages: &str,
+        files: &[(&str, &str)],
+        shown: &str,
+    ) -> Vec<lsp_types::Diagnostic> {
         let manifest = format!(
             "congregation app\nspecification_version = 1\n\ncode_generation = {{\n    languages = {{\n{languages}    }}\n}}\n"
         );
-        let files = [
-            (Url::parse("file:///pkg/config.idp").unwrap(), manifest),
-            (
-                Url::parse("file:///pkg/src/api.ids").unwrap(),
+        let mut all = vec![(Url::parse("file:///pkg/config.idp").unwrap(), manifest)];
+        for (name, schema) in files {
+            all.push((
+                Url::parse(&format!("file:///pkg/src/{name}")).unwrap(),
                 schema.to_string(),
-            ),
-        ];
-        let project = Project::new(files.iter());
+            ));
+        }
+        let project = Project::new(all.iter());
         let doc = project
             .docs
             .iter()
-            .position(|d| d.uri.path().ends_with("api.ids"))
+            .position(|d| d.uri.path().ends_with(shown))
             .unwrap();
         project_diagnostics(&project, doc)
             .into_iter()
+            .filter(|d| {
+                matches!(&d.code, Some(lsp_types::NumberOrString::String(code))
+                    if code.starts_with("generation::"))
+            })
+            .collect()
+    }
+
+    /// The package's diagnostics for `schema`, with `languages` declared.
+    fn diagnostics(languages: &str, schema: &str) -> Vec<(String, String, u32, u32)> {
+        found_in(languages, &[("api.ids", schema)], "api.ids")
+            .into_iter()
             .filter_map(|d| match d.code {
-                Some(lsp_types::NumberOrString::String(code))
-                    if code.starts_with("generation::") =>
-                {
+                Some(lsp_types::NumberOrString::String(code)) => {
                     Some((code, d.message, d.range.start.line, d.range.start.character))
                 }
                 _ => None,
@@ -346,22 +544,150 @@ mod tests {
     }
 
     #[test]
-    fn a_feature_a_declared_language_ignores_is_a_note() {
+    fn a_feature_a_declared_language_ignores_is_a_warning_at_each_use() {
         let schema = "validator NonEmpty for string {\n    validate {\n        \
                       assert(value.length > 0, f\"{value.name} is empty\")\n    }\n}\n\n\
-                      @validators = [NonEmpty]\ntype Name = string\n";
-        let found = diagnostics(
+                      @validators = [NonEmpty]\ntype Name = string\n\n\
+                      @validators = [NonEmpty]\ntype Title = string\n";
+        let found = found_in(
             "        typescript#5.0 = {}\n        rust#1.85.0 = {}\n",
-            schema,
+            &[("api.ids", schema)],
+            "api.ids",
         );
-        assert_eq!(found.len(), 1, "{found:?}");
-        let (code, message, line, character) = &found[0];
-        assert_eq!(code, super::IGNORED_FEATURE);
+        assert_eq!(found.len(), 2, "{found:?}");
+        for d in &found {
+            assert_eq!(
+                d.code,
+                Some(lsp_types::NumberOrString::String(
+                    comline_codegen::checks::IGNORED_FEATURE.id.to_string()
+                ))
+            );
+            assert_eq!(d.severity, Some(lsp_types::DiagnosticSeverity::WARNING));
+            assert_eq!(d.source.as_deref(), Some("comline"));
+            assert!(
+                d.message
+                    .starts_with("`typescript#5.0` generates this without its validators: "),
+                "{}",
+                d.message
+            );
+        }
+        let at: Vec<_> = found
+            .iter()
+            .map(|d| (d.range.start.line, d.range.start.character))
+            .collect();
+        assert_eq!(at, [(6, 15), (9, 15)], "at each validator's name");
+    }
+
+    /// The `(code, severity, line, text at the range)` of each diagnostic.
+    fn at(found: &[lsp_types::Diagnostic], source: &str) -> Vec<(String, String, u32, String)> {
+        found
+            .iter()
+            .map(|d| {
+                let code = match &d.code {
+                    Some(lsp_types::NumberOrString::String(code)) => code.clone(),
+                    _ => String::new(),
+                };
+                let line = source.lines().nth(d.range.start.line as usize).unwrap();
+                let text = line[d.range.start.character as usize..d.range.end.character as usize]
+                    .to_string();
+                (
+                    code,
+                    format!("{:?}", d.severity.unwrap()),
+                    d.range.start.line,
+                    text,
+                )
+            })
+            .collect()
+    }
+
+    /// Two protocols the client provides on JSON-RPC, each with a `send`.
+    const CLASHING: &str = "@provider = Client\n@framing = \"jsonrpc\"\nprotocol Chat {\n    \
+                            function send();\n}\n\n@provider = Client\n@framing = \"jsonrpc\"\n\
+                            protocol Admin {\n    function send();\n}\n";
+
+    #[test]
+    fn bare_method_names_that_clash_are_an_error_at_the_second_protocol() {
+        let found = found_in("", &[("api.ids", CLASHING)], "api.ids");
+        assert_eq!(
+            at(&found, CLASHING),
+            [(
+                "generation::method-name-clash".to_string(),
+                "Error".to_string(),
+                8,
+                "Admin".to_string()
+            )]
+        );
+        assert_eq!(found[0].source.as_deref(), Some("comline"));
         assert!(
-            message.starts_with("`typescript#5.0` generates this without its validators: "),
-            "{message}"
+            found[0]
+                .message
+                .starts_with("protocols `api::Chat` and `api::Admin` both have a function `send`"),
+            "{}",
+            found[0].message
         );
-        assert_eq!((*line, *character), (6, 15), "at the validator's name");
+        // The same, whatever languages are declared.
+        assert_eq!(diagnostics("        rust#1.85.0 = {}\n", CLASHING).len(), 1);
+    }
+
+    #[test]
+    fn a_clash_is_shown_once_in_the_file_of_the_second_protocol() {
+        let (first, second) = CLASHING.split_once("\n\n").unwrap();
+        let files = [("a.ids", first), ("b.ids", second)];
+        assert_eq!(found_in("", &files, "a.ids"), []);
+        let found = found_in("", &files, "b.ids");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0]
+                .message
+                .starts_with("protocols `a::Chat` and `b::Admin` "),
+            "{}",
+            found[0].message
+        );
+        // The order is the namespaces', not the order the files were listed in.
+        let files = [("b.ids", second), ("a.ids", first)];
+        assert_eq!(found_in("", &files, "a.ids"), []);
+        assert_eq!(found_in("", &files, "b.ids").len(), 1);
+    }
+
+    /// Two protocols on connections that disagree on the handshake.
+    const DISAGREEING: &str = "protocol Chat {\n    function send();\n}\n\n\
+                               @handshake = \"none\"\nprotocol Admin {\n    function kick();\n}\n";
+
+    #[test]
+    fn protocols_on_connections_that_disagree_are_a_warning_at_the_one_that_does() {
+        let found = found_in("", &[("api.ids", DISAGREEING)], "api.ids");
+        assert_eq!(
+            at(&found, DISAGREEING),
+            [(
+                "generation::no-package-connection".to_string(),
+                "Warning".to_string(),
+                5,
+                "Admin".to_string()
+            )]
+        );
+        assert!(
+            found[0]
+                .message
+                .starts_with("no package `serve` / `connect` - `api::Chat` runs the"),
+            "{}",
+            found[0].message
+        );
+        assert_eq!(
+            diagnostics(
+                "        rust#1.85.0 = {}\n        typescript#5.0 = {}\n",
+                DISAGREEING
+            )
+            .len(),
+            1,
+            "once, not per language"
+        );
+    }
+
+    #[test]
+    fn protocols_that_agree_say_nothing_about_the_connection() {
+        let agreeing = "protocol Chat {\n    function send();\n}\n\nprotocol Admin {\n    function send();\n}\n";
+        assert_eq!(diagnostics("", agreeing), []);
+        assert_eq!(diagnostics("", "struct User {\n    name: string\n}\n"), []);
     }
 
     #[test]

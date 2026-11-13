@@ -16,6 +16,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
+use comline_codegen::checks;
 use comline_codegen::config::{self, ComlineToml};
 use comline_codegen::protocol::EncodingMapping;
 use comline_core::encodings::{official, EncodingKind, EncodingMapping as Suggested};
@@ -23,11 +24,13 @@ use comline_core::package::config::ir::frozen::FrozenUnit as ConfigUnit;
 use comline_core::schema::idl::annotations;
 use comline_core::schema::ir::compiler::interpreter::incremental::IncrementalInterpreter;
 use comline_core::schema::ir::compiler::Compile;
+use comline_core::schema::ir::frozen::unit::FrozenUnit;
 use comline_core::schema::ir::package_wire::apply_package_wire;
 use lsp_types::{Diagnostic, DiagnosticSeverity, Url};
 use serde_json::{json, Value as Json};
 use toml_edit::{ImDocument, Item, TableLike, Value};
 
+use crate::analysis::diagnostics::lsp_severity;
 use crate::analysis::generation;
 use crate::analysis::source::{self, DeclaredLanguage, ProjectSource};
 use crate::util::{byte_range_to_lsp_range, comline_diagnostic};
@@ -102,6 +105,12 @@ pub struct Context {
     /// The encodings the package's schemas use, canonical. `None` when they
     /// can't all be read (a schema mid-edit): then nothing is called unmapped.
     pub used: Option<BTreeSet<String>>,
+    /// The package's schemas as generation's checks read them
+    /// ([`generation::package_schemas`]), by namespace. `None` exactly when
+    /// [`Context::used`] is.
+    pub schemas: Option<Vec<(String, Vec<FrozenUnit>)>>,
+    /// The package's `wire.format`.
+    pub wire_format: String,
     /// `comline.toml`'s directory, for `generator` paths. `None`: unchecked.
     pub base_dir: Option<PathBuf>,
 }
@@ -164,10 +173,7 @@ impl Context {
             match crate::parser::parse_document(text) {
                 Some(document) => {
                     let units = IncrementalInterpreter::from_declarations(document.0.clone());
-                    schemas.push((
-                        crate::analysis::imports::namespace_of(uri).join("::"),
-                        units,
-                    ));
+                    schemas.push((crate::analysis::imports::namespace_of(uri).join("/"), units));
                 }
                 None => complete = false,
             }
@@ -186,6 +192,10 @@ impl Context {
                 official::units(),
                 &context.declared,
             ));
+            // In namespace order, as `generation::package_schemas` has them.
+            schemas.sort_by(|a, b| a.0.cmp(&b.0));
+            context.schemas = Some(schemas);
+            context.wire_format = wire.format;
         }
         context
     }
@@ -845,11 +855,12 @@ pub fn diagnostics(text: &str, context: &Context) -> Vec<Diagnostic> {
     let mut analysis = analyse(text);
     if analysis.parsed {
         let shape_problems = analysis.problems.len();
-        semantic(&mut analysis, context);
+        let read = ComlineToml::parse(text);
+        semantic(&mut analysis, context, read.as_ref().ok());
         // The walk covers the schema; serde is the CLI's own reader, so
         // anything it still refuses is reported too.
         if shape_problems == 0 {
-            if let Err(e) = ComlineToml::parse(text) {
+            if let Err(e) = read {
                 let span = e.span().map_or((0, 0), range);
                 analysis.problems.push(Problem::error(span, INVALID, e.message().trim().to_string()));
             }
@@ -870,7 +881,7 @@ pub fn diagnostics(text: &str, context: &Context) -> Vec<Diagnostic> {
         .collect()
 }
 
-fn semantic(analysis: &mut Analysis, context: &Context) {
+fn semantic(analysis: &mut Analysis, context: &Context, read: Option<&ComlineToml>) {
     let mut problems = Vec::new();
     let declared_names: Vec<&str> = context
         .languages
@@ -1090,7 +1101,8 @@ fn semantic(analysis: &mut Analysis, context: &Context) {
                 }
             }
         }
-        for (language, block) in targets.into_iter().filter(|(l, _)| !l.is_empty()) {
+        for (language, block) in targets.iter().filter(|(l, _)| !l.is_empty()) {
+            let (language, block) = (language.clone(), *block);
             let result = comline_codegen::encodings::resolve(
                 &language,
                 official::units(),
@@ -1117,9 +1129,100 @@ fn semantic(analysis: &mut Analysis, context: &Context) {
                 }
             }
         }
+        if let Some(read) = read {
+            problems.extend(generation_problems(analysis, context, read, &targets));
+        }
     }
 
     analysis.problems.extend(problems);
+}
+
+/// What `comline generation` says before it generates each of `targets`
+/// ((language, block), as it would build them) that depends on the target,
+/// from `comline_codegen::checks::generation` over the package's schemas:
+///
+/// - that `async = true` does nothing ([`checks::ASYNC_UNUSED`]), at the
+///   `async` key that set it, the target's own or `[generate]`'s;
+/// - that no protocol is on a connection
+///   ([`checks::NO_CONNECTION_PROTOCOLS`]), at the target's `language`. A
+///   target that is only declared in config.idp has no entry to put it at,
+///   and goes without.
+///
+/// The rest of what that call says is shown elsewhere: what a generator
+/// ignores at each use in the schemas, and the package's connection at the
+/// protocol that breaks it, so neither is taken from here. A key several
+/// targets share (`[generate] async`) is shown once.
+fn generation_problems(
+    analysis: &Analysis,
+    context: &Context,
+    read: &ComlineToml,
+    targets: &[(String, Option<usize>)],
+) -> Vec<Problem> {
+    let Some(schemas) = &context.schemas else {
+        return vec![];
+    };
+    let framings = generation::framings(&context.declared);
+    let section_async = analysis
+        .entries
+        .iter()
+        .find(|e| e.path == ["generate", "async"]);
+    let mut problems: Vec<Problem> = Vec::new();
+
+    for (language, block) in targets.iter().filter(|(l, _)| !l.is_empty()) {
+        let own = block.and_then(|i| read.generate.targets.get(i));
+        let async_api = own
+            .and_then(|t| t.async_api)
+            .or(read.generate.async_api)
+            .unwrap_or(false);
+        let async_entry = block
+            .and_then(|i| analysis.target_value(i, "async"))
+            .or(section_async);
+        let language_entry = block.and_then(|i| analysis.target_value(i, "language"));
+
+        // The generator's own page on connections: a built-in one's only,
+        // since an external generator is never run to ask.
+        let version = block
+            .and_then(|i| analysis.target_value(i, "lang_version"))
+            .and_then(|e| e.text.clone())
+            .or_else(|| context.declares(language).map(|d| d.version.clone()));
+        let external = block.is_some_and(|i| analysis.target_value(i, "generator").is_some());
+        let connections_doc = match (&version, external) {
+            (Some(version), false) => generation::connections_doc(language, version),
+            _ => None,
+        };
+
+        // Neither check reads the target or the generator's support, so the
+        // request is the package's and `async`, and no `resolved`.
+        let request = generation::request(
+            schemas.clone(),
+            &context.wire_format,
+            framings.clone(),
+            async_api,
+        );
+        for diagnostic in checks::generation(&request, None, connections_doc) {
+            let at = if diagnostic.code == checks::ASYNC_UNUSED {
+                async_entry.map(|e| e.key)
+            } else if diagnostic.code == checks::NO_CONNECTION_PROTOCOLS {
+                language_entry.map(|e| e.value.unwrap_or(e.key))
+            } else {
+                None
+            };
+            let Some(span) = at else { continue };
+            let seen = problems.iter().any(|p| {
+                p.span == span && p.code == diagnostic.code.id && p.message == diagnostic.message
+            });
+            if !seen {
+                problems.push(Problem {
+                    span,
+                    code: diagnostic.code.id,
+                    severity: lsp_severity(diagnostic.code.severity),
+                    message: diagnostic.message,
+                    data: None,
+                });
+            }
+        }
+    }
+    problems
 }
 
 /// Whether `path` is an `encodings` key: `generate.encodings.<name>` or
@@ -1195,6 +1298,8 @@ mod tests {
                 )]),
             }],
             used: Some(BTreeSet::new()),
+            schemas: None,
+            wire_format: String::new(),
             base_dir: None,
         }
     }
@@ -1478,6 +1583,145 @@ mod tests {
             context.used,
             Some(BTreeSet::from([annotations::DEFAULT_FORMAT.to_string()]))
         );
+    }
+
+    /// The context of a package declaring rust and typescript, whose one
+    /// schema is `schema`.
+    fn package_of(schema: &str) -> Context {
+        use crate::analysis::source::SourceFile;
+        let manifest = "congregation p\ncode_generation = {\n    languages = {\n        rust#1.85.0 = {}\n        typescript#5.0 = {}\n    }\n}\n";
+        let files = vec![
+            SourceFile::local(Url::parse("file:///p/config.idp").unwrap(), manifest.into()),
+            SourceFile::local(Url::parse("file:///p/src/app.ids").unwrap(), schema.into()),
+        ];
+        Context::from_files(&files, None)
+    }
+
+    /// A schema whose one protocol is server-provided on JSON-RPC: lockstep,
+    /// so on no connection.
+    const LOCKSTEP: &str = "@framing = \"jsonrpc\"\nprotocol Chat {\n    function ping();\n}\n";
+
+    const ASYNC_UNUSED: &str = "generation::async-unused";
+
+    /// The code of each of generation's checks `text` has diagnostics for.
+    fn codes_of(text: &str, context: &Context) -> Vec<String> {
+        diagnostics(text, context)
+            .into_iter()
+            .filter_map(|d| match d.code {
+                Some(NumberOrString::String(code)) if code.starts_with("generation::") => {
+                    Some(code)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The text each diagnostic of generation's check `code` is at.
+    fn checked_at(text: &str, context: &Context, code: &str) -> Vec<String> {
+        diagnostics(text, context)
+            .into_iter()
+            .filter(|d| d.code == Some(NumberOrString::String(code.to_string())))
+            .map(|d| {
+                let line = text.lines().nth(d.range.start.line as usize).unwrap();
+                line[d.range.start.character as usize..d.range.end.character as usize].to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn async_where_no_protocol_is_on_a_connection_is_a_warning_at_the_key() {
+        let context = package_of(LOCKSTEP);
+
+        let section = "[generate]\nout = \"gen\"\nasync = true\n";
+        let found = diagnostics(section, &context);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].code,
+            Some(NumberOrString::String("generation::async-unused".into()))
+        );
+        assert_eq!(found[0].severity, Some(DiagnosticSeverity::WARNING));
+        assert_eq!(found[0].source.as_deref(), Some("comline"));
+        assert_eq!(found[0].range.start.line, 2);
+        assert!(
+            found[0].message.starts_with(
+                "`async = true`, but no protocol runs on a connection, so the output is the same \
+                 as without it - every protocol here is lockstep: on JSON-RPC"
+            ),
+            "{}",
+            found[0].message
+        );
+        // Two languages are built with `[generate]`'s key: one diagnostic at it.
+        assert_eq!(checked_at(section, &context, ASYNC_UNUSED), ["async"]);
+
+        // A target's own key is where its own is, and over the section's.
+        let own =
+            "[generate]\nasync = false\n\n[[generate.target]]\nlanguage = \"rust\"\nasync = true\n";
+        let found: Vec<_> = diagnostics(own, &context)
+            .into_iter()
+            .filter(|d| d.code == Some(NumberOrString::String(ASYNC_UNUSED.to_string())))
+            .collect();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].range.start.line, 5);
+        let off =
+            "[generate]\nasync = true\n\n[[generate.target]]\nlanguage = \"rust\"\nasync = false\n";
+        assert_eq!(
+            checked_at(off, &context, ASYNC_UNUSED),
+            ["async"],
+            "typescript still takes the section's `async = true`"
+        );
+        let off = "[generate]\nasync = true\nonly = [\"rust\"]\n\n[[generate.target]]\nlanguage = \"rust\"\nasync = false\n";
+        assert_eq!(
+            checked_at(off, &context, ASYNC_UNUSED),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn async_where_a_protocol_is_on_a_connection_says_nothing() {
+        let context = package_of("protocol Chat {\n    function ping();\n}\n");
+        let text = "[generate]\nasync = true\n";
+        assert_eq!(codes_of(text, &context), Vec::<String>::new());
+        // Nor does a package with nothing it can be judged by.
+        assert_eq!(codes_of(text, &rust_package()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn no_protocol_on_a_connection_is_a_note_at_the_targets_language() {
+        let context = package_of(LOCKSTEP);
+        let text = "[[generate.target]]\nlanguage = \"rust\"\n";
+        let found = diagnostics(text, &context);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].code,
+            Some(NumberOrString::String(
+                "generation::no-connection-protocols".into()
+            ))
+        );
+        assert_eq!(found[0].severity, Some(DiagnosticSeverity::INFORMATION));
+        assert_eq!(found[0].range.start.line, 1);
+        assert_eq!(
+            (found[0].range.start.character, found[0].range.end.character),
+            (11, 17),
+            "at the language's name"
+        );
+        assert!(
+            found[0].message.starts_with(
+                "no package `Services` / `serve` / `connect` - every protocol is server-provided \
+                 on JSON-RPC (its frames don't name the protocol, and none of its protocols is \
+                 client-provided), and none is on a connection"
+            ),
+            "{}",
+            found[0].message
+        );
+
+        // A target only declared in config.idp has no entry to show it at.
+        assert_eq!(
+            codes_of("[generate]\nout = \"g\"\n", &context),
+            Vec::<String>::new()
+        );
+        // And one on a connection has nothing to note.
+        let connected = package_of("protocol Chat {\n    function ping();\n}\n");
+        assert_eq!(codes_of(text, &connected), Vec::<String>::new());
     }
 
     #[test]
