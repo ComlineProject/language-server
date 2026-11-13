@@ -1,18 +1,20 @@
 //! Completion, hover and code actions for `comline.toml`, over
 //! [`analysis::comline_toml`](crate::analysis::comline_toml).
 
-use std::collections::HashMap;
 
 use lsp_types::{
     CodeAction, CodeActionDisabled, CodeActionKind, CodeActionOrCommand, CodeActionParams,
-    CompletionItem, CompletionItemKind, Documentation, Hover, HoverContents, InsertTextFormat,
-    MarkupContent, MarkupKind, Position, TextEdit, Url, WorkspaceEdit,
+    CompletionItem, CompletionItemKind, Hover, HoverContents, InsertTextFormat,
+    MarkupContent, MarkupKind, Position, TextEdit, Url,
 };
 use serde_json::Value as Json;
 
 use crate::analysis::comline_toml::{self as toml, Context, KnownEncoding};
 use crate::analysis::generation;
-use crate::util::{byte_range_to_lsp_range, offset_to_position, position_to_offset};
+use crate::handlers::markdown;
+use crate::util::{
+    byte_range_to_lsp_range, file_edit, matching_brace, position_to_offset,
+};
 
 /// Hover: a key's description from the schema; for an `encodings` key, the
 /// encoding's declaration.
@@ -182,12 +184,7 @@ pub fn completion(text: &str, position: Position, context: &Context) -> Vec<Comp
         .map(|(key, doc)| CompletionItem {
             label: key.clone(),
             kind: Some(CompletionItemKind::PROPERTY),
-            documentation: (!doc.is_empty()).then(|| {
-                Documentation::MarkupContent(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value: doc,
-                })
-            }),
+            documentation: (!doc.is_empty()).then(|| markdown(doc)),
             insert_text: Some(format!("{key} = ")),
             ..Default::default()
         })
@@ -220,10 +217,7 @@ fn encoding_items(context: &Context, language: Option<&str>, inline: bool) -> Ve
                 label: encoding.name.clone(),
                 kind: Some(CompletionItemKind::FIELD),
                 detail: Some(format!("{:?} - {}", encoding.kind, encoding.package).to_lowercase()),
-                documentation: Some(Documentation::MarkupContent(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value: toml::describe_encoding(&encoding),
-                })),
+                documentation: Some(markdown(toml::describe_encoding(&encoding))),
                 insert_text: Some(format!("\"{}\" = {value}{separator}", encoding.name)),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 ..Default::default()
@@ -260,7 +254,7 @@ pub fn code_actions(
                 title: format!("Change to {candidate}"),
                 kind: Some(CodeActionKind::QUICKFIX),
                 diagnostics: Some(vec![diagnostic.clone()]),
-                edit: Some(edit(
+                edit: Some(file_edit(
                     uri,
                     vec![TextEdit {
                         range: diagnostic.range,
@@ -281,18 +275,14 @@ pub fn code_actions(
             {
                 let language = language.to_lowercase();
                 let new_text = declare_language(manifest_text, &language, version);
-                let end = offset_to_position(manifest_text, manifest_text.len());
                 actions.push(CodeActionOrCommand::CodeAction(CodeAction {
                     title: format!("Declare `{language}#{version}` in config.idp"),
                     kind: Some(CodeActionKind::QUICKFIX),
                     diagnostics: Some(vec![diagnostic.clone()]),
-                    edit: Some(edit(
+                    edit: Some(file_edit(
                         manifest_uri,
                         vec![TextEdit {
-                            range: lsp_types::Range {
-                                start: Position::new(0, 0),
-                                end,
-                            },
+                            range: byte_range_to_lsp_range(manifest_text, 0, manifest_text.len()),
                             new_text,
                         }],
                     )),
@@ -334,33 +324,6 @@ pub fn check_generator(written: &str) -> CodeAction {
         disabled: Some(CodeActionDisabled { reason }),
         ..Default::default()
     }
-}
-
-fn edit(uri: &Url, edits: Vec<TextEdit>) -> WorkspaceEdit {
-    WorkspaceEdit {
-        changes: Some(HashMap::from([(uri.clone(), edits)])),
-        ..Default::default()
-    }
-}
-
-/// The matching `}` of the `{` at `open`.
-fn matching_brace(text: &str, open: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    let mut in_string = false;
-    for (i, c) in text[open..].char_indices() {
-        match c {
-            '"' => in_string = !in_string,
-            '{' if !in_string => depth += 1,
-            '}' if !in_string => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(open + i);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
 }
 
 /// The `{` opening `key = {` at or after `from`, within `until`.
@@ -429,6 +392,7 @@ pub fn declare_language(manifest: &str, language: &str, version: &str) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lsp_types::Documentation;
     use crate::analysis::comline_toml::{diagnostics, KnownEncoding};
     use crate::analysis::source::DeclaredLanguage;
     use comline_core::encodings::{EncodingKind, EncodingMapping as Suggested};

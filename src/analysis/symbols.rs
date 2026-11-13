@@ -1,6 +1,6 @@
 // Symbol table building from AST
 
-use crate::util::{byte_range_to_lsp_range, word_occurrences};
+use crate::util::{byte_range_to_lsp_range, clamped, word_occurrences};
 use comline_core::schema::idl::grammar::{Declaration, Document};
 use lsp_types::{Location, SymbolKind, Url};
 use std::collections::HashMap;
@@ -318,8 +318,7 @@ fn declaration_name_span(
     keyword: &str,
     name: &str,
 ) -> (usize, usize) {
-    let (start, end) = (span.0.min(source.len()), span.1.min(source.len()));
-    let text = &source[start..end];
+    let (start, text) = clamped(source, span);
 
     let offset = word_occurrences(text, name)
         .into_iter()

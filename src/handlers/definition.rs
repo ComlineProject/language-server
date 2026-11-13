@@ -3,8 +3,8 @@
 use crate::analysis::modules;
 use crate::analysis::project::Project;
 use crate::analysis::source::ProjectSource;
-use crate::util::{byte_range_to_lsp_range, position_to_offset};
-use lsp_types::{GotoDefinitionResponse, Location, Position, Url};
+use crate::util::position_to_offset;
+use lsp_types::{GotoDefinitionResponse, Location, Position, Range, Url};
 
 /// Find the definition of a symbol at a position, considering only this file.
 pub fn find_definition(
@@ -37,12 +37,12 @@ pub fn find_definition_with_project<S: ProjectSource>(
     other_files: &[S],
 ) -> Option<GotoDefinitionResponse> {
     let offset = position_to_offset(source, position)?;
+    let project = Project::with_active(uri, source, other_files);
 
-    if let Some(location) = module_definition(source, uri, offset, other_files) {
+    if let Some(location) = module_definition(source, uri, offset, &project) {
         return Some(GotoDefinitionResponse::Scalar(location));
     }
 
-    let project = Project::with_active(uri, source, other_files);
     let active = project.index_of(uri)?;
     let target = project.target_at_cursor(active, source, offset)?;
 
@@ -56,18 +56,12 @@ pub fn find_definition_with_project<S: ProjectSource>(
 /// directory with no schema of its own, or a dependency's package root) -
 /// there's no single file to open for one of those, only a listing (what
 /// hover already shows).
-fn module_definition<S: ProjectSource>(
-    source: &str,
-    uri: &Url,
-    offset: usize,
-    other_files: &[S],
-) -> Option<Location> {
-    let project = Project::with_active(uri, source, other_files);
-    let (namespace, _) = modules::path_module_at(source, uri, offset, &project)?;
+fn module_definition(source: &str, uri: &Url, offset: usize, project: &Project) -> Option<Location> {
+    let (namespace, _) = modules::path_module_at(source, uri, offset, project)?;
     let doc = project.docs.iter().find(|d| d.namespace == namespace)?;
     Some(Location {
         uri: doc.uri.clone(),
-        range: byte_range_to_lsp_range(doc.source, 0, 0),
+        range: Range::default(),
     })
 }
 

@@ -7,7 +7,7 @@
 // code block still runs through the real comline grammar and gets
 // genuine theme-colored syntax highlighting, same as any other code
 // block.
-use lsp_types::{Hover, HoverContents, MarkedString};
+use lsp_types::{Hover, MarkedString};
 
 pub struct UnitHover {
     signature: String,
@@ -92,29 +92,14 @@ impl UnitHover {
         let mut contents = vec![MarkedString::from_markdown(body.join("\n"))];
         contents.extend(self.extra.into_iter().map(MarkedString::from_markdown));
 
-        Hover {
-            contents: HoverContents::Array(contents),
-            range: None,
-        }
+        super::hover(contents)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn blocks(hover: Hover) -> Vec<String> {
-        match hover.contents {
-            HoverContents::Array(parts) => parts
-                .into_iter()
-                .map(|p| match p {
-                    MarkedString::String(s) => s,
-                    MarkedString::LanguageString(ls) => ls.value,
-                })
-                .collect(),
-            _ => panic!("expected an array of blocks"),
-        }
-    }
+    use crate::test_support::blocks;
 
     #[test]
     fn signature_only_is_a_single_fenced_block() {

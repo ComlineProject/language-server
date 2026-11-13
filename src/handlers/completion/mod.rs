@@ -112,10 +112,17 @@ fn completions_at<S: ProjectSource>(
     // either way, so a mid-edit document still gets real, context-aware
     // suggestions; this only widens the *type* list with names that
     // haven't been reparsed yet.
-    let symbol_table = parser::parse(source)
-        .ok()
-        .and_then(|r| r.document)
+    let symbol_table = parser::parse_document(source)
         .map(|document| symbols::build_symbol_table(&document, uri, source));
+
+    // Every known type: primitives first, then user-declared struct/enum/
+    // alias names, then the ones other files declare.
+    let type_items = || {
+        let mut items = get_primitive_type_completions();
+        items.extend(get_type_completions(symbol_table.as_ref(), source));
+        items.extend(get_import_completions(source, uri, other_files, symbol_table.as_ref()));
+        items
+    };
 
     let mut completions = Vec::new();
 
@@ -126,14 +133,7 @@ fn completions_at<S: ProjectSource>(
             // struct/enum/alias names) is relevant here, regardless of how
             // much whitespace or partial typing separates the cursor from
             // that `:`/`->`/`(`.
-            completions.extend(get_primitive_type_completions());
-            completions.extend(get_type_completions(symbol_table.as_ref(), source));
-            completions.extend(get_import_completions(
-                source,
-                uri,
-                other_files,
-                symbol_table.as_ref(),
-            ));
+            completions.extend(type_items());
         }
         CompletionContext::TopLevel => {
             // Nothing (or only a partial keyword) typed yet, no enclosing
@@ -161,16 +161,7 @@ fn completions_at<S: ProjectSource>(
         CompletionContext::ValidatorBody(body) => match validator_body::completions(body) {
             Some(items) => completions.extend(items),
             // A property's type: as after any other `:`.
-            None => {
-                completions.extend(get_primitive_type_completions());
-                completions.extend(get_type_completions(symbol_table.as_ref(), source));
-                completions.extend(get_import_completions(
-                    source,
-                    uri,
-                    other_files,
-                    symbol_table.as_ref(),
-                ));
-            }
+            None => completions.extend(type_items()),
         },
         CompletionContext::ValidatorFor => {
             completions.push(for_keyword_completion());
@@ -205,14 +196,7 @@ fn completions_at<S: ProjectSource>(
             // mix completion has always fallen back to, rather than
             // nothing.
             completions.extend(get_keyword_completions());
-            completions.extend(get_primitive_type_completions());
-            completions.extend(get_type_completions(symbol_table.as_ref(), source));
-            completions.extend(get_import_completions(
-                source,
-                uri,
-                other_files,
-                symbol_table.as_ref(),
-            ));
+            completions.extend(type_items());
         }
     }
 
@@ -267,10 +251,7 @@ fn get_import_completions<S: ProjectSource>(
         for (label, real) in names {
             imported.insert((sibling, real.clone()));
             if in_scope.insert(label.clone()) {
-                let detail = match label == real {
-                    true => format!("from {}", origin(doc)),
-                    false => format!("`{real}` from {}", origin(doc)),
-                };
+                let detail = imported_detail(doc, &label, &real);
                 items.push(type_item(doc, &real, label, detail));
             }
         }
@@ -281,20 +262,9 @@ fn get_import_completions<S: ProjectSource>(
             if in_scope.contains(&name) || imported.contains(&(index, name.clone())) {
                 continue;
             }
-            let path = format!("{}::{}", doc.namespace.join("::"), name);
-            let mut item = type_item(
-                doc,
-                &name,
-                name.clone(),
-                format!("from {} — adds `use {path}`", origin(doc)),
-            );
-            // After everything in scope; a dependency's after the package's own.
-            item.sort_text = Some(match doc.dependency {
-                Some(_) => format!("~~{name}"),
-                None => format!("~{name}"),
-            });
-            item.additional_text_edits = Some(vec![add_use_edit(source, &path)]);
-            items.push(item);
+            items.push(unimported_item(doc, &name, source, |detail| {
+                type_item(doc, &name, name.clone(), detail)
+            }));
         }
     }
 
@@ -309,13 +279,41 @@ fn uses_in(source: &str, uri: &Url) -> Vec<ResolvedUse> {
         .lines()
         .map(str::trim)
         .filter(|line| line.starts_with("use ") || line.starts_with("import "))
-        .filter_map(|line| parser::parse(line).ok()?.document)
+        .filter_map(parser::parse_document)
         .flat_map(|document| imports::resolved_imports(&document, &namespace))
         .collect()
 }
 
 /// Where a type comes from, for an item's detail: `` `types.ids` ``, or
 /// `` `models.ids` (dependency `shared_types`) ``.
+/// The detail of `label`, which a `use` here imports from `doc`: where it's
+/// from, and its declared name `real` when that's not `label`.
+fn imported_detail(doc: &ProjectDoc, label: &str, real: &str) -> String {
+    match label == real {
+        true => format!("from {}", origin(doc)),
+        false => format!("`{real}` from {}", origin(doc)),
+    }
+}
+
+/// The item `item` makes, given its detail, for `name` - declared in `doc`,
+/// imported by nothing here. Sorted after everything in scope (a
+/// dependency's after the package's own), and inserting the `use` it needs.
+fn unimported_item(
+    doc: &ProjectDoc,
+    name: &str,
+    source: &str,
+    item: impl FnOnce(String) -> CompletionItem,
+) -> CompletionItem {
+    let path = format!("{}::{}", doc.namespace.join("::"), name);
+    let mut item = item(format!("from {} — adds `use {path}`", origin(doc)));
+    item.sort_text = Some(match doc.dependency {
+        Some(_) => format!("~~{name}"),
+        None => format!("~{name}"),
+    });
+    item.additional_text_edits = Some(vec![add_use_edit(source, &path)]);
+    item
+}
+
 fn origin(doc: &ProjectDoc) -> String {
     match doc.dependency {
         Some(dependency) => format!("`{}` ({})", file_name(doc), stdlib::owner(dependency)),
@@ -946,18 +944,20 @@ fn value_snippet(ty: &ValueType, n: usize) -> Option<String> {
         ValueType::AnyOf(types) => return types.first().and_then(|first| value_snippet(first, n)),
         // The keys it can't do without, each its own tab-stop.
         ValueType::Dict(keys) => {
-            let entries: Vec<String> = keys
-                .iter()
-                .filter(|k| k.required)
-                .enumerate()
-                .map(|(i, k)| match value_snippet(&k.value, n + i) {
-                    Some(value) => format!("{} = {value}", k.key),
-                    None => k.key.to_string(),
-                })
-                .collect();
-            format!("{{ {} }}", entries.join(", "))
+            format!("{{ {} }}", dict_entries(keys.iter().filter(|k| k.required), n))
         }
     })
+}
+
+/// `keys` as a dict's entries, `key = value`, the values tab-stops from `n`.
+fn dict_entries<'k>(keys: impl Iterator<Item = &'k config_value::DictKey>, n: usize) -> String {
+    keys.enumerate()
+        .map(|(i, k)| match value_snippet(&k.value, n + i) {
+            Some(value) => format!("{} = {value}", k.key),
+            None => k.key.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The snippet a known annotation key inserts. The value half comes from
@@ -1188,9 +1188,7 @@ fn effective_settings<S: ProjectSource>(
     use comline_core::schema::ir::compiler::Compile;
     use comline_core::settings::effective::{effective_schema_settings, schema_settings};
 
-    let package = other_files
-        .iter()
-        .find(|f| f.dependency().is_none() && crate::analysis::source::is_manifest(f.uri()))
+    let package = crate::analysis::source::own_manifest(other_files)
         .map(|f| crate::analysis::source::declared_settings(f.text()))
         .unwrap_or_else(crate::analysis::source::base_settings);
 
@@ -1199,14 +1197,10 @@ fn effective_settings<S: ProjectSource>(
     // about the file as it stands yields nothing, which is exactly when
     // this is called. Blank that one line and ask about the rest: the
     // `settings` block the answer depends on is elsewhere in the file.
-    let document = parser::parse(source)
-        .ok()
-        .and_then(|r| r.document)
+    let document = parser::parse_document(source)
         .or_else(|| {
             let without_cursor_line = blank_line_at(source, offset);
-            parser::parse(&without_cursor_line)
-                .ok()
-                .and_then(|r| r.document)
+            parser::parse_document(&without_cursor_line)
         });
     let Some(document) = document else {
         return package;
@@ -1229,15 +1223,7 @@ fn dict_form_insert_text(info: &annotations::AnnotationInfo) -> Option<String> {
         ValueType::Dict(keys) if keys.iter().any(|k| !k.required) => Some(*keys),
         _ => None,
     })?;
-    let entries: Vec<String> = keys
-        .iter()
-        .enumerate()
-        .map(|(i, k)| match value_snippet(&k.value, i + 1) {
-            Some(value) => format!("{} = {value}", k.key),
-            None => k.key.to_string(),
-        })
-        .collect();
-    Some(format!("{} = {{ {} }}$0", info.key, entries.join(", ")))
+    Some(format!("{} = {{ {} }}$0", info.key, dict_entries(keys.iter(), 1)))
 }
 
 fn get_annotation_completions(

@@ -85,6 +85,16 @@ pub fn parse_idp(source: &str) -> Result<IdpParseResult> {
     }
 }
 
+/// The document `source` parses to - `None` while it has errors.
+pub fn parse_document(source: &str) -> Option<Document> {
+    parse(source).ok()?.document
+}
+
+/// The congregation `.idp` `source` parses to - `None` while it has errors.
+pub fn parse_congregation(source: &str) -> Option<Congregation> {
+    parse_idp(source).ok()?.document
+}
+
 /// Get declaration count from a document
 pub fn get_declaration_count(doc: &Document) -> usize {
     doc.0.len()

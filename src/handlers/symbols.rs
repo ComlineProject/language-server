@@ -8,15 +8,8 @@ use lsp_types::{DocumentSymbol, Range, SymbolInformation, SymbolKind, Url};
 /// Get document symbols for outline view
 #[allow(deprecated)] // DocumentSymbol uses deprecated fields
 pub fn get_document_symbols(source: &str, uri: &Url) -> Vec<DocumentSymbol> {
-    // Parse the document
-    let parse_result = match parser::parse(source) {
-        Ok(result) => result,
-        Err(_) => return vec![],
-    };
-
-    let document = match parse_result.document {
-        Some(doc) => doc,
-        None => return vec![],
+    let Some(document) = parser::parse_document(source) else {
+        return vec![];
     };
 
     // Build symbol table
@@ -79,32 +72,14 @@ fn format_symbol_detail(kind: SymbolKind, children: &[String]) -> String {
     }
 
     let count = children.len();
-    let item_type = match kind {
-        SymbolKind::STRUCT => {
-            if count == 1 {
-                "field"
-            } else {
-                "fields"
-            }
-        }
-        SymbolKind::INTERFACE => {
-            if count == 1 {
-                "function"
-            } else {
-                "functions"
-            }
-        }
-        SymbolKind::ENUM => {
-            if count == 1 {
-                "variant"
-            } else {
-                "variants"
-            }
-        }
-        _ => "items",
+    let (one, many) = match kind {
+        SymbolKind::STRUCT => ("field", "fields"),
+        SymbolKind::INTERFACE => ("function", "functions"),
+        SymbolKind::ENUM => ("variant", "variants"),
+        _ => ("items", "items"),
     };
 
-    format!("{} {}", count, item_type)
+    format!("{count} {}", if count == 1 { one } else { many })
 }
 
 /// Find a child's range within its parent declaration

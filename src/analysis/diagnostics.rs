@@ -7,7 +7,7 @@ use crate::analysis::generation;
 use crate::analysis::import_check::{self, MissingImport, UnresolvedImport, UnverifiedImport};
 use crate::analysis::project::Project;
 use crate::analysis::symbols::Namespace;
-use crate::util::byte_range_to_lsp_range;
+use crate::util::{byte_range_to_lsp_range, comline_diagnostic};
 use comline_core::diagnostics::{Fix, Severity};
 use comline_core::edition::{self, Edition};
 use comline_core::package::layout;
@@ -27,7 +27,7 @@ use comline_core::schema::ir::validation;
 use comline_core::settings::{SettingsDict, SettingsSpans};
 use lsp_types::{
     Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, DiagnosticTag, Location,
-    NumberOrString, Range, TextEdit, Url,
+    Range, TextEdit, Url,
 };
 
 /// The `code` of a missing-import diagnostic - what the quick fix in
@@ -82,7 +82,7 @@ fn narrows_to_name(code: &str) -> bool {
     )
 }
 
-fn lsp_severity(severity: Severity) -> DiagnosticSeverity {
+pub(crate) fn lsp_severity(severity: Severity) -> DiagnosticSeverity {
     match severity {
         Severity::Error => DiagnosticSeverity::ERROR,
         Severity::Warning => DiagnosticSeverity::WARNING,
@@ -162,13 +162,13 @@ pub fn from_core(source: &str, diagnostic: &comline_core::diagnostics::Diagnosti
         None => diagnostic.message.clone(),
     };
     let lsp = Diagnostic {
-        range,
-        severity: Some(lsp_severity(diagnostic.effective_severity())),
-        code: Some(NumberOrString::String(diagnostic.code.id.to_string())),
-        source: Some("comline".to_string()),
-        message,
         tags: lsp_tags(diagnostic.code.id),
-        ..Default::default()
+        ..comline_diagnostic(
+            range,
+            lsp_severity(diagnostic.effective_severity()),
+            Some(diagnostic.code.id),
+            message,
+        )
     };
     with_fix(lsp, source, diagnostic.fix.as_ref())
 }
@@ -178,11 +178,7 @@ pub fn from_core(source: &str, diagnostic: &comline_core::diagnostics::Diagnosti
 /// or an unknown one - with its fix. Empty while the manifest doesn't
 /// parse; its parse errors say that.
 pub fn edition_config_diagnostics(manifest: &str) -> Vec<Diagnostic> {
-    let Some(congregation) = crate::parser::parse_idp(manifest)
-        .ok()
-        .filter(|r| !r.has_errors())
-        .and_then(|r| r.document)
-    else {
+    let Some(congregation) = crate::parser::parse_congregation(manifest) else {
         return vec![];
     };
     match edition::check_config(manifest, &congregation) {
@@ -350,25 +346,21 @@ impl DeclaredData<'_, '_> {
         }
         self.answers.insert(key.clone(), None);
         let project = self.project;
-        let declared = project.docs[doc]
+        let answer = project.docs[doc]
             .document
             .0
             .iter()
-            .find(|decl| match &decl.value {
-                Declaration::Struct(s) => s.name() == name,
-                Declaration::TypeAlias(a) => a.name() == name,
-                _ => false,
-            });
-        let answer = match declared.map(|decl| &decl.value) {
-            Some(Declaration::Struct(s)) => s.fields().iter().any(|field| {
-                field.value.optional()
-                    || self.carries(doc, &TypeRef::from_grammar(field.value.field_type()))
-            }),
-            Some(Declaration::TypeAlias(a)) => {
-                self.carries(doc, &TypeRef::from_grammar(a.target_type()))
-            }
-            _ => true,
-        };
+            .find_map(|decl| match &decl.value {
+                Declaration::Struct(s) if s.name() == name => Some(s.fields().iter().any(|field| {
+                    field.value.optional()
+                        || self.carries(doc, &TypeRef::from_grammar(field.value.field_type()))
+                })),
+                Declaration::TypeAlias(a) if a.name() == name => {
+                    Some(self.carries(doc, &TypeRef::from_grammar(a.target_type())))
+                }
+                _ => None,
+            })
+            .unwrap_or(true);
         self.answers.insert(key, Some(answer));
         answer
     }
@@ -387,17 +379,10 @@ impl DeclaredData<'_, '_> {
                 length: Some(0), ..
             } => false,
             TypeRef::Array { element, .. } => self.carries(doc, element),
-            TypeRef::Named(name) => {
-                let bare = name.rsplit("::").next().unwrap_or(name);
-                let project = self.project;
-                let declared = project
-                    .resolve(doc, bare, Namespace::Declaration)
-                    .and_then(|target| Some((target.doc, project.symbol(&target)?.name.clone())));
-                match declared {
-                    Some((doc, real_name)) => self.named(doc, &real_name),
-                    None => true,
-                }
-            }
+            TypeRef::Named(name) => match declaration_in(self.project, doc, name) {
+                Some((doc, real_name)) => self.named(doc, &real_name),
+                None => true,
+            },
         }
     }
 }
@@ -527,7 +512,6 @@ fn validation_diagnostics_with(
             let code = error.code;
             let fix = error.fix.clone();
             let effective_severity = error.effective_severity();
-            let lsp_code = Some(NumberOrString::String(code.id.to_string()));
 
             // `help` carries the actionable half - a "did you mean" for a
             // misspelled settings key, say. The other conversion in this
@@ -542,23 +526,14 @@ fn validation_diagnostics_with(
                 message = format!("{message} — {help}");
             }
 
+            let primary = Diagnostic {
+                tags: lsp_tags(code.id),
+                ..comline_diagnostic(range, lsp_severity(effective_severity), Some(code.id), message)
+            };
+
             // No secondary span: today's single-diagnostic shape, unchanged.
             let Some((sec_span, sec_label)) = &error.secondary else {
-                return vec![with_fix(
-                    Diagnostic {
-                        range,
-                        severity: Some(lsp_severity(effective_severity)),
-                        code: lsp_code,
-                        code_description: None,
-                        source: Some("comline".to_string()),
-                        message,
-                        related_information: None,
-                        tags: lsp_tags(code.id),
-                        data: None,
-                    },
-                    source,
-                    fix.as_ref(),
-                )];
+                return vec![with_fix(primary, source, fix.as_ref())];
             };
 
             // A two-site error (e.g. a malformed settings value): the real
@@ -571,42 +546,29 @@ fn validation_diagnostics_with(
             // points, so "jump to all diagnostics with this code" should
             // find both.
             let sec_range = byte_range_to_lsp_range(source, sec_span.0, sec_span.1);
-            let primary = Diagnostic {
-                range,
-                severity: Some(lsp_severity(effective_severity)),
-                code: lsp_code.clone(),
-                code_description: None,
-                source: Some("comline".to_string()),
-                message: message.clone(),
-                related_information: Some(vec![DiagnosticRelatedInformation {
-                    location: Location {
-                        uri: uri.clone(),
-                        range: sec_range,
-                    },
-                    message: sec_label.clone(),
-                }]),
-                tags: lsp_tags(code.id),
-                data: None,
-            };
-            let primary = with_fix(primary, source, fix.as_ref());
-            let hint = Diagnostic {
-                range: sec_range,
-                severity: Some(DiagnosticSeverity::HINT),
-                code: lsp_code,
-                code_description: None,
-                source: Some("comline".to_string()),
-                message: format!("{sec_label} — {}", hint_pointer(code.id)),
-                related_information: Some(vec![DiagnosticRelatedInformation {
+            let related = |range, message| {
+                Some(vec![DiagnosticRelatedInformation {
                     location: Location {
                         uri: uri.clone(),
                         range,
                     },
                     message,
-                }]),
-                tags: None,
-                data: None,
+                }])
             };
-            vec![primary, hint]
+            let hint = Diagnostic {
+                related_information: related(range, primary.message.clone()),
+                ..comline_diagnostic(
+                    sec_range,
+                    DiagnosticSeverity::HINT,
+                    Some(code.id),
+                    format!("{sec_label} — {}", hint_pointer(code.id)),
+                )
+            };
+            let primary = Diagnostic {
+                related_information: related(sec_range, sec_label.clone()),
+                ..primary
+            };
+            vec![with_fix(primary, source, fix.as_ref()), hint]
         })
         .collect()
 }
@@ -867,20 +829,12 @@ fn reserved_name_diagnostic(here: &crate::analysis::project::ProjectDoc) -> Opti
         return None;
     }
     let (segment, reason) = layout::reserved_in_namespace(&here.namespace)?;
-    Some(Diagnostic {
-        range: Range::default(),
-        severity: Some(DiagnosticSeverity::ERROR),
-        code: Some(NumberOrString::String(RESERVED_SCHEMA_NAME.to_string())),
-        code_description: None,
-        source: Some("comline".to_string()),
-        message: format!(
-            "this schema uses the reserved name '{segment}' - {}",
-            reason.help(),
-        ),
-        related_information: None,
-        tags: None,
-        data: None,
-    })
+    Some(comline_diagnostic(
+        Range::default(),
+        DiagnosticSeverity::ERROR,
+        Some(RESERVED_SCHEMA_NAME),
+        format!("this schema uses the reserved name '{segment}' - {}", reason.help()),
+    ))
 }
 
 /// Worded like core's own error, so the editor and `comline check` say the
@@ -917,17 +871,12 @@ fn import_diagnostic(
     code: &str,
     message: String,
 ) -> Diagnostic {
-    Diagnostic {
-        range: byte_range_to_lsp_range(source, range.0, range.1),
-        severity: Some(severity),
-        code: Some(NumberOrString::String(code.to_string())),
-        code_description: None,
-        source: Some("comline".to_string()),
+    comline_diagnostic(
+        byte_range_to_lsp_range(source, range.0, range.1),
+        severity,
+        Some(code),
         message,
-        related_information: None,
-        tags: None,
-        data: None,
-    }
+    )
 }
 
 fn missing_import_diagnostic(source: &str, missing: &MissingImport) -> Diagnostic {
@@ -951,17 +900,13 @@ fn missing_import_diagnostic(source: &str, missing: &MissingImport) -> Diagnosti
         ),
     };
 
-    Diagnostic {
-        range: byte_range_to_lsp_range(source, missing.range.0, missing.range.1),
-        severity: Some(DiagnosticSeverity::ERROR),
-        code: Some(NumberOrString::String(MISSING_IMPORT.to_string())),
-        code_description: None,
-        source: Some("comline".to_string()),
+    import_diagnostic(
+        source,
+        missing.range,
+        DiagnosticSeverity::ERROR,
+        MISSING_IMPORT,
         message,
-        related_information: None,
-        tags: None,
-        data: None,
-    }
+    )
 }
 
 /// Generate LSP diagnostics from parse errors. Each top-level
@@ -1034,28 +979,21 @@ fn parse_diagnostic(
         .map(|(start, end)| byte_range_to_lsp_range(source, start, end))
         .unwrap_or_default();
 
-    let message = match &diagnostic.help {
-        Some(help) => format!("{} — {help}", diagnostic.message),
-        None => diagnostic.message.clone(),
-    };
-
-    let lsp = Diagnostic {
+    // `from_core`'s message and fix; a parse error is always an error, and
+    // carries no code or tags.
+    Diagnostic {
         range,
         severity: Some(DiagnosticSeverity::ERROR),
         code: None,
-        code_description: None,
-        source: Some("comline".to_string()),
-        message,
-        related_information: None,
         tags: None,
-        data: None,
-    };
-    with_fix(lsp, source, diagnostic.fix.as_ref())
+        ..from_core(source, diagnostic)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lsp_types::NumberOrString;
     use crate::parser;
 
     #[test]
@@ -1346,11 +1284,7 @@ struct User {
     }
 
     fn messages(source: &str) -> Vec<String> {
-        let r = parser::parse(source).unwrap();
-        all_diagnostics(source, &r.errors, r.document.as_ref())
-            .into_iter()
-            .map(|d| d.message)
-            .collect()
+        diags(source).into_iter().map(|d| d.message).collect()
     }
 
     #[test]
@@ -2130,6 +2064,7 @@ struct User {
 #[cfg(test)]
 mod duplicate_declaration_tests {
     use super::*;
+    use lsp_types::NumberOrString;
     use crate::parser;
 
     /// The screenshot's file: a struct, an error and a settings preset all
@@ -2284,6 +2219,7 @@ mod duplicate_declaration_tests {
 #[cfg(test)]
 mod reserved_schema_name_tests {
     use super::*;
+    use lsp_types::NumberOrString;
     use crate::analysis::source::SourceFile;
 
     fn diagnostics_for(path: &str) -> Vec<Diagnostic> {
@@ -2347,6 +2283,7 @@ mod reserved_schema_name_tests {
 #[cfg(test)]
 mod edition_tests {
     use super::*;
+    use lsp_types::NumberOrString;
 
     fn covered<'s>(source: &'s str, d: &Diagnostic) -> &'s str {
         let start = crate::util::position_to_offset(source, d.range.start).unwrap();
@@ -2525,6 +2462,7 @@ mod edition_tests {
 #[cfg(test)]
 mod unverified_judgement_tests {
     use super::*;
+    use lsp_types::NumberOrString;
     use crate::analysis::source::SourceFile;
 
     /// Allows `@unverified`, as a package that uses it has to.

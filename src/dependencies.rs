@@ -18,7 +18,7 @@ use lsp_types::{Diagnostic, DiagnosticSeverity, Url};
 use crate::acceptance;
 use crate::analysis::source::DeclaredLanguage;
 use crate::parser;
-use crate::util::{byte_range_to_lsp_range, word_occurrences};
+use crate::util::{byte_range_to_lsp_range, comline_diagnostic, keyword_span, word_occurrences};
 
 
 /// The file every package's manifest is in.
@@ -74,16 +74,13 @@ pub fn index(package_dir: &Path, manifest: &str) -> Vec<IndexedDependency> {
 /// the ones `comline check` would stop on, or that it has yet to fetch -
 /// and for the ones whose `@unverified` protocols aren't accepted.
 pub fn manifest_diagnostics(package_dir: &Path, manifest: &str) -> Vec<Diagnostic> {
-    let Some(congregation) = parser::parse_idp(manifest).ok().and_then(|r| r.document) else {
+    let Some(congregation) = parser::parse_congregation(manifest) else {
         return vec![];
     };
     let dependencies = match DependencyConfig::parse_dependencies(&congregation.assignments) {
         Ok(dependencies) => dependencies,
         Err(message) => {
-            let at = manifest
-                .find("dependencies")
-                .map(|i| (i, i + "dependencies".len()))
-                .unwrap_or((0, 0));
+            let at = keyword_span(manifest, "dependencies");
             return vec![diagnostic(manifest, at, DiagnosticSeverity::ERROR, message)];
         }
     };
@@ -140,9 +137,7 @@ fn problem(
 }
 
 fn declared(manifest: &str) -> Vec<DependencyConfig> {
-    parser::parse_idp(manifest)
-        .ok()
-        .and_then(|r| r.document)
+    parser::parse_congregation(manifest)
         .and_then(|congregation| {
             DependencyConfig::parse_dependencies(&congregation.assignments).ok()
         })
@@ -180,19 +175,14 @@ fn entry_range(manifest: &str, name: &str) -> (usize, usize) {
         .unwrap_or((from, from))
 }
 
-fn diagnostic(
+/// A code-less diagnostic at byte `range` of `source`.
+pub(crate) fn diagnostic(
     source: &str,
     range: (usize, usize),
     severity: DiagnosticSeverity,
     message: String,
 ) -> Diagnostic {
-    Diagnostic {
-        range: byte_range_to_lsp_range(source, range.0, range.1),
-        severity: Some(severity),
-        source: Some("comline".to_string()),
-        message,
-        ..Default::default()
-    }
+    comline_diagnostic(byte_range_to_lsp_range(source, range.0, range.1), severity, None, message)
 }
 
 /// Every `.ids` file under `dir`, with its text.
@@ -254,7 +244,7 @@ mod tests {
             "https://example.test/fetched",
             "abc",
         );
-        for (path, text) in [
+        crate::test_support::write_tree(Path::new("/"), [
             (consumer.join("config.idp"), CONSUMER),
             (
                 consumer.join("src/main.ids"),
@@ -276,10 +266,7 @@ mod tests {
                 fetched.join("src/wire/frame.ids"),
                 "struct Frame {\n    len: u32\n}\n",
             ),
-        ] {
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, text).unwrap();
-        }
+        ]);
         root
     }
 
@@ -375,7 +362,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let manifest = "congregation app\nspecification_version = 1\n\n\
             dependencies = {\n    billing = {\n        path = \"../billing\"\n    }\n}\n";
-        for (path, text) in [
+        crate::test_support::write_tree(Path::new("/"), [
             (root.join("app/config.idp"), manifest),
             (
                 root.join("app/src/main.ids"),
@@ -391,10 +378,7 @@ mod tests {
                 "@handshake = \"none\"\n@unverified = \"the 2009 gateway\"\n\
                  protocol Billing {\n    function charge();\n}\n",
             ),
-        ] {
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, text).unwrap();
-        }
+        ]);
         let app = root.join("app");
 
         let found = manifest_diagnostics(&app, manifest);
@@ -426,20 +410,7 @@ mod tests {
             "Accept that `Billing` gives up schema agreement and encoding agreement"
         );
         let edit = &action.edit.as_ref().unwrap().changes.as_ref().unwrap()[&uri][0];
-        let offset = |p: lsp_types::Position| {
-            manifest
-                .split_inclusive('\n')
-                .take(p.line as usize)
-                .map(str::len)
-                .sum::<usize>()
-                + p.character as usize
-        };
-        let fixed = format!(
-            "{}{}{}",
-            &manifest[..offset(edit.range.start)],
-            edit.new_text,
-            &manifest[offset(edit.range.end)..]
-        );
+        let fixed = crate::test_support::apply_edit(manifest, edit);
         let accepted = manifest.replace(
             "path = \"../billing\"\n",
             "path = \"../billing\"\n        accept_unverified = { Billing = [\"schema_agreement\", \"encoding_agreement\"] }\n",
@@ -463,7 +434,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let manifest = "congregation app\nspecification_version = 1\n\n\
             dependencies = {\n    billing = {\n        path = \"../billing\"\n    }\n}\n";
-        for (path, text) in [
+        crate::test_support::write_tree(Path::new("/"), [
             (root.join("app/config.idp"), manifest),
             (root.join("app/src/models.ids"), "struct Main {\n    id: u64\n}\n"),
             (root.join("money/config.idp"), "congregation money\nspecification_version = 1\n"),
@@ -479,10 +450,7 @@ mod tests {
                 "use money::types::Amount\n\n@handshake = \"none\"\n@unverified = \"the 2009 gateway\"\n\
                  protocol Billing {\n    function charge(amount: Amount);\n}\n",
             ),
-        ] {
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, text).unwrap();
-        }
+        ]);
 
         let found = manifest_diagnostics(&root.join("app"), manifest);
         assert_eq!(found.len(), 1, "{found:?}");
