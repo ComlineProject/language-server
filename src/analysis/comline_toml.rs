@@ -111,6 +111,9 @@ pub struct Context {
     pub schemas: Option<Vec<(String, Vec<FrozenUnit>)>>,
     /// The package's `wire.format`.
     pub wire_format: String,
+    /// The names the package gives its dependencies: those whose manifests
+    /// are in view, sorted.
+    pub dependencies: Vec<String>,
     /// `comline.toml`'s directory, for `generator` paths. `None`: unchecked.
     pub base_dir: Option<PathBuf>,
 }
@@ -135,7 +138,11 @@ impl Context {
                     .dependency()
                     .map(str::to_string)
                     .unwrap_or_else(|| THIS_PACKAGE.to_string());
-                if file.dependency().is_none() {
+                if let Some(name) = file.dependency() {
+                    if !context.dependencies.iter().any(|d| d == name) {
+                        context.dependencies.push(name.to_string());
+                    }
+                } else {
                     context.has_manifest = true;
                     context.languages = source::declared_languages(text);
                     wire = source::declared_wire(text);
@@ -178,6 +185,7 @@ impl Context {
                 None => complete = false,
             }
         }
+        context.dependencies.sort();
         if complete {
             // As core's compiler freezes them, and each framing judged by
             // its declaration's frozen facts, as `comline generation` does.
@@ -1195,6 +1203,7 @@ fn generation_problems(
         // request is the package's and `async`, and no `resolved`.
         let request = generation::request(
             schemas.clone(),
+            context.dependencies.clone(),
             &context.wire_format,
             framings.clone(),
             async_api,
@@ -1279,6 +1288,7 @@ mod tests {
     fn rust_package() -> Context {
         Context {
             has_manifest: true,
+            dependencies: vec![],
             declared: vec![],
             languages: vec![DeclaredLanguage {
                 language: "rust".into(),
