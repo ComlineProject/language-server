@@ -276,7 +276,11 @@ pub fn connection_diagnostics(project: &Project, doc: usize) -> Vec<Diagnostic> 
         .into_iter()
         .filter(|d| d.code == checks::NO_PACKAGE_CONNECTION)
         .collect();
-    found.extend(checks::method_name_clashes(&request.schemas, &framings));
+    found.extend(checks::method_name_clashes_among(
+        &request.schemas,
+        &request.dependencies,
+        &framings,
+    ));
 
     // The check names a protocol by path (`app::Chat`); here it's the name in
     // this file's own namespace.
