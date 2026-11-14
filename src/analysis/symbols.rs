@@ -466,7 +466,7 @@ protocol UserService {
             // Every other position a name appears in.
             ("f: Test", Namespace::Declaration),
             ("function f() ! Test;", Namespace::Declaration),
-            ("use types::Test", Namespace::Declaration),
+            ("use package::types::Test", Namespace::Declaration),
             ("@deprecated = Test", Namespace::Declaration),
         ];
         for (source, expected) in cases {
@@ -479,7 +479,7 @@ protocol UserService {
     fn declaration_range_is_the_declared_name_not_an_earlier_substring() {
         // `User` appears first inside `UserProfile`, then in the `use`
         // line, then in a docstring - none of them are the declaration.
-        let source = "use types::User\n\nstruct UserProfile {\n    id: u64\n}\n\n/// The User record\nstruct User {\n    name: string\n}\n";
+        let source = "use package::types::User\n\nstruct UserProfile {\n    id: u64\n}\n\n/// The User record\nstruct User {\n    name: string\n}\n";
         let uri = Url::parse("file:///test.ids").unwrap();
         let result = parser::parse(source).unwrap();
 

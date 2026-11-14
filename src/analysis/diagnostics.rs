@@ -649,6 +649,9 @@ pub fn project_diagnostics(project: &Project, doc: usize) -> Vec<Diagnostic> {
             .iter()
             .map(|m| missing_import_diagnostic(here.source, m)),
     );
+    // Core's own error for a bare path to one of the package's schemas, with
+    // its fix (`package::` written in front), carried to the quick fix.
+    diagnostics.extend(check.bare_own.iter().map(|d| from_core(here.source, d)));
     diagnostics.extend(
         check
             .unresolved
@@ -1551,7 +1554,7 @@ struct User {
         );
         let messages = |call: &str| -> Vec<String> {
             let api = format!(
-                "use rules::AtLeast\n\nstruct S {{\n    @validators = [{call}]\n    n: u32\n}}\n"
+                "use package::rules::AtLeast\n\nstruct S {{\n    @validators = [{call}]\n    n: u32\n}}\n"
             );
             project_messages(&[("file:///pkg/src/api.ids", &api), rules])
                 .into_iter()
@@ -1589,7 +1592,7 @@ struct User {
              validator NonEmpty for string {\n    validate {\n        assert(value.length > 0, f\"{value.name} is empty\")\n    }\n}\n",
         );
         let bad = project_messages(&[
-            ("file:///pkg/src/api.ids", "use rules::{Count, NonEmpty}\n\nstruct S {\n    @validators = [NonEmpty()]\n    n: Count\n}\n"),
+            ("file:///pkg/src/api.ids", "use package::rules::{Count, NonEmpty}\n\nstruct S {\n    @validators = [NonEmpty()]\n    n: Count\n}\n"),
             RULES,
         ]);
         assert_eq!(bad.len(), 1, "{bad:?}");
@@ -1605,7 +1608,7 @@ struct User {
         );
 
         let ok = project_messages(&[
-            ("file:///pkg/src/api.ids", "use rules::{Name, NonEmpty}\n\nstruct S {\n    @validators = [NonEmpty()]\n    n: Name\n}\n"),
+            ("file:///pkg/src/api.ids", "use package::rules::{Name, NonEmpty}\n\nstruct S {\n    @validators = [NonEmpty()]\n    n: Name\n}\n"),
             RULES,
         ]);
         assert!(ok.is_empty(), "{ok:?}");
@@ -1647,7 +1650,7 @@ struct User {
     fn an_array_of_an_imported_dataless_type_is_an_error() {
         const API: (&str, &str) = (
             "file:///pkg/src/api.ids",
-            "use shapes::Empty\n\nstruct Batch {\n    items: Empty[]\n}\n",
+            "use package::shapes::Empty\n\nstruct Batch {\n    items: Empty[]\n}\n",
         );
         let messages = |shapes: &str, more: &str| {
             project_messages(&[
@@ -1662,14 +1665,14 @@ struct User {
         assert_eq!(
             dataless(&bad),
             ["an array of `Empty` carries only its length: `Empty` has no data, so each element \
-              would take no bytes — Struct 'Batch', field 'items' — give `Empty` a field, or use a \
+              would take no bytes — Struct 'Batch', field 'items' — give `Empty` a field, or use package::a \
               count (`u32`) instead"]
         );
         assert_eq!((bad[0].2, bad[0].3), (3, 4), "at the field");
 
         // Through an alias and on into a third file.
         let through = messages(
-            "use more::Nothing\n\ntype Empty = Nothing[2]\n",
+            "use package::more::Nothing\n\ntype Empty = Nothing[2]\n",
             "struct Nothing {\n    unit: ()\n}\n",
         );
         assert_eq!(dataless(&through).len(), 1, "{through:?}");
@@ -1678,7 +1681,7 @@ struct User {
         // third file's type, a dynamic array.
         assert!(messages("struct Empty {\n    note?: ()\n}\n", "").is_empty());
         assert!(messages(
-            "use more::Nothing\n\nstruct Empty {\n    n: Nothing\n}\n",
+            "use package::more::Nothing\n\nstruct Empty {\n    n: Nothing\n}\n",
             "struct Nothing {\n    n: u8\n}\n"
         )
         .is_empty());
@@ -1709,7 +1712,7 @@ struct User {
         let messages = project_messages(&[
             (
                 "file:///pkg/src/api.ids",
-                "use shapes::Empty\n\nstruct Batch {\n    items: Empty[]\n}\n",
+                "use package::shapes::Empty\n\nstruct Batch {\n    items: Empty[]\n}\n",
             ),
             (
                 "file:///pkg/src/shapes.ids",
@@ -1743,14 +1746,14 @@ struct User {
         .collect();
         assert_eq!(
             messages,
-            ["`Bounds` is declared in `rules.ids` but not imported here — add `use rules::Bounds`"]
+            ["`Bounds` is declared in `rules.ids` but not imported here — add `use package::rules::Bounds`"]
         );
 
         // Imported, it's found - and then its target is what's wrong.
         let messages: Vec<String> = project_messages(&[
             (
                 "file:///pkg/src/api.ids",
-                "use rules::Bounds\n\n@validators = [Bounds()]\ntype FixedNum = u8[2]\n",
+                "use package::rules::Bounds\n\n@validators = [Bounds()]\ntype FixedNum = u8[2]\n",
             ),
             BOUNDS,
         ])
@@ -1827,10 +1830,10 @@ struct User {
     fn use_forms_core_cannot_expand_alone_are_not_unknown_types() {
         // Each of these was reported as "Unknown type 'Message'" on its own.
         for source in [
-            "use types::*\n\nstruct S {\n    m: Message\n}\n",
-            "use types::{Message, Other}\n\nstruct S {\n    m: Message\n}\n",
-            "use types\n\nstruct S {\n    m: Message\n}\n",
-            "use types\n\nstruct S {\n    m: types::Message\n}\n",
+            "use package::types::*\n\nstruct S {\n    m: Message\n}\n",
+            "use package::types::{Message, Other}\n\nstruct S {\n    m: Message\n}\n",
+            "use package::types\n\nstruct S {\n    m: Message\n}\n",
+            "use package::types\n\nstruct S {\n    m: types::Message\n}\n",
         ] {
             assert_eq!(messages(source), Vec::<String>::new(), "{source}");
         }
@@ -1877,7 +1880,7 @@ struct User {
         assert_eq!(
             found,
             vec![(
-                "`Message` is declared in `types.ids` but not imported here — add `use types::Message`".to_string(),
+                "`Message` is declared in `types.ids` but not imported here — add `use package::types::Message`".to_string(),
                 Some(NumberOrString::String(MISSING_IMPORT.to_string())),
                 1,
                 7
@@ -1887,7 +1890,7 @@ struct User {
 
     #[test]
     fn a_glob_of_a_project_file_is_expanded_with_what_it_declares() {
-        let chat = "use types::*\n\nstruct S {\n    m: Message\n    n: Nope\n}\n";
+        let chat = "use package::types::*\n\nstruct S {\n    m: Message\n    n: Nope\n}\n";
         let found = project_messages(&[("file:///pkg/src/chat.ids", chat), TYPES]);
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].0.starts_with("Unknown type 'Nope'"), "{found:?}");
@@ -1895,12 +1898,12 @@ struct User {
 
     #[test]
     fn using_the_real_name_of_an_aliased_import_says_so() {
-        let chat = "use types::Message as Msg\n\nstruct S {\n    m: Message\n}\n";
+        let chat = "use package::types::Message as Msg\n\nstruct S {\n    m: Message\n}\n";
         let found = project_messages(&[("file:///pkg/src/chat.ids", chat), TYPES]);
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(
             found[0].0,
-            "`Message` is imported here as `Msg` — write `Msg`, or add `use types::Message`"
+            "`Message` is imported here as `Msg` — write `Msg`, or add `use package::types::Message`"
         );
     }
 
@@ -2583,7 +2586,7 @@ mod unverified_judgement_tests {
         let chat_uri = Url::parse("file:///pkg/src/chat.ids").unwrap();
 
         // Marked: it gives bounded size up, so the marker isn't for nothing.
-        let marked = "use models::Note\n\n@unverified = \"notes are free text\"\n\
+        let marked = "use package::models::Note\n\n@unverified = \"notes are free text\"\n\
             protocol Chat {\n    function post(note: Note);\n}\n";
         let found = found(&files(marked), &chat_uri);
         assert!(!nothing_given_up(&found), "{found:?}");
@@ -2731,5 +2734,222 @@ mod unverified_judgement_tests {
         let chat = "@unverified = \"for nothing\"\n\
             protocol Chat {\n    function ping(n: u32) -> u32;\n}\n";
         assert!(nothing_given_up(&package(ALLOWS, chat)));
+    }
+}
+
+/// A `use` that reaches one of the package's own schemas by a bare path is
+/// core's error `import::bare-own-schema-path` (ComlineProject/language-server#122,
+/// core#282), with core's fix: `package::` written in front of the path.
+#[cfg(test)]
+mod bare_own_path_tests {
+    use super::*;
+    use lsp_types::NumberOrString;
+    use crate::analysis::source::SourceFile;
+    use crate::util::position_to_offset;
+    use comline_core::schema::ir::compiler::import_resolver::BARE_OWN_SCHEMA_PATH;
+
+    const MANIFEST: &str = "congregation pkg\nspecification_version = 1\n\n\
+        dependencies = {\n    shared = {\n        path = \"../shared\"\n    }\n}\n";
+
+    fn local(path: &str, text: &str) -> SourceFile {
+        SourceFile::local(
+            Url::parse(&format!("file:///pkg/{path}")).unwrap(),
+            text.to_string(),
+        )
+    }
+
+    /// The package: manifest, `types`, `api::common`, a `shared` dependency,
+    /// and the file under test, `src/chat.ids`.
+    fn package(chat: &str) -> Vec<SourceFile> {
+        vec![
+            local("config.idp", MANIFEST),
+            local("src/chat.ids", chat),
+            local(
+                "src/types.ids",
+                "struct Message {\n    text: string\n}\n\nenum Kind {\n    A\n}\n",
+            ),
+            local("src/api/common.ids", "struct Error {\n    code: u32\n}\n"),
+            SourceFile::of_dependency(
+                Url::parse("file:///shared/src/models.ids").unwrap(),
+                "struct Thing {\n    id: u64\n}\n".to_string(),
+                "shared",
+                vec!["shared".to_string(), "models".to_string()],
+            ),
+        ]
+    }
+
+    fn diagnostics_of(files: &[SourceFile]) -> Vec<Diagnostic> {
+        let project = Project::new(files);
+        let doc = project.index_of(&files[1].uri).expect("chat.ids parses");
+        project_diagnostics(&project, doc)
+    }
+
+    fn is_bare(d: &Diagnostic) -> bool {
+        d.code == Some(NumberOrString::String(BARE_OWN_SCHEMA_PATH.id.to_string()))
+    }
+
+    /// `source` with the diagnostic's quick fix applied.
+    fn fixed(source: &str, d: &Diagnostic) -> String {
+        let edits: Vec<TextEdit> =
+            serde_json::from_value(d.data.as_ref().unwrap()[FIX_DATA]["edits"].clone()).unwrap();
+        assert_eq!(edits.len(), 1, "{edits:?}");
+        let at = position_to_offset(source, edits[0].range.start).unwrap();
+        assert_eq!(edits[0].range.start, edits[0].range.end, "an insertion");
+        format!("{}{}{}", &source[..at], edits[0].new_text, &source[at..])
+    }
+
+    #[test]
+    fn the_code_is_the_one_core_exports() {
+        assert_eq!(BARE_OWN_SCHEMA_PATH.id, "import::bare-own-schema-path");
+    }
+
+    #[test]
+    fn a_bare_path_to_an_own_schema_is_core_s_error_worded_as_core_words_it() {
+        let chat = "use types::Message\n\nstruct S {\n    m: Message\n}\n";
+        let found = diagnostics_of(&package(chat));
+        assert_eq!(found.len(), 1, "{found:#?}");
+        let d = &found[0];
+        assert!(is_bare(d), "{d:?}");
+        assert_eq!(d.severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(
+            d.message,
+            "'types::Message' is one of this package's own schemas, reached by a bare path \
+             — write `package::types::Message`: a package's own schemas are reached as \
+             `package::...`, `parent::...` or `self::...`"
+        );
+        assert_eq!(
+            (d.range.start.line, d.range.start.character, d.range.end.line),
+            (0, 0, 0),
+            "the `use` declaration"
+        );
+        assert_eq!(fix_of(d)["title"], "Write `package::types::Message`");
+    }
+
+    fn fix_of(d: &Diagnostic) -> &serde_json::Value {
+        &d.data.as_ref().expect("data")[FIX_DATA]
+    }
+
+    /// Every form of a `use`: the error, and the fix makes it go away.
+    #[test]
+    fn every_form_is_an_error_and_its_fix_clears_it() {
+        for header in [
+            "use types::Message",
+            "use types::Message as M",
+            "use types",
+            "use types::*",
+            "use types::{Message, Kind}",
+            "use api::common::Error",
+        ] {
+            let chat = format!("{header}\n\nstruct S {{\n    id: u64\n}}\n");
+            let found = diagnostics_of(&package(&chat));
+            let bare: Vec<_> = found.iter().filter(|d| is_bare(d)).collect();
+            assert_eq!(bare.len(), 1, "`{header}`: {found:#?}");
+            assert_eq!(found.len(), 1, "nothing else is said of `{header}`: {found:#?}");
+
+            let repaired = fixed(&chat, bare[0]);
+            assert_eq!(repaired, chat.replacen("use ", "use package::", 1), "`{header}`");
+            let after = diagnostics_of(&package(&repaired));
+            assert!(after.is_empty(), "`{header}` fixed: {after:#?}");
+        }
+    }
+
+    #[test]
+    fn a_bare_path_into_a_nested_directory_gets_the_fix_too() {
+        let chat = "use api::common::Error\n\nstruct S {\n    e: Error\n}\n";
+        let found = diagnostics_of(&package(chat));
+        assert_eq!(fix_of(&found[0])["title"], "Write `package::api::common::Error`");
+    }
+
+    #[test]
+    fn a_bare_path_is_an_error_without_a_manifest_too() {
+        let files = vec![
+            local("src/chat.ids", "use types::Message\n\nstruct S {\n    m: Message\n}\n"),
+            local("src/types.ids", "struct Message {\n    text: string\n}\n"),
+        ];
+        let project = Project::new(&files);
+        let found = project_diagnostics(&project, 0);
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!(is_bare(&found[0]), "{found:#?}");
+    }
+
+    /// Core stops at the bare path: a name the schema doesn't declare is said
+    /// once the path is written right.
+    #[test]
+    fn a_bare_path_to_a_missing_item_is_only_the_bare_error() {
+        let chat = "use types::Nope\n\nstruct S {\n    id: u64\n}\n";
+        let found = diagnostics_of(&package(chat));
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!(is_bare(&found[0]), "{found:#?}");
+
+        let after = diagnostics_of(&package(&fixed(chat, &found[0])));
+        assert_eq!(after.len(), 1, "{after:#?}");
+        assert_eq!(
+            after[0].code,
+            Some(NumberOrString::String(UNRESOLVED_IMPORT.to_string()))
+        );
+    }
+
+    #[test]
+    fn the_prefixes_a_dependency_and_std_are_not_bare() {
+        for header in [
+            "use package::types::Message",
+            "use package::types::*",
+            "use shared::models::Thing",
+            "use std::http::Request",
+        ] {
+            let chat = format!("{header}\n\nstruct S {{\n    id: u64\n}}\n");
+            let mut files = package(&chat);
+            files.extend(crate::analysis::stdlib::files(&crate::analysis::stdlib::root()));
+            let found = diagnostics_of(&files);
+            assert!(
+                !found.iter().any(is_bare),
+                "`{header}` is not a bare path to an own schema: {found:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_relative_path_is_not_bare() {
+        let files = vec![
+            local("config.idp", MANIFEST),
+            local(
+                "src/api/chat.ids",
+                "use parent::common::Error\nuse self::inner::Deep\n\nstruct S {\n    e: Error\n    d: Deep\n}\n",
+            ),
+            local("src/api/common.ids", "struct Error {\n    code: u32\n}\n"),
+            local("src/api/chat/inner.ids", "struct Deep {\n    n: u8\n}\n"),
+        ];
+        let project = Project::new(&files);
+        let found = project_diagnostics(&project, 0);
+        assert!(!found.iter().any(is_bare), "{found:#?}");
+    }
+
+    /// A typo reaches nothing: `import::unresolved`, with its "did you mean".
+    #[test]
+    fn a_path_that_reaches_nothing_is_unresolved_not_bare() {
+        let chat = "use typse::Message\n\nstruct S {\n    id: u64\n}\n";
+        let found = diagnostics_of(&package(chat));
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert_eq!(
+            found[0].code,
+            Some(NumberOrString::String(UNRESOLVED_IMPORT.to_string()))
+        );
+    }
+
+    /// A dependency's own schemas are written against their own package: a
+    /// bare path there is not this package's to report.
+    #[test]
+    fn a_dependencys_own_files_are_not_checked() {
+        let mut files = package("struct S {\n    id: u64\n}\n");
+        files.push(SourceFile::of_dependency(
+            Url::parse("file:///shared/src/other.ids").unwrap(),
+            "use models::Thing\n\nstruct Holder {\n    t: Thing\n}\n".to_string(),
+            "shared",
+            vec!["shared".to_string(), "other".to_string()],
+        ));
+        let project = Project::new(&files);
+        let doc = project.docs.len() - 1;
+        let found = project_diagnostics(&project, doc);
+        assert!(!found.iter().any(is_bare), "{found:#?}");
     }
 }

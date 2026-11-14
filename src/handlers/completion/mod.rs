@@ -9,6 +9,7 @@ mod tests;
 use std::collections::BTreeSet;
 
 use crate::analysis::import_check::{self, declares_type, file_name, is_type_kind, Target};
+use crate::analysis::import_check::use_path;
 use crate::analysis::imports::{self, add_use_edit, ResolvedUse};
 use crate::analysis::project::{Project, ProjectDoc};
 use crate::analysis::source::ProjectSource;
@@ -302,7 +303,9 @@ fn unimported_item(
     source: &str,
     item: impl FnOnce(String) -> CompletionItem,
 ) -> CompletionItem {
-    let path = format!("{}::{}", doc.namespace.join("::"), name);
+    // The package's own schemas are reached as `package::...`, a dependency's
+    // and `std`'s by their own names.
+    let path = use_path(doc.dependency.is_none(), &doc.namespace, name);
     let mut item = item(format!("from {} — adds `use {path}`", origin(doc)));
     item.sort_text = Some(match doc.dependency {
         Some(_) => format!("~~{name}"),

@@ -6,7 +6,7 @@ A Language Server Protocol (LSP) implementation for [Comline](https://github.com
 
 ### ✅ Fully Implemented
 
-- **Diagnostics** - Real-time syntax errors plus `comline-core`'s validation pass (undefined types, duplicate declarations, ...) — the same checks `comline build` runs. A type from another file of the package used without a `use` gets a specific error with an **"Add `use ...`" quick fix**
+- **Diagnostics** - Real-time syntax errors plus `comline-core`'s validation pass (undefined types, duplicate declarations, ...) — the same checks `comline build` runs. A type from another file of the package used without a `use` gets a specific error with an **"Add `use ...`" quick fix**; a `use` that reaches one of the package's own schemas by a bare path (`use types::User` instead of `use package::types::User`) is an error with a **"Write `package::…`" quick fix**
 - **Whole-package analysis** - every `.ids` file in a package's `src/` takes part, open or not, kept current through file watching; each package only sees its own files
 - **Dependency packages** - the dependencies `config.idp` declares are indexed (path dependencies, and git pins `comline check` has fetched; the editor never fetches), so imports, hover, go-to-definition and completion work into them under the dependency's name. Unresolved imports are errors, worded like `comline check`'s, with a "did you mean" quick fix; imports of a dependency that isn't fetched yet are marked as not checked, and its `config.idp` entry says why. A dependency whose `@unverified` protocols aren't accepted is an error on its entry, with a quick fix that writes the `accept_unverified` line `comline deps accept` would
 - **Standard library** - `use std::…` resolves against the std embedded in `comline-core`, like a read-only dependency: hover, go-to-definition (into virtual `comline-std:` documents, whose text clients fetch with the `comline/stdSource` request), completion, and unresolved-import errors worded like `comline check`'s (`std has no schema matching 'std::htp::Request' - did you mean 'std::http'?`)
@@ -232,11 +232,19 @@ A `use` path completes one segment at a time, resolved the way
 `comline check` resolves it:
 
 ```comline
-use                        // → the package's namespaces, its dependencies, self / parent / package, std
+use                        // → its dependencies, self / parent / package, std
+use package::              // → the package's own schemas
 use shared::               // → what's under the `shared` dependency
-use api::common::          // → what `api::common` declares, then `*` and `{…}`
-use api::common::{Error,   // → what `api::common` declares that isn't listed yet
+use package::api::common:: // → what `api::common` declares, then `*` and `{…}`
+use package::api::common::{Error,   // → what `api::common` declares that isn't listed yet
 ```
+
+The package's own schemas are reached only as `package::…`, `parent::…` or
+`self::…`, so they are offered under those and not at the top. A bare path to
+one of them (`use types::User`) is the error `import::bare-own-schema-path`,
+the same one `comline check` reports, and its quick fix writes `package::` in
+front. The "Add `use …`" fix and a type's auto-import write `package::…` for the
+package's own schemas, and a dependency's or `std`'s path as it is.
 
 A dependency that isn't fetched yet is offered, marked as such, with nothing
 under it until `comline check` fetches it.

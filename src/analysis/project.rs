@@ -798,8 +798,8 @@ mod tests {
         let all = files(&[
             ("file:///types.ids", "struct Message {\n    text: string\n}\n"),
             ("file:///other.ids", "struct Message {\n    other: bool\n}\n"),
-            ("file:///chat.ids", "use types::Message\n\nprotocol Chat {\n    function send(Message) -> Message;\n}\n"),
-            ("file:///unrelated.ids", "use other::Message\n\nstruct S {\n    m: Message\n}\n"),
+            ("file:///chat.ids", "use package::types::Message\n\nprotocol Chat {\n    function send(Message) -> Message;\n}\n"),
+            ("file:///unrelated.ids", "use package::other::Message\n\nstruct S {\n    m: Message\n}\n"),
         ]);
         let project = Project::new(all.iter());
         let target = project
@@ -827,7 +827,7 @@ mod tests {
             ),
             (
                 "file:///chat.ids",
-                "use types::Message as Msg\n\nstruct S {\n    m: Msg\n}\n",
+                "use package::types::Message as Msg\n\nstruct S {\n    m: Msg\n}\n",
             ),
         ]);
         let project = Project::new(all.iter());
@@ -875,7 +875,7 @@ mod tests {
     fn a_local_declaration_shadows_an_import() {
         let all = files(&[
             ("file:///types.ids", "struct Message {\n    text: string\n}\n"),
-            ("file:///chat.ids", "use types::Message\n\nstruct Message {\n    local: bool\n}\n\nstruct S {\n    m: Message\n}\n"),
+            ("file:///chat.ids", "use package::types::Message\n\nstruct Message {\n    local: bool\n}\n\nstruct S {\n    m: Message\n}\n"),
         ]);
         let project = Project::new(all.iter());
         let target = project

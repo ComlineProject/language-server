@@ -416,7 +416,7 @@ mod tests {
 
     #[test]
     fn a_missing_import_gets_an_add_use_fix() {
-        let chat = "use other::Thing\n\nstruct S {\n    m: Message\n}\n";
+        let chat = "use package::other::Thing\n\nstruct S {\n    m: Message\n}\n";
         let chat_uri = Url::parse("file:///pkg/src/chat.ids").unwrap();
         let others = [(
             Url::parse("file:///pkg/src/types.ids").unwrap(),
@@ -429,8 +429,8 @@ mod tests {
         assert_eq!(
             titles_and_edits(actions),
             vec![(
-                "Add `use types::Message`".to_string(),
-                "use types::Message\n".to_string(),
+                "Add `use package::types::Message`".to_string(),
+                "use package::types::Message\n".to_string(),
                 1
             )]
         );
@@ -532,7 +532,7 @@ mod tests {
         .collect();
         assert_eq!(
             titles,
-            vec!["Add `use types::Message`", "Add `use legacy::Message`"]
+            vec!["Add `use package::types::Message`", "Add `use package::legacy::Message`"]
         );
     }
 
@@ -684,7 +684,7 @@ mod duplicate_name_tests {
             ),
             SourceFile::local(
                 Url::parse("file:///pkg/src/other.ids").unwrap(),
-                "use chat::Test\n\nstruct Holder {\n    t: Test\n}\n".to_string(),
+                "use package::chat::Test\n\nstruct Holder {\n    t: Test\n}\n".to_string(),
             ),
         ];
         let action = actions(THREE_TESTS, &at(0, 8), &others)
@@ -925,5 +925,158 @@ mod duplicate_name_tests {
             };
             assert!(fixes(&uri, vec![plain, Diagnostic::default()]).is_empty());
         }
+    }
+}
+
+/// The two sides of the own-schema path rule (ComlineProject/language-server#122):
+/// the quick fix for a bare path, and the "Add `use ...`" fix writing what the
+/// rule asks for.
+#[cfg(test)]
+mod own_schema_path_tests {
+    use super::*;
+    use crate::analysis::diagnostics::project_diagnostics;
+    use crate::analysis::source::SourceFile;
+    use lsp_types::{CodeActionContext, Position, TextDocumentIdentifier};
+
+    fn params(uri: &Url, range: Range, diagnostics: Vec<Diagnostic>) -> CodeActionParams {
+        CodeActionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            range,
+            context: CodeActionContext {
+                diagnostics,
+                only: None,
+                trigger_kind: None,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        }
+    }
+
+    fn actions_of(actions: Vec<CodeActionOrCommand>) -> Vec<CodeAction> {
+        actions
+            .into_iter()
+            .map(|a| match a {
+                CodeActionOrCommand::CodeAction(a) => a,
+                other => panic!("expected a code action, got {other:?}"),
+            })
+            .collect()
+    }
+
+    fn local(path: &str, text: &str) -> SourceFile {
+        SourceFile::local(
+            Url::parse(&format!("file:///pkg/{path}")).unwrap(),
+            text.to_string(),
+        )
+    }
+
+    /// The edits `action` makes to `uri`, applied to `source`.
+    fn apply(source: &str, uri: &Url, action: &CodeAction) -> String {
+        let changes = action.edit.as_ref().unwrap().changes.as_ref().unwrap();
+        let mut edits = changes[uri].clone();
+        edits.sort_by_key(|e| std::cmp::Reverse((e.range.start.line, e.range.start.character)));
+        let mut out = source.to_string();
+        for edit in edits {
+            let start = crate::util::position_to_offset(&out, edit.range.start).unwrap();
+            let end = crate::util::position_to_offset(&out, edit.range.end).unwrap();
+            out.replace_range(start..end, &edit.new_text);
+        }
+        out
+    }
+
+    #[test]
+    fn a_bare_path_to_an_own_schema_gets_a_write_package_fix() {
+        let chat = "use types::Message\n\nstruct S {\n    m: Message\n}\n";
+        let uri = Url::parse("file:///pkg/src/chat.ids").unwrap();
+        let others = [local(
+            "src/types.ids",
+            "struct Message {\n    text: string\n}\n",
+        )];
+
+        let diagnostics = {
+            let mut all = vec![SourceFile::local(uri.clone(), chat.to_string())];
+            all.extend(others.iter().cloned());
+            let project = Project::new(&all);
+            project_diagnostics(&project, 0)
+        };
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+
+        let cursor = Range::new(Position::new(0, 6), Position::new(0, 6));
+        let fixes = actions_of(get_code_actions_with_project(
+            chat,
+            &uri,
+            &params(&uri, cursor, diagnostics.clone()),
+            &others,
+        ));
+        assert_eq!(fixes.len(), 1, "{fixes:#?}");
+        let fix = &fixes[0];
+        assert_eq!(fix.title, "Write `package::types::Message`");
+        assert_eq!(fix.kind, Some(CodeActionKind::QUICKFIX));
+        assert_eq!(fix.is_preferred, Some(true));
+        assert_eq!(fix.diagnostics.as_deref(), Some(&diagnostics[..]));
+        assert_eq!(
+            apply(chat, &uri, fix),
+            "use package::types::Message\n\nstruct S {\n    m: Message\n}\n"
+        );
+    }
+
+    #[test]
+    fn the_fix_is_not_offered_away_from_the_use() {
+        let chat = "use types::Message\n\nstruct S {\n    m: Message\n}\n";
+        let uri = Url::parse("file:///pkg/src/chat.ids").unwrap();
+        let others = [local(
+            "src/types.ids",
+            "struct Message {\n    text: string\n}\n",
+        )];
+        let mut all = vec![SourceFile::local(uri.clone(), chat.to_string())];
+        all.extend(others.iter().cloned());
+        let diagnostics = project_diagnostics(&Project::new(&all), 0);
+
+        let away = Range::new(Position::new(3, 8), Position::new(3, 8));
+        let fixes = actions_of(get_code_actions_with_project(
+            chat,
+            &uri,
+            &params(&uri, away, diagnostics),
+            &others,
+        ));
+        assert!(fixes.is_empty(), "{fixes:#?}");
+    }
+
+    #[test]
+    fn add_use_writes_package_for_an_own_schema_and_the_dependencys_own_name_for_a_dependency() {
+        let chat = "struct S {\n    m: Message\n    e: Error\n    t: Thing\n}\n";
+        let uri = Url::parse("file:///pkg/src/chat.ids").unwrap();
+        let others = [
+            local(
+                "config.idp",
+                "congregation app\nspecification_version = 1\n\ndependencies = {\n    shared = {\n        path = \"../shared\"\n    }\n}\n",
+            ),
+            local("src/types.ids", "struct Message {\n    text: string\n}\n"),
+            local("src/api/common.ids", "struct Error {\n    code: u32\n}\n"),
+            SourceFile::of_dependency(
+                Url::parse("file:///shared/src/models.ids").unwrap(),
+                "struct Thing {\n    id: u64\n}\n".to_string(),
+                "shared",
+                vec!["shared".to_string(), "models".to_string()],
+            ),
+        ];
+
+        let whole = Range::new(Position::new(0, 0), Position::new(5, 0));
+        let titles: Vec<String> = actions_of(get_code_actions_with_project(
+            chat,
+            &uri,
+            &params(&uri, whole, vec![]),
+            &others,
+        ))
+        .into_iter()
+        .map(|a| a.title)
+        .collect();
+        assert_eq!(
+            titles,
+            [
+                "Add `use package::types::Message`",
+                "Add `use package::api::common::Error`",
+                "Add `use shared::models::Thing`",
+            ]
+        );
     }
 }

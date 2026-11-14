@@ -181,7 +181,7 @@ struct User {
     #[test]
     fn test_goto_definition_in_another_file_via_use() {
         let chat_source =
-            "use types::Message\n\nprotocol Chat {\n    function send() -> Message;\n}\n";
+            "use package::types::Message\n\nprotocol Chat {\n    function send() -> Message;\n}\n";
         let types_source = "struct Message {\n    text: string\n}\n";
 
         let chat_uri = Url::parse("file:///chat.ids").unwrap();
@@ -201,7 +201,7 @@ struct User {
 
     #[test]
     fn test_goto_definition_two_siblings_same_name_picks_the_imported_one() {
-        let active_source = "use b::Message\n\nprotocol P {\n    function f() -> Message;\n}\n";
+        let active_source = "use package::b::Message\n\nprotocol P {\n    function f() -> Message;\n}\n";
         let a_source = "struct Message {\n    from_a: bool\n}\n";
         let b_source = "struct Message {\n    from_b: bool\n}\n";
 
@@ -226,7 +226,7 @@ struct User {
     #[test]
     fn test_goto_definition_through_an_as_alias() {
         let active_source =
-            "use types::Message as Msg\n\nprotocol P {\n    function f() -> Msg;\n}\n";
+            "use package::types::Message as Msg\n\nprotocol P {\n    function f() -> Msg;\n}\n";
         let types_source =
             "struct Other {\n    x: bool\n}\n\nstruct Message {\n    text: string\n}\n";
 
@@ -249,17 +249,17 @@ struct User {
 
     #[test]
     fn test_goto_definition_from_the_use_line_itself() {
-        let active_source = "use types::Message\n\nstruct S {\n    m: Message\n}\n";
+        let active_source = "use package::types::Message\n\nstruct S {\n    m: Message\n}\n";
         let types_source = "struct Message {\n    text: string\n}\n";
 
         let active_uri = Url::parse("file:///active.ids").unwrap();
         let types_uri = Url::parse("file:///types.ids").unwrap();
 
-        // "Message" in `use types::Message`
+        // "Message" in `use package::types::Message`
         let location = scalar(find_definition_with_project(
             active_source,
             &active_uri,
-            Position::new(0, 13),
+            Position::new(0, 22),
             &[(types_uri.clone(), types_source.to_string())],
         ));
 
@@ -288,7 +288,7 @@ struct User {
 
     #[test]
     fn test_goto_definition_prefers_a_local_declaration() {
-        let active_source = "use types::Message\n\nstruct Message {\n    local: bool\n}\n\nstruct S {\n    m: Message\n}\n";
+        let active_source = "use package::types::Message\n\nstruct Message {\n    local: bool\n}\n\nstruct S {\n    m: Message\n}\n";
         let types_source = "struct Message {\n    text: string\n}\n";
 
         let active_uri = Url::parse("file:///active.ids").unwrap();
@@ -375,7 +375,7 @@ struct User {
     #[test]
     fn a_module_segment_jumps_to_its_own_schema_file() {
         let location =
-            definition_in("chat.ids", "use types::User\n", "types").expect("module definition");
+            definition_in("chat.ids", "use package::types::User\n", "types").expect("module definition");
         assert_eq!(location.uri.as_str(), "file:///pkg/src/types.ids");
         assert_eq!(location.range.start, Position::new(0, 0));
     }
@@ -401,7 +401,7 @@ struct User {
         // `api` has both a schema (`api.ids`) and a deeper module
         // (`api::common`) - the schema is what a jump lands on.
         let location =
-            definition_in("chat.ids", "use api::common::Error\n", "api").expect("api.ids exists");
+            definition_in("chat.ids", "use package::api::common::Error\n", "api").expect("api.ids exists");
         assert_eq!(location.uri.as_str(), "file:///pkg/src/api.ids");
     }
 
@@ -415,7 +415,7 @@ struct User {
             "struct Profile {\n    id: u64\n}\n",
         )];
         let uri = Url::parse("file:///pkg/src/chat.ids").unwrap();
-        let source = "use api::v1::user::Profile\n";
+        let source = "use package::api::v1::user::Profile\n";
         let offset = source.find("v1").unwrap();
         let position = crate::util::offset_to_position(source, offset);
         assert!(find_definition_with_project(source, &uri, position, &files).is_none());
@@ -439,7 +439,7 @@ struct User {
     #[test]
     fn a_whole_namespace_import_names_a_module_at_the_end() {
         let location =
-            definition_in("chat.ids", "use types\n", "types").expect("lone word on a use line");
+            definition_in("chat.ids", "use package::types\n", "types").expect("lone word on a use line");
         assert_eq!(location.uri.as_str(), "file:///pkg/src/types.ids");
     }
 

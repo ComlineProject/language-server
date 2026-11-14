@@ -20,8 +20,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use comline_core::diagnostics::Diagnostic as CoreDiagnostic;
 use comline_core::schema::idl::grammar::Declaration;
-use comline_core::schema::ir::compiler::import_resolver::ImportResolver;
+use comline_core::schema::ir::compiler::import_resolver::{
+    absolute_first_segment, check_imports, ImportResolver, BARE_OWN_SCHEMA_PATH,
+};
 use comline_core::schema::ir::frozen::unit::FrozenUnit;
 use lsp_types::SymbolKind;
 
@@ -45,6 +48,10 @@ pub struct ImportCheck {
     /// Each `use` of a declared dependency there are no files for, so it
     /// can't be checked here.
     pub unverified: Vec<UnverifiedImport>,
+    /// Each `use` that reaches one of the package's own schemas by a bare path
+    /// (`use types::User`, for `use types::User`): core's own error
+    /// for it, with its fix - see [`bare_own_schema_paths`].
+    pub bare_own: Vec<CoreDiagnostic>,
 }
 
 /// A `use` that doesn't resolve, the way core's `check_imports` sees it.
@@ -83,14 +90,19 @@ pub struct MissingImport {
 /// A project file a missing name could be imported from.
 pub struct Candidate {
     pub namespace: Vec<String>,
+    /// Whether the file is one of the package's own. Its schemas are reached
+    /// as `package::...`; a dependency's and `std`'s by their own names.
+    pub own: bool,
     /// The file's name, for messages (`types.ids`).
     pub file: String,
 }
 
 impl Candidate {
-    /// The path a `use` for `name` from this file would take: `types::User`.
+    /// The path a `use` for `name` from this file would take:
+    /// `package::types::User` for the package's own schema, `shared::models::Thing`
+    /// for a dependency's.
     pub fn use_path(&self, name: &str) -> String {
-        qualified(&self.namespace, name)
+        use_path(self.own, &self.namespace, name)
     }
 }
 
@@ -212,6 +224,7 @@ pub fn check(project: &Project, doc: usize) -> ImportCheck {
             .filter(|(i, d)| *i != doc && declares(d, name))
             .map(|(_, d)| Candidate {
                 namespace: d.namespace.clone(),
+                own: d.dependency.is_none(),
                 file: file_name(d),
             })
             .collect();
@@ -234,12 +247,14 @@ pub fn check(project: &Project, doc: usize) -> ImportCheck {
         }
     }
 
-    let (unresolved, unverified) = resolution(project, doc);
+    let bare_own = bare_own_schema_paths(project, doc);
+    let (unresolved, unverified) = resolution(project, doc, &bare_own);
     ImportCheck {
         scope,
         missing,
         unresolved,
         unverified,
+        bare_own,
     }
 }
 
@@ -254,7 +269,11 @@ pub fn check(project: &Project, doc: usize) -> ImportCheck {
 /// Only with the package's `config.idp` in the project: without it, the
 /// files at hand may not be the whole package (a single file in the
 /// playground), and nothing could be called unresolved.
-fn resolution(project: &Project, doc: usize) -> (Vec<UnresolvedImport>, Vec<UnverifiedImport>) {
+fn resolution(
+    project: &Project,
+    doc: usize,
+    bare_own: &[CoreDiagnostic],
+) -> (Vec<UnresolvedImport>, Vec<UnverifiedImport>) {
     if !project.has_manifest {
         return (vec![], vec![]);
     }
@@ -284,6 +303,12 @@ fn resolution(project: &Project, doc: usize) -> (Vec<UnresolvedImport>, Vec<Unve
         };
         let span = decl.span;
         let (_, text) = clamped(here.source, span);
+
+        // Core stops at the bare path: the error is that, and nothing more
+        // is said of the `use` until it's written `package::...`.
+        if bare_own.iter().any(|d| d.span == Some(span)) {
+            continue;
+        }
 
         let resolved = match resolver.resolve_namespace(&use_stmt.path, &here.namespace) {
             Ok(resolved) => resolved,
@@ -378,6 +403,88 @@ fn resolution(project: &Project, doc: usize) -> (Vec<UnresolvedImport>, Vec<Unve
     }
 
     (unresolved, unverified)
+}
+
+/// Every `use` in `docs[doc]` that reaches one of the package's own schemas
+/// by a bare path: `use types::User`, where the package's own schemas are
+/// reached as `package::...`, `parent::...` or `self::...`. These are core's own
+/// errors (`import::bare-own-schema-path`, with the fix that writes
+/// `package::`), from core's `check_imports` run over the package's schemas,
+/// not a second rule kept here - and so worded, and fixed, as `comline check`
+/// has it.
+///
+/// `check_imports` reads the package as a `ProjectContext`; what it asks of
+/// this one is the schemas' namespaces (every schema of the package, the file's
+/// own with its text, for the fix) and the file's declarations. Nothing else of
+/// the other schemas is read before it reports a bare path, so they go in empty.
+/// A dependency's schemas aren't part of the package and don't go in (a path
+/// into one starts with the dependency's name, and is not bare), and a
+/// dependency's own files aren't checked here: they are written against their own
+/// package.
+///
+/// Without a `config.idp` in view too: a path that reaches a schema of the files
+/// at hand is the package's own whether or not the rest of it is known.
+fn bare_own_schema_paths(project: &Project, doc: usize) -> Vec<CoreDiagnostic> {
+    use comline_core::package::config::idl::grammar as config_grammar;
+    use comline_core::package::config::ir::context::ProjectContext;
+    use comline_core::schema::ir::context::SchemaContext;
+    use comline_core::utils::codemap::CodeMap;
+
+    let here = &project.docs[doc];
+    if here.dependency.is_some() {
+        return vec![];
+    }
+
+    let own: Vec<&Vec<String>> = project
+        .docs
+        .iter()
+        .filter(|d| d.dependency.is_none())
+        .map(|d| &d.namespace)
+        .chain(&project.unparsed)
+        .collect();
+    let reaches_own = here.document.0.iter().any(|decl| {
+        let Declaration::Use(use_stmt) = &decl.value else {
+            return false;
+        };
+        absolute_first_segment(&use_stmt.path).is_some_and(|first| {
+            first != stdlib::NAME
+                && !project.dependencies.iter().any(|d| d.name == first)
+                && own.iter().any(|namespace| namespace.first().map(String::as_str) == Some(first))
+        })
+    });
+    if !reaches_own {
+        return vec![];
+    }
+
+    let Ok(congregation) = config_grammar::parse("congregation package") else {
+        return vec![];
+    };
+    let mut context = ProjectContext::with_config(congregation);
+    let schema = |namespace: &[String], codemap: CodeMap| {
+        let schema = SchemaContext::with_declarations(vec![], namespace.to_vec(), codemap);
+        std::rc::Rc::new(std::cell::RefCell::new(schema))
+    };
+    let mut codemap = CodeMap::new();
+    codemap.insert_file(here.namespace.join("/"), here.source);
+    context.schema_contexts.push(schema(&here.namespace, codemap));
+    let others = project
+        .docs
+        .iter()
+        .enumerate()
+        .filter(|(i, d)| *i != doc && d.dependency.is_none())
+        .map(|(_, d)| &d.namespace)
+        .chain(&project.unparsed);
+    for namespace in others {
+        context.schema_contexts.push(schema(namespace, CodeMap::new()));
+    }
+
+    let Err(errors) = check_imports(&here.document.0, &here.namespace, &context) else {
+        return vec![];
+    };
+    errors
+        .into_iter()
+        .filter(|error| error.code == BARE_OWN_SCHEMA_PATH)
+        .collect()
 }
 
 /// A `std::` path no std schema matches, worded like the build's, with the
@@ -552,6 +659,16 @@ pub(crate) fn file_name(doc: &ProjectDoc) -> String {
         .unwrap_or_else(|| doc.uri.to_string())
 }
 
+/// The path of `name` in the schema at `namespace`: written `package::...`
+/// for one of the package's own schemas, as its own schemas are reached; a
+/// dependency's (and `std`'s) namespace already starts with its name.
+pub(crate) fn use_path(own: bool, namespace: &[String], name: &str) -> String {
+    match own {
+        true => format!("package::{}", qualified(namespace, name)),
+        false => qualified(namespace, name),
+    }
+}
+
 fn qualified(namespace: &[String], name: &str) -> String {
     if namespace.is_empty() {
         name.to_string()
@@ -605,18 +722,17 @@ mod tests {
         ]);
         assert_eq!(
             missing_names(&files, 0),
-            vec![("Message".into(), vec!["types::Message".into()])]
+            vec![("Message".into(), vec!["package::types::Message".into()])]
         );
     }
 
     #[test]
     fn every_use_form_that_imports_the_name_counts() {
         for header in [
-            "use types::Message",
-            "use types::*",
-            "use types::{Message, Kind}",
-            "use types",
             "use package::types::Message",
+            "use package::types::*",
+            "use package::types::{Message, Kind}",
+            "use package::types",
             "import types::Message",
         ] {
             let source = format!("{header}\n\nstruct S {{\n    m: Message\n}}\n");
@@ -655,7 +771,7 @@ mod tests {
 
     #[test]
     fn an_alias_binds_only_the_alias() {
-        let aliased = "use types::Message as Msg\n\nstruct S {\n    a: Msg\n    b: Message\n}\n";
+        let aliased = "use package::types::Message as Msg\n\nstruct S {\n    a: Msg\n    b: Message\n}\n";
         let files = project(&[("file:///pkg/src/chat.ids", aliased), TYPES]);
         let project = Project::new(files.iter());
 
@@ -667,7 +783,7 @@ mod tests {
 
     #[test]
     fn a_use_of_something_else_from_the_same_file_does_not_count() {
-        for header in ["use types::Kind", "use types::{Kind}"] {
+        for header in ["use package::types::Kind", "use package::types::{Kind}"] {
             let source = format!("{header}\n\nstruct S {{\n    m: Message\n}}\n");
             let files = project(&[("file:///pkg/src/chat.ids", &source), TYPES]);
             assert_eq!(
@@ -680,7 +796,7 @@ mod tests {
 
     #[test]
     fn a_glob_or_whole_namespace_use_of_a_file_outside_the_project_gets_the_benefit_of_the_doubt() {
-        for header in ["use other::*", "use other"] {
+        for header in ["use package::other::*", "use package::other"] {
             let source = format!("{header}\n\nstruct S {{\n    m: Message\n}}\n");
             let files = project(&[("file:///pkg/src/chat.ids", &source), TYPES]);
             assert_eq!(
@@ -696,7 +812,7 @@ mod tests {
         let files = project(&[
             (
                 "file:///pkg/src/chat.ids",
-                "use other::*\n\nstruct S {\n    m: Message\n}\n",
+                "use package::other::*\n\nstruct S {\n    m: Message\n}\n",
             ),
             (
                 "file:///pkg/src/other.ids",
@@ -706,7 +822,7 @@ mod tests {
         ]);
         assert_eq!(
             missing_names(&files, 0),
-            vec![("Message".into(), vec!["types::Message".into()])]
+            vec![("Message".into(), vec!["package::types::Message".into()])]
         );
     }
 
@@ -740,8 +856,8 @@ mod tests {
         assert_eq!(
             found[0].1,
             vec![
-                "types::Message".to_string(),
-                "legacy::types::Message".to_string()
+                "package::types::Message".to_string(),
+                "package::legacy::types::Message".to_string()
             ]
         );
     }
@@ -840,7 +956,7 @@ mod tests {
     #[test]
     fn an_item_the_schema_does_not_declare_is_unresolved() {
         let (unresolved, _) =
-            resolution_of("use types::{User, Usr}\n\nstruct S {\n    u: User\n}\n");
+            resolution_of("use package::types::{User, Usr}\n\nstruct S {\n    u: User\n}\n");
         assert_eq!(
             unresolved,
             vec![(
@@ -854,12 +970,12 @@ mod tests {
     #[test]
     fn imports_that_resolve_or_cannot_be_checked_are_not_unresolved() {
         for body in [
-            "use types::User\n\nstruct S {\n    u: User\n}\n",
-            "use types::Gone\n\nstruct S {\n    id: u64\n}\n",
-            "use types\n\nstruct S {\n    u: User\n}\n",
+            "use package::types::User\n\nstruct S {\n    u: User\n}\n",
+            "use package::types::Gone\n\nstruct S {\n    id: u64\n}\n",
+            "use package::types\n\nstruct S {\n    u: User\n}\n",
             "use std::http::{Request, Response}\n\nstruct S {\n    r: Request\n}\n",
             "use std::validators::StringBounds\n\nstruct S {\n    id: u64\n}\n",
-            "use broken::Anything\n\nstruct S {\n    id: u64\n}\n",
+            "use package::broken::Anything\n\nstruct S {\n    id: u64\n}\n",
             "use shared::models::Thing\n\nstruct S {\n    t: Thing\n}\n",
         ] {
             let (unresolved, unverified) = resolution_of(body);

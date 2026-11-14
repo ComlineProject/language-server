@@ -221,9 +221,9 @@ struct Request {
     #[test]
     fn test_rename_across_files_updates_use_lines_and_keeps_aliases() {
         let types_source = "struct Message {\n    text: string\n}\n";
-        let chat_source = "use types::Message\n\nstruct S {\n    m: Message\n}\n";
-        let aliased_source = "use types::Message as Msg\n\nstruct T {\n    m: Msg\n}\n";
-        let other_source = "use other::Message\n\nstruct U {\n    m: Message\n}\n";
+        let chat_source = "use package::types::Message\n\nstruct S {\n    m: Message\n}\n";
+        let aliased_source = "use package::types::Message as Msg\n\nstruct T {\n    m: Msg\n}\n";
+        let other_source = "use package::other::Message\n\nstruct U {\n    m: Message\n}\n";
         let other_decl = "struct Message {\n    unrelated: bool\n}\n";
 
         let types_uri = Url::parse("file:///types.ids").unwrap();
@@ -257,8 +257,8 @@ struct Request {
         assert_eq!(
             edits_by_file(edit),
             vec![
-                ("aliased.ids".into(), 0, 11),
-                ("chat.ids".into(), 0, 11),
+                ("aliased.ids".into(), 0, 20),
+                ("chat.ids".into(), 0, 20),
                 ("chat.ids".into(), 3, 7),
                 ("types.ids".into(), 0, 7),
             ],
@@ -269,7 +269,7 @@ struct Request {
     #[test]
     fn test_rename_started_on_an_alias_is_refused() {
         let types_source = "struct Message {\n    text: string\n}\n";
-        let aliased_source = "use types::Message as Msg\n\nstruct T {\n    m: Msg\n}\n";
+        let aliased_source = "use package::types::Message as Msg\n\nstruct T {\n    m: Msg\n}\n";
         let aliased_uri = Url::parse("file:///aliased.ids").unwrap();
 
         let edit = rename_symbol_with_project(
@@ -289,7 +289,7 @@ struct Request {
     fn test_prepare_rename_returns_the_word_range_or_nothing() {
         let types_source = "struct Message {\n    text: string\n}\n";
         let aliased_source =
-            "use types::Message as Msg\n\nstruct T {\n    m: Msg\n    s: string\n}\n";
+            "use package::types::Message as Msg\n\nstruct T {\n    m: Msg\n    s: string\n}\n";
         let aliased_uri = Url::parse("file:///aliased.ids").unwrap();
         let project = [(
             Url::parse("file:///types.ids").unwrap(),
@@ -299,11 +299,11 @@ struct Request {
         let range = prepare_rename_with_project(
             aliased_source,
             &aliased_uri,
-            Position::new(0, 14),
+            Position::new(0, 23),
             &project,
         )
         .expect("`Message` in the `use` line is renameable");
-        assert_eq!((range.start.character, range.end.character), (11, 18));
+        assert_eq!((range.start.character, range.end.character), (20, 27));
 
         assert!(prepare_rename_with_project(
             aliased_source,
