@@ -200,8 +200,11 @@ pub fn package_schemas(project: &Project) -> Option<Vec<(String, Vec<FrozenUnit>
 /// `async_api` as one target would have them. It's what
 /// `comline_codegen::checks` reads of a request: the target, the package's
 /// name and version, and the options no check looks at are placeholders.
+/// `dependencies` are the names the package gives its dependencies: a
+/// dependency's protocols aren't the package's to put on its connection.
 pub fn request(
     schemas: Vec<(String, Vec<FrozenUnit>)>,
+    dependencies: Vec<String>,
     wire_format: &str,
     framings: BTreeMap<String, EncodingMapping>,
     async_api: bool,
@@ -223,6 +226,7 @@ pub fn request(
         async_api,
         encodings: framings,
         facts: None,
+        dependencies,
     }
 }
 
@@ -263,6 +267,7 @@ pub fn connection_diagnostics(project: &Project, doc: usize) -> Vec<Diagnostic> 
     );
     let request = request(
         schemas,
+        project.dependency_settings.keys().cloned().collect(),
         config::wire_format(config),
         framings.clone(),
         false,
