@@ -74,6 +74,6 @@ fn test_initialize_reports_server_info_with_core_rev() {
         .find(|m| m["id"] == 1)
         .expect("a response to initialize");
     let info = &initialize["result"]["serverInfo"];
-    assert_eq!(info["name"], "Comline Language Server");
+    assert_eq!(info["name"], "Comline Language Server", "{initialize}");
     assert_eq!(info["version"], server_version().as_str());
 }
