@@ -3,7 +3,7 @@
 
 #![cfg(feature = "server")]
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
 
 use comline_language_server::version::{server_version, CORE_REV};
@@ -26,24 +26,27 @@ fn frame(message: &serde_json::Value) -> Vec<u8> {
     format!("Content-Length: {}\r\n\r\n{body}", body.len()).into_bytes()
 }
 
-/// The JSON bodies of the `Content-Length`-framed messages in `stdout`.
-fn messages(stdout: &[u8]) -> Vec<serde_json::Value> {
-    let mut rest = stdout;
-    let mut found = Vec::new();
-    while let Some(at) = rest.windows(4).position(|w| w == b"\r\n\r\n") {
-        let header = std::str::from_utf8(&rest[..at]).unwrap();
-        let length: usize = header
-            .lines()
-            .find_map(|l| l.strip_prefix("Content-Length: "))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        let body = &rest[at + 4..at + 4 + length];
-        found.push(serde_json::from_slice(body).unwrap());
-        rest = &rest[at + 4 + length..];
+/// The next `Content-Length`-framed message on `stdout`.
+fn read_message(stdout: &mut impl BufRead) -> serde_json::Value {
+    let mut length = None;
+    loop {
+        let mut line = String::new();
+        assert_ne!(
+            stdout.read_line(&mut line).unwrap(),
+            0,
+            "the server closed stdout"
+        );
+        let line = line.trim_end();
+        if line.is_empty() {
+            break;
+        }
+        if let Some(value) = line.strip_prefix("Content-Length: ") {
+            length = Some(value.parse::<usize>().unwrap());
+        }
     }
-    found
+    let mut body = vec![0; length.expect("a Content-Length header")];
+    stdout.read_exact(&mut body).unwrap();
+    serde_json::from_slice(&body).unwrap()
 }
 
 #[test]
@@ -54,25 +57,31 @@ fn test_initialize_reports_server_info_with_core_rev() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    {
-        let mut stdin = child.stdin.take().unwrap();
-        let requests = [
-            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                "params": {"processId": null, "rootUri": null, "capabilities": {}}}),
-            serde_json::json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
-            serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "shutdown"}),
-            serde_json::json!({"jsonrpc": "2.0", "method": "exit"}),
-        ];
-        for request in &requests {
-            stdin.write_all(&frame(request)).unwrap();
-        }
-    }
-    let output = child.wait_with_output().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
-    let initialize = messages(&output.stdout)
-        .into_iter()
-        .find(|m| m["id"] == 1)
-        .expect("a response to initialize");
+    stdin
+        .write_all(&frame(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"processId": null, "rootUri": null, "capabilities": {}}
+        })))
+        .unwrap();
+    let initialize = read_message(&mut stdout);
+
+    // Let the server exit rather than leave it for the test runner to reap.
+    stdin
+        .write_all(&frame(
+            &serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "shutdown"}),
+        ))
+        .unwrap();
+    stdin
+        .write_all(&frame(
+            &serde_json::json!({"jsonrpc": "2.0", "method": "exit"}),
+        ))
+        .unwrap();
+    drop(stdin);
+    child.wait().unwrap();
+
     let info = &initialize["result"]["serverInfo"];
     assert_eq!(info["name"], "Comline Language Server", "{initialize}");
     assert_eq!(info["version"], server_version().as_str());
