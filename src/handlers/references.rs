@@ -161,7 +161,7 @@ struct User {
 
     #[test]
     fn test_find_references_across_files_from_a_usage() {
-        let chat_source = "use types::Message\n\nstruct S {\n    m: Message\n}\n";
+        let chat_source = "use package::types::Message\n\nstruct S {\n    m: Message\n}\n";
         let types_source = "struct Message {\n    text: string\n}\n";
         let chat_uri = Url::parse("file:///chat.ids").unwrap();
         let types_uri = Url::parse("file:///types.ids").unwrap();

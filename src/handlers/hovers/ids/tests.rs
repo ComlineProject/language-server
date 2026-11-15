@@ -317,7 +317,7 @@ struct User {
     #[test]
     fn test_hover_on_struct_declared_in_another_file() {
         // `chat.ids` references `Message`, declared only in `types.ids`.
-        let chat_source = r#"use types::Message
+        let chat_source = r#"use package::types::Message
 protocol Chat {
     function send(text: string) -> Message;
 }
@@ -388,7 +388,7 @@ protocol Chat {
         assert!(!text.contains("packed@1"), "got: {text}");
         assert!(!text.contains("json@1"), "got: {text}");
 
-        let text = hover_on("use types::Message\n\nstruct S {\n    m: Message\n}\n", 2);
+        let text = hover_on("use package::types::Message\n\nstruct S {\n    m: Message\n}\n", 2);
         assert!(text.contains("packed@1: 8 B"), "got: {text}");
     }
 
@@ -569,7 +569,7 @@ protocol Chat {
     #[test]
     fn use_types_message_resolves_silently_no_note() {
         let chat_source =
-            "use types::Message\n\nprotocol Chat {\n    function send() -> Message;\n}\n";
+            "use package::types::Message\n\nprotocol Chat {\n    function send() -> Message;\n}\n";
         let types_source = "struct Message {\n    text: string\n}\n";
 
         let chat_uri = Url::parse("file:///chat.ids").unwrap();
@@ -595,8 +595,8 @@ protocol Chat {
         // The actual bug item 4 of this whole plan exists to fix: a flat,
         // first-match scan can't tell `a.ids`'s `Message` from `b.ids`'s -
         // it just returns whichever file happened to come first in
-        // `other_files`. `use b::Message` must resolve to `b`'s.
-        let active_source = "use b::Message\n\nprotocol P {\n    function f() -> Message;\n}\n";
+        // `other_files`. `use package::b::Message` must resolve to `b`'s.
+        let active_source = "use package::b::Message\n\nprotocol P {\n    function f() -> Message;\n}\n";
         let a_source = "struct Message {\n    from_a: bool\n}\n";
         let b_source = "struct Message {\n    from_b: bool\n}\n";
 
@@ -625,7 +625,7 @@ protocol Chat {
     #[test]
     fn use_multi_resolves_a_listed_item_silently() {
         let active_source =
-            "use types::{Message, Other}\n\nprotocol P {\n    function f() -> Message;\n}\n";
+            "use package::types::{Message, Other}\n\nprotocol P {\n    function f() -> Message;\n}\n";
         let types_source = "struct Message {\n    text: string\n}\nstruct Other {\n    n: u8\n}\n";
 
         let active_uri = Url::parse("file:///active.ids").unwrap();
@@ -646,7 +646,7 @@ protocol Chat {
 
     #[test]
     fn use_glob_resolves_anything_in_the_namespace_silently() {
-        let active_source = "use types::*\n\nprotocol P {\n    function f() -> Message;\n}\n";
+        let active_source = "use package::types::*\n\nprotocol P {\n    function f() -> Message;\n}\n";
         let types_source = "struct Message {\n    text: string\n}\n";
 
         let active_uri = Url::parse("file:///active.ids").unwrap();
@@ -668,7 +668,7 @@ protocol Chat {
     #[test]
     fn use_as_alias_resolves_the_aliased_name_to_the_real_declaration() {
         let active_source =
-            "use types::Message as Msg\n\nprotocol P {\n    function f() -> Msg;\n}\n";
+            "use package::types::Message as Msg\n\nprotocol P {\n    function f() -> Msg;\n}\n";
         let types_source = "struct Message {\n    text: string\n}\n";
 
         let active_uri = Url::parse("file:///active.ids").unwrap();
@@ -776,7 +776,7 @@ protocol Chat {
 
     #[test]
     fn a_module_segment_shows_its_docs_and_the_types_it_declares() {
-        let text = hover_in("chat.ids", "use types::User\n", "types", 1).expect("module hover");
+        let text = hover_in("chat.ids", "use package::types::User\n", "types", 1).expect("module hover");
         assert!(text.contains("module types"), "{text}");
         assert!(
             text.contains("The package's types.\n\nShared by everything."),
@@ -843,7 +843,7 @@ protocol Chat {
             text.contains("- `struct Response` — An HTTP response, by its status code."),
             "{text}"
         );
-        let lone = hover_in("chat.ids", "use types\n", "types", 0).unwrap();
+        let lone = hover_in("chat.ids", "use package::types\n", "types", 0).unwrap();
         assert!(
             lone.contains("module types"),
             "a lone word on a `use` line: {lone}"
@@ -852,7 +852,7 @@ protocol Chat {
 
     #[test]
     fn a_directory_over_a_schema_lists_both() {
-        let text = hover_in("chat.ids", "use api::common::Error\n", "api", 0).unwrap();
+        let text = hover_in("chat.ids", "use package::api::common::Error\n", "api", 0).unwrap();
         assert!(text.contains("module api\n"), "{text}");
         assert!(text.contains("The API."), "{text}");
         assert!(

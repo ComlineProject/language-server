@@ -248,7 +248,7 @@ mod tests {
 
     #[test]
     fn use_with_remaining_symbol_resolves_to_the_namespace_sibling() {
-        let doc = parse_use("use types::User");
+        let doc = parse_use("use package::types::User");
         let imports = resolved_imports(&doc, &["app".to_string()]);
         let siblings = vec![file(&["types"])];
 
@@ -259,7 +259,7 @@ mod tests {
 
     #[test]
     fn use_of_the_whole_namespace_resolves_any_name_it_declares() {
-        let doc = parse_use("use types");
+        let doc = parse_use("use package::types");
         let imports = resolved_imports(&doc, &["app".to_string()]);
         let siblings = vec![file(&["types"])];
 
@@ -268,7 +268,7 @@ mod tests {
 
     #[test]
     fn use_glob_resolves_any_name() {
-        let doc = parse_use("use types::*");
+        let doc = parse_use("use package::types::*");
         let imports = resolved_imports(&doc, &["app".to_string()]);
         let siblings = vec![file(&["types"])];
 
@@ -277,7 +277,7 @@ mod tests {
 
     #[test]
     fn use_multi_only_resolves_listed_names() {
-        let doc = parse_use("use types::{User, Post}");
+        let doc = parse_use("use package::types::{User, Post}");
         let imports = resolved_imports(&doc, &["app".to_string()]);
         let siblings = vec![file(&["types"])];
 
@@ -309,7 +309,7 @@ mod tests {
         // Matches `use_brings_into_scope`'s existing, already-shipped rule
         // (`symbol == name || alias == Some(name)`) - aliasing adds a
         // binding, it doesn't hide the original name.
-        let doc = parse_use("use types::User as Account");
+        let doc = parse_use("use package::types::User as Account");
         let imports = resolved_imports(&doc, &["app".to_string()]);
         let siblings = vec![file(&["types"])];
 
@@ -322,7 +322,7 @@ mod tests {
         // `types.ids`'s own symbol table never heard of "Account" - a
         // caller that looked it up there by the alias instead of
         // `real_name` would get nothing.
-        let doc = parse_use("use types::Message as Msg");
+        let doc = parse_use("use package::types::Message as Msg");
         let imports = resolved_imports(&doc, &["app".to_string()]);
         let siblings = vec![file(&["types"])];
 
@@ -335,7 +335,7 @@ mod tests {
         // The actual regression this module exists to fix: a flat scan
         // can't tell these apart and would just return whichever sibling
         // happened to come first.
-        let doc = parse_use("use b::Message");
+        let doc = parse_use("use package::b::Message");
         let imports = resolved_imports(&doc, &["app".to_string()]);
         let siblings = vec![file(&["a"]), file(&["b"])];
 

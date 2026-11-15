@@ -1,6 +1,7 @@
 //! Completion inside a `use` path. `use ` offers what a path can start with
-//! (the package's namespaces, its dependencies, `self` / `parent` /
-//! `package`, `std`), `use shared::` what's under `shared`, and
+//! (its dependencies, `self` / `parent` / `package`, `std`: the package's own
+//! schemas are reached through the prefixes), `use package::` what's under the
+//! package, `use shared::` what's under `shared`, and
 //! `use shared::models::{Thing, ` the rest of what `shared::models` declares.
 //!
 //! A path is resolved the way the build resolves it, relative prefixes
@@ -183,6 +184,13 @@ pub(super) fn completions<S: ProjectSource>(
     }
 
     let relative = modules::is_relative_prefix(&prefix.segments[0]);
+    // A bare path to the package's own schemas is an error
+    // (`import::bare-own-schema-path`), so nothing is offered along it: they
+    // are reached through `package::`, `parent::` or `self::`. The legacy
+    // `import` has no such prefixes.
+    if !prefix.legacy && !relative && !leaves_the_package(&project, &prefix.segments[0]) {
+        return vec![];
+    }
     let Some(base) = modules::resolve_path(&prefix.segments, prefix.legacy, uri) else {
         return vec![]; // `parent::` above the top
     };
@@ -217,13 +225,27 @@ pub(super) fn completions<S: ProjectSource>(
     items
 }
 
-/// `use ` itself: the package's own top-level namespaces, then its declared
-/// dependencies, then `self` / `parent` / `package` and `std`.
+/// Whether an absolute path starting with `first` goes into `std` or a
+/// dependency, rather than naming one of the package's own schemas.
+fn leaves_the_package(project: &Project, first: &str) -> bool {
+    first == stdlib::NAME
+        || project.dependencies.iter().any(|d| d.name == first)
+        || project.docs.iter().any(|d| d.dependency == Some(first))
+}
+
+/// `use ` itself: the package's declared dependencies, then `self` / `parent` /
+/// `package` and `std`. The package's own schemas are not offered here: they
+/// are reached through `package::`, `parent::` or `self::`, so a bare one would
+/// be an error (`import::bare-own-schema-path`). The legacy `import` has no
+/// such prefixes and still lists them.
 fn path_starts(project: &Project, legacy: bool, range: Range) -> Vec<CompletionItem> {
-    let mut items: Vec<CompletionItem> = modules::children(project, &[], true)
-        .iter()
-        .map(|child| sorted(child_item(child, range), '0'))
-        .collect();
+    let mut items: Vec<CompletionItem> = match legacy {
+        true => modules::children(project, &[], true)
+            .iter()
+            .map(|child| sorted(child_item(child, range), '0'))
+            .collect(),
+        false => vec![],
+    };
 
     for dependency in &project.dependencies {
         if items.iter().any(|item| item.label == dependency.name) {
@@ -557,14 +579,25 @@ mod tests {
     }
 
     #[test]
-    fn a_path_starts_with_the_packages_namespaces_its_dependencies_and_the_prefixes() {
+    fn a_path_starts_with_the_dependencies_and_the_prefixes_not_the_packages_own_schemas() {
         let items = complete("use ");
         assert_eq!(
             labels(&items),
-            ["api", "types", "net", "shared", "package", "parent", "self", "std"]
+            ["net", "shared", "package", "parent", "self", "std"],
+            "the package's own schemas are reached through `package::`, not offered bare"
         );
 
         let find = |label: &str| items.iter().find(|(l, _, _)| l == label).unwrap();
+        assert_eq!(find("shared").1, "dependency, path `../shared`");
+        assert_eq!(find("net").1, "dependency, git — not fetched yet");
+        assert_eq!(find("parent").1, "In a `use` path, one namespace level up.");
+    }
+
+    #[test]
+    fn the_packages_own_schemas_are_offered_under_package() {
+        let items = complete("use package::");
+        let find = |label: &str| items.iter().find(|(l, _, _)| l == label).unwrap();
+        assert_eq!(labels(&items), ["api", "types"]);
         assert_eq!(
             find("api"),
             &("api".into(), "`api/`".into(), "api::".into()),
@@ -575,14 +608,25 @@ mod tests {
             &("types".into(), "`types.ids`".into(), "types".into()),
             "a schema can end a path"
         );
-        assert_eq!(find("shared").1, "dependency, path `../shared`");
-        assert_eq!(find("net").1, "dependency, git — not fetched yet");
-        assert_eq!(find("parent").1, "In a `use` path, one namespace level up.");
+    }
+
+    #[test]
+    fn nothing_is_offered_along_a_bare_path_to_an_own_schema() {
+        for source in ["use api::", "use types::", "use types::{", "use api::common::"] {
+            assert!(
+                complete(source).is_empty(),
+                "`{source}` is `import::bare-own-schema-path`: {:?}",
+                complete(source)
+            );
+        }
+        // The same paths, written the way they're reached, are offered.
+        assert!(!complete("use package::api::").is_empty());
+        assert!(!complete("use package::types::").is_empty());
     }
 
     #[test]
     fn a_namespace_offers_whats_under_it() {
-        let items = complete("use api::");
+        let items = complete("use package::api::");
         assert_eq!(
             items,
             [
@@ -594,7 +638,7 @@ mod tests {
 
     #[test]
     fn a_schema_offers_its_declarations_then_glob_and_list() {
-        let items = complete("use types::");
+        let items = complete("use package::types::");
         assert_eq!(labels(&items), ["Kind", "NotFound", "User", "*", "{…}"]);
         assert_eq!(items[1].1, "error", "errors are importable too");
         assert_eq!(items[4].2, "{$0}");
@@ -825,7 +869,7 @@ mod tests {
 
     #[test]
     fn a_path_start_carries_each_modules_and_packages_docs() {
-        let items = documented("use ");
+        let items = documented("use package::");
         assert_eq!(
             docs_for(&items, "types").as_deref(),
             Some("The package's types.")
@@ -835,6 +879,7 @@ mod tests {
             None,
             "a directory with no schema of its own"
         );
+        let items = documented("use ");
         assert_eq!(
             docs_for(&items, "shared").as_deref(),
             Some("A shared package."),
@@ -855,7 +900,7 @@ mod tests {
             .unwrap()
             .starts_with("Validators to attach to fields"));
         assert_eq!(
-            docs_for(&documented("use api::"), "common").as_deref(),
+            docs_for(&documented("use package::api::"), "common").as_deref(),
             Some("Things every API schema needs.")
         );
         assert_eq!(
@@ -877,7 +922,7 @@ mod tests {
             Some("A thing.")
         );
         assert_eq!(
-            docs_for(&documented("use types::{"), "User").as_deref(),
+            docs_for(&documented("use package::types::{"), "User").as_deref(),
             Some("Someone."),
             "in a brace list"
         );

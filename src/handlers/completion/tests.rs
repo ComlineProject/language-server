@@ -937,15 +937,15 @@ fn imported_items(source: &str) -> Vec<(String, String, Option<String>)> {
 #[test]
 fn imported_types_are_offered_and_the_rest_add_their_use() {
     // Mid-edit: the file doesn't parse, its `use` line still does.
-    let items = imported_items("use types::Message\n\nstruct S {\n    m: ");
+    let items = imported_items("use package::types::Message\n\nstruct S {\n    m: ");
     assert_eq!(
         items,
         vec![
             ("Message".to_string(), "from `types.ids`".to_string(), None),
             (
                 "Kind".to_string(),
-                "from `types.ids` — adds `use types::Kind`".to_string(),
-                Some("use types::Kind\n".to_string())
+                "from `types.ids` — adds `use package::types::Kind`".to_string(),
+                Some("use package::types::Kind\n".to_string())
             ),
         ],
         "the protocol `Api` isn't a type"
@@ -953,7 +953,7 @@ fn imported_types_are_offered_and_the_rest_add_their_use() {
 }
 #[test]
 fn an_alias_is_offered_under_its_alias_only() {
-    let items = imported_items("use types::Message as Msg\n\nstruct S {\n    m: ");
+    let items = imported_items("use package::types::Message as Msg\n\nstruct S {\n    m: ");
     let labels: Vec<_> = items
         .iter()
         .map(|(l, d, _)| (l.as_str(), d.as_str()))
@@ -969,7 +969,7 @@ fn an_alias_is_offered_under_its_alias_only() {
 }
 #[test]
 fn a_glob_brings_in_every_type() {
-    let items = imported_items("use types::*\n\nstruct S {\n    m: ");
+    let items = imported_items("use package::types::*\n\nstruct S {\n    m: ");
     assert_eq!(items.len(), 2, "{items:?}");
     assert!(items.iter().all(|(_, _, edit)| edit.is_none()), "{items:?}");
 }
@@ -978,7 +978,7 @@ fn without_a_use_every_type_adds_one_at_the_top() {
     let items = imported_items("struct S {\n    m: ");
     assert_eq!(items.len(), 2, "{items:?}");
     assert!(items.iter().any(
-        |(l, _, edit)| l == "Message" && edit.as_deref() == Some("use types::Message\n\n")
+        |(l, _, edit)| l == "Message" && edit.as_deref() == Some("use package::types::Message\n\n")
     ));
 }
 #[test]
@@ -1088,4 +1088,45 @@ fn the_language_deprecates_no_completion_yet() {
     );
     assert!(!items.is_empty());
     assert!(items.iter().all(|i| i.tags.is_none()));
+}
+#[test]
+fn an_unimported_own_type_adds_a_package_path_and_a_dependencys_type_its_own_name() {
+    let uri = Url::parse("file:///pkg/src/chat.ids").unwrap();
+    let files = vec![
+        crate::analysis::source::SourceFile::local(
+            Url::parse("file:///pkg/config.idp").unwrap(),
+            "congregation app\nspecification_version = 1\n\ndependencies = {\n    shared = {\n        path = \"../shared\"\n    }\n}\n".to_string(),
+        ),
+        crate::analysis::source::SourceFile::local(
+            Url::parse("file:///pkg/src/api/common.ids").unwrap(),
+            "struct Error {\n    code: u32\n}\n".to_string(),
+        ),
+        crate::analysis::source::SourceFile::of_dependency(
+            Url::parse("file:///shared/src/models.ids").unwrap(),
+            "struct Thing {\n    id: u64\n}\n".to_string(),
+            "shared",
+            vec!["shared".to_string(), "models".to_string()],
+        ),
+    ];
+    let source = "struct S {\n    m: ";
+    let items = get_completions_with_project(source, &uri, crate::util::offset_to_position(source, source.len()), &files);
+    let detail = |label: &str| {
+        items
+            .iter()
+            .find(|c| c.label == label)
+            .and_then(|c| c.detail.clone())
+            .unwrap_or_else(|| panic!("no {label}"))
+    };
+    assert_eq!(detail("Error"), "from `common.ids` — adds `use package::api::common::Error`");
+    assert_eq!(detail("Thing"), "from `models.ids` (dependency `shared`) — adds `use shared::models::Thing`");
+
+    let edit = |label: &str| {
+        items
+            .iter()
+            .find(|c| c.label == label)
+            .and_then(|c| c.additional_text_edits.as_ref())
+            .map(|edits| edits[0].new_text.clone())
+    };
+    assert_eq!(edit("Error").as_deref(), Some("use package::api::common::Error\n\n"));
+    assert_eq!(edit("Thing").as_deref(), Some("use shared::models::Thing\n\n"));
 }
