@@ -375,7 +375,7 @@ impl LanguageServer for Backend {
             },
             server_info: Some(ServerInfo {
                 name: "Comline Language Server".to_string(),
-                version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                version: Some(crate::version::server_version()),
             }),
         })
     }
