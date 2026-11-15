@@ -43,6 +43,18 @@ cargo build --release
 
 The LSP server binary will be available at `target/release/comline-lsp`.
 
+`comline-lsp --version` prints the server's version and the `comline-core`
+commit it was built against:
+
+```
+comline-lsp 0.1.0 (core 14ce54658455206d639ddc4fbe6d609d20292587)
+```
+
+The `initialize` result's `serverInfo.version` is the same text without the
+name, so a client can tell which grammar and checks the running server has.
+The commit is read from `Cargo.lock` at build time, else from `Cargo.toml`,
+else it is `unknown`.
+
 ## Editor Integration
 
 ### Visual Studio Code

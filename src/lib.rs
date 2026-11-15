@@ -12,6 +12,7 @@
 
 pub mod parser;
 pub mod util;
+pub mod version;
 
 pub mod analysis;
 pub mod handlers;
