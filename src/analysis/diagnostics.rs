@@ -1665,7 +1665,7 @@ struct User {
         assert_eq!(
             dataless(&bad),
             ["an array of `Empty` carries only its length: `Empty` has no data, so each element \
-              would take no bytes — Struct 'Batch', field 'items' — give `Empty` a field, or use package::a \
+              would take no bytes — Struct 'Batch', field 'items' — give `Empty` a field, or use a \
               count (`u32`) instead"]
         );
         assert_eq!((bad[0].2, bad[0].3), (3, 4), "at the field");
@@ -2805,7 +2805,7 @@ mod bare_own_path_tests {
 
     #[test]
     fn a_bare_path_to_an_own_schema_is_core_s_error_worded_as_core_words_it() {
-        let chat = "use types::Message\n\nstruct S {\n    m: Message\n}\n";
+        let chat = "use types::Message\n\nstruct S {\n    id: u64\n}\n";
         let found = diagnostics_of(&package(chat));
         assert_eq!(found.len(), 1, "{found:#?}");
         let d = &found[0];

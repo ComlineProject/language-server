@@ -810,7 +810,7 @@ mod tests {
         assert_eq!(
             lines(&refs),
             vec![
-                ("chat.ids".into(), 0, 11),
+                ("chat.ids".into(), 0, 20),
                 ("chat.ids".into(), 3, 18),
                 ("chat.ids".into(), 3, 30)
             ],
@@ -885,7 +885,7 @@ mod tests {
         let refs = project.references(&target);
         assert_eq!(
             lines(&refs),
-            vec![("chat.ids".into(), 0, 11)],
+            vec![("chat.ids".into(), 0, 20)],
             "`m: Message` is the local struct; only the `use` line names `types`'s"
         );
     }
