@@ -53,6 +53,13 @@ tokio = { version = "1.35", features = ["full"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 dashmap = { version = "5.5", optional = true }
 
+# generation and the generators pin `comline-core` at their own rev (14ce546),
+# and none of their revs pins 69039e7 yet. The tree has one `comline-core`:
+# patching the git source onto the rev above makes it so, and goes when they
+# are bumped (see the pull request).
+[patch."https://github.com/ComlineProject/core"]
+comline-core = { git = "https://github.com/ComlineProject/core", rev = "69039e7ab05953760bb7a6818f61e98c14b43922" }
+
 # Local iteration against a sibling `core` checkout — uncomment to build
 # `comline-core` from the working tree instead of the pinned git rev.
 # Re-comment before pushing; CI has no sibling checkout.
