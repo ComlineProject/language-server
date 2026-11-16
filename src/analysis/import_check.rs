@@ -59,8 +59,8 @@ pub struct ImportCheck {
     /// What core's reference rule refuses in the file (core#290): a name
     /// nothing brought into scope, a qualifier that isn't in scope, a name
     /// defined twice - its own errors, with their fixes (see
-    /// [`Names::reference_errors`]). Without the not-in-scope error of a name
-    /// that is in [`ImportCheck::missing`], which says the same, once.
+    /// [`Names::reference_errors`]). A bare type another file declares is
+    /// core's `reference::not-in-scope`, as `comline check` reports it.
     pub references: Vec<CoreDiagnostic>,
     /// The names core's validation must not also call unknown: those of
     /// [`ImportCheck::missing`] and of `references`, where the error is
@@ -99,6 +99,11 @@ pub struct MissingImport {
     /// binds only the alias (`use types::User as U` makes `U` usable, not
     /// `User`).
     pub imported_as: Option<String>,
+    /// A validator named in a `@validators` list, which core's reference rule
+    /// doesn't cover: the only name `import::missing` is still reported for.
+    /// A type is core's `reference::not-in-scope`; what is here for it is
+    /// what its quick fixes are made of (every file that declares it).
+    pub validator: bool,
 }
 
 /// A project file a missing name could be imported from.
@@ -285,6 +290,7 @@ pub fn check_with(project: &Project, names: &Names, doc: usize) -> ImportCheck {
                 range: (*offset, offset + name.len()),
                 candidates,
                 imported_as: aliases.get(name).cloned(),
+                validator: !is_type,
             });
         }
     }
@@ -305,13 +311,10 @@ pub fn check_with(project: &Project, names: &Names, doc: usize) -> ImportCheck {
                     stand_ins.insert(written.to_string());
                 }
             }
-            // The missing `use` says the same of a name another file declares.
-            let said = error.code == NOT_IN_SCOPE
-                && missing.iter().any(|m| Some(m.range) == error.span);
             // Without the manifest the view may not be the whole package, so a
             // qualifier nothing here matches may be a dependency's name.
             let unknown_root = error.code == QUALIFIER_NOT_IN_SCOPE && !project.has_manifest;
-            if !said && !unknown_root {
+            if !unknown_root {
                 references.push(error);
             }
         }
@@ -979,14 +982,16 @@ mod tests {
     fn what_core_refuses_is_reported_with_its_fix_and_not_twice() {
         use comline_core::schema::ir::compiler::references::DEFINED_TWICE;
 
-        // A bare name after only a whole-namespace `use`: the missing `use`
-        // says it, core's `reference::not-in-scope` for it is not said again.
+        // A bare name after only a whole-namespace `use`: core's
+        // `reference::not-in-scope`, which `missing` holds the candidates of.
         let source = "use package::types\n\nstruct S {\n    m: Message\n}\n";
         let files = project(&[("file:///pkg/src/chat.ids", source), TYPES]);
         let view = Project::new(files.iter());
         let found = check(&view, 0);
         assert_eq!(found.missing.len(), 1);
-        assert!(found.references.is_empty(), "{:?}", found.references);
+        assert_eq!(found.references.len(), 1, "{:?}", found.references);
+        assert_eq!(found.references[0].code, NOT_IN_SCOPE);
+        assert!(!found.missing[0].validator);
         assert!(found.stand_ins.contains("Message"));
 
         // A name declared nowhere: core's own error, and no unknown type.

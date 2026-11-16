@@ -662,6 +662,9 @@ pub fn project_diagnostics_with<'a>(
         check
             .missing
             .iter()
+            // A type is core's `reference::not-in-scope` (below); a validator
+            // in a `@validators` list isn't a type, which core doesn't check.
+            .filter(|m| m.validator)
             .map(|m| missing_import_diagnostic(here.source, m)),
     );
     // Core's own error for a bare path to one of the package's schemas, with
@@ -1738,7 +1741,7 @@ struct User {
         assert!(
             messages
                 .iter()
-                .any(|m| m.1 == Some(NumberOrString::String(MISSING_IMPORT.to_string()))),
+                .any(|m| m.1 == Some(NumberOrString::String("reference::not-in-scope".to_string()))),
             "{messages:?}"
         );
 
@@ -1902,7 +1905,7 @@ struct User {
     }
 
     #[test]
-    fn a_missing_import_replaces_the_unknown_type_error() {
+    fn a_type_another_file_declares_is_core_s_not_in_scope_not_an_unknown_type() {
         let found = project_messages(&[
             (
                 "file:///pkg/src/chat.ids",
@@ -1913,8 +1916,8 @@ struct User {
         assert_eq!(
             found,
             vec![(
-                "`Message` is declared in `types.ids` but not imported here — add `use package::types::Message`".to_string(),
-                Some(NumberOrString::String(MISSING_IMPORT.to_string())),
+                "'Message' is not in scope — 'Message' is declared in `package::types`: add `use package::types::Message`, or write `package::types::Message`".to_string(),
+                Some(NumberOrString::String("reference::not-in-scope".to_string())),
                 1,
                 7
             )]
@@ -1930,14 +1933,15 @@ struct User {
     }
 
     #[test]
-    fn using_the_real_name_of_an_aliased_import_says_so() {
+    fn using_the_real_name_of_an_aliased_import_is_not_in_scope() {
         let chat = "use package::types::Message as Msg\n\nstruct S {\n    m: Message\n}\n";
         let found = project_messages(&[("file:///pkg/src/chat.ids", chat), TYPES]);
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(
-            found[0].0,
-            "`Message` is imported here as `Msg` — write `Msg`, or add `use package::types::Message`"
+            found[0].1,
+            Some(NumberOrString::String("reference::not-in-scope".to_string()))
         );
+        assert!(found[0].0.starts_with("'Message' is not in scope"), "{found:?}");
     }
 
     const MANIFEST_URI: &str = "file:///pkg/config.idp";
@@ -3116,15 +3120,16 @@ mod reference_tests {
     }
 
     #[test]
-    fn a_bare_name_after_only_a_whole_namespace_use_is_a_missing_import() {
+    fn a_bare_name_after_only_a_whole_namespace_use_is_not_in_scope() {
         let chat = "use package::types\n\nstruct S {\n    u: User\n}\n";
         let found = of_chat(chat);
-        assert_eq!(codes(&found), [MISSING_IMPORT], "{found:#?}");
+        assert_eq!(codes(&found), ["reference::not-in-scope"], "{found:#?}");
         assert_eq!(
             found[0].message,
-            "`User` is declared in `types.ids` but not imported here — add \
+            "'User' is not in scope — 'User' is declared in `package::types`: add \
              `use package::types::User`, or write `types::User`"
         );
+        assert_eq!(title(&found[0]), "Add `use package::types::User`");
     }
 
     #[test]

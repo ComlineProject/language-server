@@ -11,6 +11,7 @@ use crate::analysis::source::ProjectSource;
 use crate::analysis::symbols::{Namespace, Symbol};
 use crate::handlers::rename;
 use crate::util::{byte_range_to_lsp_range, file_edit, position_to_offset};
+use comline_core::schema::ir::compiler::references::NOT_IN_SCOPE;
 use lsp_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams, Command, Diagnostic,
     NumberOrString, Range, SymbolKind, TextEdit, Url,
@@ -73,7 +74,33 @@ pub fn get_code_actions_with_project<S: ProjectSource>(
             continue;
         }
 
-        let diagnostics = matching_diagnostics(params, range, MISSING_IMPORT);
+        // A type is core's `reference::not-in-scope`, which carries the fix for
+        // the one schema that declares it; these are the fixes for each of
+        // several, and the other way to write it. A validator is the editor's
+        // own `import::missing`.
+        let code = match missing.validator {
+            true => MISSING_IMPORT,
+            false => NOT_IN_SCOPE.id,
+        };
+        let diagnostics = matching_diagnostics(params, range, code);
+
+        // Imported here under an alias: it is that name that is in scope.
+        if let Some(alias) = &missing.imported_as {
+            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                title: format!("Write `{alias}`"),
+                kind: Some(CodeActionKind::QUICKFIX),
+                diagnostics: diagnostics.clone(),
+                edit: Some(file_edit(
+                    uri,
+                    vec![TextEdit {
+                        range,
+                        new_text: alias.clone(),
+                    }],
+                )),
+                is_preferred: Some(false),
+                ..Default::default()
+            }));
+        }
 
         let only_one = missing.candidates.len() == 1;
         for candidate in &missing.candidates {
@@ -118,7 +145,19 @@ pub fn get_code_actions_with_project<S: ProjectSource>(
         other_files,
     ));
     actions.extend(f_string_actions(source, uri, params));
-    actions.extend(fix_actions(uri, params));
+    // Core's own fix of a diagnostic is the same one an action above already
+    // makes (core's "Add `use ...`" for the one schema that declares the name).
+    let made: Vec<String> = actions
+        .iter()
+        .filter_map(|a| match a {
+            CodeActionOrCommand::CodeAction(a) => Some(a.title.clone()),
+            _ => None,
+        })
+        .collect();
+    actions.extend(fix_actions(uri, params).into_iter().filter(|a| match a {
+        CodeActionOrCommand::CodeAction(a) => !made.contains(&a.title),
+        _ => true,
+    }));
 
     // Several uses of the same name in range: one fix per candidate is enough.
     actions.dedup_by(|a, b| match (a, b) {
@@ -1198,6 +1237,15 @@ mod reference_tests {
         );
         assert_eq!(actions[0].is_preferred, Some(true));
         assert_eq!(actions[1].is_preferred, Some(false));
+        // Both are fixes of core's `reference::not-in-scope`.
+        for action in &actions {
+            let attached = action.diagnostics.as_ref().expect("attached to the error");
+            assert_eq!(attached.len(), 1);
+            assert_eq!(
+                attached[0].code,
+                Some(NumberOrString::String("reference::not-in-scope".to_string()))
+            );
+        }
 
         // An item `use`, not a namespace `use` followed by the bare name.
         let with_use = apply(chat, &actions[0]);
@@ -1213,6 +1261,59 @@ mod reference_tests {
             "use package::types\n\nstruct S {\n    m: types::Message\n}\n"
         );
         assert!(diagnostics_of(&written).is_empty(), "{written}");
+    }
+
+    #[test]
+    fn a_name_imported_under_an_alias_can_be_written_as_the_alias() {
+        let chat = "use package::types::Message as Msg\n\nstruct S {\n    m: Message\n}\n";
+        let actions = actions_for(chat);
+        assert_eq!(
+            titles(&actions),
+            ["Write `Msg`", "Add `use package::types::Message`"]
+        );
+        let fixed = apply(chat, &actions[0]);
+        assert!(diagnostics_of(&fixed).is_empty(), "{fixed}");
+    }
+
+    #[test]
+    fn several_schemas_declaring_the_name_each_get_an_add_use() {
+        let chat = "struct S {\n    m: Message\n}\n";
+        let uri = chat_uri();
+        let mut files = others();
+        files.push(local("src/legacy/types.ids", "struct Message {\n    id: u64\n}\n"));
+        let mut all = vec![SourceFile::local(uri.clone(), chat.to_string())];
+        all.extend(files.iter().cloned());
+        let diagnostics = project_diagnostics(&Project::new(&all), 0);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(
+            diagnostics[0].code,
+            Some(NumberOrString::String("reference::not-in-scope".to_string()))
+        );
+        let params = CodeActionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            range: Range::new(Position::new(0, 0), Position::new(20, 0)),
+            context: CodeActionContext {
+                diagnostics,
+                only: None,
+                trigger_kind: None,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let titles: Vec<String> = get_code_actions_with_project(chat, &uri, &params, &files)
+            .into_iter()
+            .filter_map(|a| match a {
+                CodeActionOrCommand::CodeAction(a) => Some(a.title),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            titles,
+            [
+                "Add `use package::types::Message`",
+                "Add `use package::legacy::types::Message`"
+            ]
+        );
     }
 
     #[test]
