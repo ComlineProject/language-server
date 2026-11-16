@@ -934,8 +934,8 @@ mod tests {
     fn a_missing_name_can_be_written_through_the_namespace_a_use_brought_in() {
         let source = "use package::types\n\nstruct S {\n    m: Message\n}\n";
         let files = project(&[("file:///pkg/src/chat.ids", source), TYPES]);
-        let project = Project::new(files.iter());
-        let missing = check(&project, 0).missing;
+        let view = Project::new(files.iter());
+        let missing = check(&view, 0).missing;
         assert_eq!(missing.len(), 1);
         let candidate = &missing[0].candidates[0];
         assert_eq!(candidate.use_path("Message"), "package::types::Message");
@@ -945,16 +945,16 @@ mod tests {
         // rest of the path.
         let source = "use package::types as t\n\nstruct S {\n    m: Message\n}\n";
         let files = project_files(source);
-        let project = Project::new(files.iter());
-        let missing = check(&project, 0).missing;
+        let view = Project::new(files.iter());
+        let missing = check(&view, 0).missing;
         assert_eq!(
             missing[0].candidates[0].qualified("Message").as_deref(),
             Some("t::Message")
         );
         let source = "use package::legacy\n\nstruct S {\n    m: Message\n}\n";
         let files = project_files(source);
-        let project = Project::new(files.iter());
-        let missing = check(&project, 0).missing;
+        let view = Project::new(files.iter());
+        let missing = check(&view, 0).missing;
         let qualified: Vec<_> = missing[0]
             .candidates
             .iter()
@@ -983,8 +983,8 @@ mod tests {
         // says it, core's `reference::not-in-scope` for it is not said again.
         let source = "use package::types\n\nstruct S {\n    m: Message\n}\n";
         let files = project(&[("file:///pkg/src/chat.ids", source), TYPES]);
-        let project = Project::new(files.iter());
-        let found = check(&project, 0);
+        let view = Project::new(files.iter());
+        let found = check(&view, 0);
         assert_eq!(found.missing.len(), 1);
         assert!(found.references.is_empty(), "{:?}", found.references);
         assert!(found.stand_ins.contains("Message"));
@@ -992,8 +992,8 @@ mod tests {
         // A name declared nowhere: core's own error, and no unknown type.
         let source = "struct S {\n    m: Nope\n}\n";
         let files = project(&[("file:///pkg/src/chat.ids", source), TYPES]);
-        let project = Project::new(files.iter());
-        let found = check(&project, 0);
+        let view = Project::new(files.iter());
+        let found = check(&view, 0);
         assert!(found.missing.is_empty());
         assert_eq!(found.references.len(), 1);
         assert_eq!(found.references[0].code, NOT_IN_SCOPE);
@@ -1002,8 +1002,8 @@ mod tests {
         // A qualifier that matches nothing, and a name defined twice.
         let source = "use package::types::Message\n\nstruct Message {\n    x: bool\n}\n\nstruct S {\n    m: typse::Message\n}\n";
         let files = project(&[("file:///pkg/src/chat.ids", source), TYPES]);
-        let project = Project::new(files.iter());
-        let found = check(&project, 0);
+        let view = Project::new(files.iter());
+        let found = check(&view, 0);
         let codes: Vec<_> = found.references.iter().map(|d| d.code).collect();
         assert!(codes.contains(&DEFINED_TWICE), "{codes:?}");
         assert!(
