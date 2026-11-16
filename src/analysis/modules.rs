@@ -15,6 +15,7 @@ use comline_core::schema::ir::compiler::import_resolver::ImportResolver;
 use lsp_types::Url;
 
 use crate::analysis::imports;
+use crate::analysis::names;
 use crate::analysis::project::{Project, ProjectDoc};
 use crate::util::{follows_as, in_comment_or_string, path_at};
 
@@ -266,7 +267,16 @@ pub fn path_module_at(
         return None;
     }
 
-    let namespace = resolve_path(&at.segments, keyword == Some("import"), uri)?;
+    // In a type position, a name a `use` of this file brought in is a path
+    // prefix too (`b` in `b::Invoice`, after `use package::billing::api as b`).
+    let namespace = match keyword {
+        None => through_binding(project, uri, &at.segments),
+        Some(_) => None,
+    };
+    let namespace = match namespace {
+        Some(namespace) => namespace,
+        None => resolve_path(&at.segments, keyword == Some("import"), uri)?,
+    };
 
     if !at.continues {
         let (last, parent) = namespace.split_last()?;
@@ -278,6 +288,22 @@ pub fn path_module_at(
     }
 
     Some((namespace, at.range))
+}
+
+/// The namespace `segments` name when the first is a name a whole-namespace
+/// `use` of the file at `uri` brought in: what it stands for, then the rest.
+fn through_binding(project: &Project, uri: &Url, segments: &[String]) -> Option<Vec<String>> {
+    let doc = &project.docs[project.index_of(uri)?];
+    let (first, rest) = segments.split_first()?;
+    let (_, namespace) = names::namespace_bindings(project, &doc.imports)
+        .into_iter()
+        .find(|(name, _)| name == first)?;
+    Some(namespace.into_iter().chain(rest.iter().cloned()).collect())
+}
+
+/// Whether the line `offset` is on is a `use` or an `import`.
+pub(crate) fn in_use_statement(source: &str, offset: usize) -> bool {
+    statement_keyword(source, offset).is_some()
 }
 
 /// `use` or `import` when the line `offset` is on starts with it.

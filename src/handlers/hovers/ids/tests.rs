@@ -1107,3 +1107,78 @@ protocol Chat {
             "got: {text}"
         );
     }
+    // ---- qualified references (ComlineProject/language-server#124, core#290) ----
+
+    /// The documented package, and a directory `billing` with `api`.
+    fn qualified_package() -> Vec<SourceFile> {
+        let mut files = documented_package();
+        files.push(local(
+            "src/billing/api.ids",
+            "//! What is owed.\n\n/// A bill.\nstruct Invoice {\n    id: u64\n}\n",
+        ));
+        files
+    }
+
+    /// The hover at the last `needle` in `source`, written in `pkg/src/chat.ids`.
+    fn hover_over(source: &str, needle: &str) -> Option<String> {
+        let uri = Url::parse("file:///pkg/src/chat.ids").unwrap();
+        let offset = source.rfind(needle).unwrap();
+        let position = crate::util::offset_to_position(source, offset);
+        get_hover_info_with_project(source, &uri, position, &qualified_package()).map(hover_text)
+    }
+
+    #[test]
+    fn every_form_of_a_type_hovers_on_its_declaration() {
+        for source in [
+            "use package::billing::api::Invoice\n\nstruct S {\n    i: Invoice\n}\n",
+            "use package::billing\n\nstruct S {\n    i: billing::api::Invoice\n}\n",
+            "use package::billing::api\n\nstruct S {\n    i: api::Invoice\n}\n",
+            "use package::billing::api as b\n\nstruct S {\n    i: b::Invoice\n}\n",
+            "struct S {\n    i: package::billing::api::Invoice\n}\n",
+        ] {
+            let text = hover_over(source, "Invoice").unwrap_or_else(|| panic!("no hover: {source}"));
+            assert!(text.contains("struct Invoice"), "{source}: {text}");
+            assert!(text.contains("A bill."), "{source}: {text}");
+        }
+    }
+
+    #[test]
+    fn a_full_path_into_std_and_a_namespace_from_std_hover_on_the_declaration() {
+        let text = hover_over("struct S {\n    r: std::http::Request\n}\n", "Request").unwrap();
+        assert!(text.contains("struct Request"), "{text}");
+        let text = hover_over(
+            "use std::http\n\nstruct S {\n    r: http::Request\n}\n",
+            "Request",
+        )
+        .unwrap();
+        assert!(text.contains("struct Request"), "{text}");
+    }
+
+    #[test]
+    fn a_bare_name_after_only_a_whole_namespace_use_hovers_on_nothing() {
+        let source = "use package::types\n\nstruct S {\n    u: User\n}\n";
+        assert_eq!(hover_over(source, "User"), None, "`User` isn't in scope");
+        let source = "use package::types\n\nstruct S {\n    u: types::User\n}\n";
+        let text = hover_over(source, "User").unwrap();
+        assert!(text.contains("struct User"), "{text}");
+    }
+
+    #[test]
+    fn a_name_in_scope_that_shadows_nothing_hovers_on_what_the_path_names() {
+        // The file declares its own `Invoice`; the qualified one is billing's.
+        let source = "struct Invoice {\n    mine: bool\n}\n\nstruct S {\n    a: package::billing::api::Invoice\n    b: Invoice\n}\n";
+        let text = hover_over(source, "Invoice\n    b").unwrap();
+        assert!(text.contains("A bill."), "billing's: {text}");
+        let text = hover_over(source, "Invoice\n}").unwrap();
+        assert!(!text.contains("A bill."), "the local one: {text}");
+    }
+
+    #[test]
+    fn a_name_that_a_use_brought_in_is_a_module_to_hover_on() {
+        let source = "use package::types\n\nstruct S {\n    u: types::User\n}\n";
+        let text = hover_over(source, "types::User").unwrap();
+        assert!(text.contains("module types"), "{text}");
+        let source = "use package::billing::api as b\n\nstruct S {\n    i: b::Invoice\n}\n";
+        let text = hover_over(source, "b::Invoice").unwrap();
+        assert!(text.contains("module billing::api"), "the alias stands for it: {text}");
+    }

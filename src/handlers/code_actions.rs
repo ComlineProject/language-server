@@ -87,6 +87,25 @@ pub fn get_code_actions_with_project<S: ProjectSource>(
                 is_preferred: Some(only_one),
                 ..Default::default()
             }));
+
+            // Or, where a `use` here brought the schema in as a namespace
+            // (`use package::types`), the name written through it.
+            if let Some(written) = candidate.qualified(&missing.name) {
+                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                    title: format!("Write `{written}`"),
+                    kind: Some(CodeActionKind::QUICKFIX),
+                    diagnostics: diagnostics.clone(),
+                    edit: Some(file_edit(
+                        uri,
+                        vec![TextEdit {
+                            range,
+                            new_text: written,
+                        }],
+                    )),
+                    is_preferred: Some(false),
+                    ..Default::default()
+                }));
+            }
         }
     }
 
@@ -566,8 +585,8 @@ mod tests {
         assert_eq!(
             titles_and_edits(actions),
             vec![(
-                "Change `typse` to `types`".to_string(),
-                "types".to_string(),
+                "Change `typse` to `package::types`".to_string(),
+                "package::types".to_string(),
                 0
             )]
         );
@@ -1077,6 +1096,169 @@ mod own_schema_path_tests {
                 "Add `use package::api::common::Error`",
                 "Add `use shared::models::Thing`",
             ]
+        );
+    }
+}
+
+/// Quick fixes that write a `use` or a reference follow the Rust model too
+/// (ComlineProject/language-server#124, core#290): core's own fixes for what the
+/// reference rule refuses, and the fixes for a missing `use`.
+#[cfg(test)]
+mod reference_tests {
+    use super::*;
+    use crate::analysis::diagnostics::project_diagnostics;
+    use crate::analysis::source::SourceFile;
+    use lsp_types::{CodeActionContext, Position, TextDocumentIdentifier};
+
+    const MANIFEST: &str = "congregation app\nspecification_version = 1\n\n\
+        dependencies = {\n    shared = {\n        path = \"../shared\"\n    }\n}\n";
+
+    fn local(path: &str, text: &str) -> SourceFile {
+        SourceFile::local(
+            Url::parse(&format!("file:///pkg/{path}")).unwrap(),
+            text.to_string(),
+        )
+    }
+
+    /// Everything but `chat.ids`: the manifest, `types` and a dependency.
+    fn others() -> Vec<SourceFile> {
+        vec![
+            local("config.idp", MANIFEST),
+            local(
+                "src/types.ids",
+                "struct Message {\n    text: string\n}\n\nenum Kind {\n    A\n}\n",
+            ),
+            SourceFile::of_dependency(
+                Url::parse("file:///shared/src/models.ids").unwrap(),
+                "struct Thing {\n    id: u64\n}\n".to_string(),
+                "shared",
+                vec!["shared".to_string(), "models".to_string()],
+            ),
+        ]
+    }
+
+    fn chat_uri() -> Url {
+        Url::parse("file:///pkg/src/chat.ids").unwrap()
+    }
+
+    fn diagnostics_of(chat: &str) -> Vec<Diagnostic> {
+        let mut all = vec![SourceFile::local(chat_uri(), chat.to_string())];
+        all.extend(others());
+        project_diagnostics(&Project::new(&all), 0)
+    }
+
+    /// The quick fixes over the whole of `chat`, for the diagnostics it has.
+    fn actions_for(chat: &str) -> Vec<CodeAction> {
+        let uri = chat_uri();
+        let params = CodeActionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            range: Range::new(Position::new(0, 0), Position::new(20, 0)),
+            context: CodeActionContext {
+                diagnostics: diagnostics_of(chat),
+                only: None,
+                trigger_kind: None,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        get_code_actions_with_project(chat, &uri, &params, &others())
+            .into_iter()
+            .map(|a| match a {
+                CodeActionOrCommand::CodeAction(a) => a,
+                other => panic!("expected a code action, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// The edits `action` makes to the file, applied to `source`.
+    fn apply(source: &str, action: &CodeAction) -> String {
+        let changes = action.edit.as_ref().unwrap().changes.as_ref().unwrap();
+        let mut edits = changes[&chat_uri()].clone();
+        edits.sort_by_key(|e| std::cmp::Reverse((e.range.start.line, e.range.start.character)));
+        let mut out = source.to_string();
+        for edit in edits {
+            let start = crate::util::position_to_offset(&out, edit.range.start).unwrap();
+            let end = crate::util::position_to_offset(&out, edit.range.end).unwrap();
+            out.replace_range(start..end, &edit.new_text);
+        }
+        out
+    }
+
+    fn titles(actions: &[CodeAction]) -> Vec<&str> {
+        actions.iter().map(|a| a.title.as_str()).collect()
+    }
+
+    #[test]
+    fn a_bare_name_after_a_whole_namespace_use_is_fixed_by_a_use_or_by_the_path() {
+        let chat = "use package::types\n\nstruct S {\n    m: Message\n}\n";
+        let actions = actions_for(chat);
+        assert_eq!(
+            titles(&actions),
+            ["Add `use package::types::Message`", "Write `types::Message`"]
+        );
+        assert_eq!(actions[0].is_preferred, Some(true));
+        assert_eq!(actions[1].is_preferred, Some(false));
+
+        // An item `use`, not a namespace `use` followed by the bare name.
+        let with_use = apply(chat, &actions[0]);
+        assert_eq!(
+            with_use,
+            "use package::types\nuse package::types::Message\n\nstruct S {\n    m: Message\n}\n"
+        );
+        assert!(diagnostics_of(&with_use).is_empty(), "{with_use}");
+
+        let written = apply(chat, &actions[1]);
+        assert_eq!(
+            written,
+            "use package::types\n\nstruct S {\n    m: types::Message\n}\n"
+        );
+        assert!(diagnostics_of(&written).is_empty(), "{written}");
+    }
+
+    #[test]
+    fn with_no_use_at_all_only_an_item_use_is_offered() {
+        let chat = "struct S {\n    m: Message\n}\n";
+        let actions = actions_for(chat);
+        assert_eq!(titles(&actions), ["Add `use package::types::Message`"]);
+        let fixed = apply(chat, &actions[0]);
+        assert_eq!(
+            fixed,
+            "use package::types::Message\n\nstruct S {\n    m: Message\n}\n"
+        );
+        assert!(diagnostics_of(&fixed).is_empty(), "{fixed}");
+    }
+
+    #[test]
+    fn core_s_fixes_for_a_refused_reference_are_quick_fixes() {
+        // A qualified name after an item `use`: write the bare name.
+        let chat = "use package::types::Message\n\nstruct S {\n    m: types::Message\n}\n";
+        let actions = actions_for(chat);
+        assert_eq!(titles(&actions), ["Write `Message`"]);
+        assert_eq!(actions[0].kind, Some(CodeActionKind::QUICKFIX));
+        assert_eq!(actions[0].is_preferred, Some(true));
+        let fixed = apply(chat, &actions[0]);
+        assert_eq!(
+            fixed,
+            "use package::types::Message\n\nstruct S {\n    m: Message\n}\n"
+        );
+        assert!(diagnostics_of(&fixed).is_empty(), "{fixed}");
+
+        // A name defined twice: import it under an alias.
+        let chat = "use package::types::Message\n\nstruct Message {\n    x: bool\n}\n";
+        let actions = actions_for(chat);
+        assert_eq!(titles(&actions), ["Import `Message` as `TypesMessage`"]);
+        let fixed = apply(chat, &actions[0]);
+        assert!(diagnostics_of(&fixed).is_empty(), "{fixed}");
+    }
+
+    #[test]
+    fn a_did_you_mean_for_a_bare_own_path_writes_the_package_path() {
+        let chat = "use typse::Message\n\nstruct S {\n    m: Message\n}\n";
+        let actions = actions_for(chat);
+        assert_eq!(titles(&actions), ["Change `typse` to `package::types`"]);
+        assert_eq!(
+            apply(chat, &actions[0]),
+            "use package::types::Message\n\nstruct S {\n    m: Message\n}\n"
         );
     }
 }

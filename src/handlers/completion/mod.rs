@@ -1,5 +1,6 @@
 // Completion handler - provides auto-completion suggestions
 
+mod type_path;
 mod use_path;
 mod validator_body;
 mod validators;
@@ -11,6 +12,7 @@ use std::collections::BTreeSet;
 use crate::analysis::import_check::{self, declares_type, file_name, is_type_kind, Target};
 use crate::analysis::import_check::use_path;
 use crate::analysis::imports::{self, add_use_edit, ResolvedUse};
+use crate::analysis::names;
 use crate::analysis::project::{Project, ProjectDoc};
 use crate::analysis::source::ProjectSource;
 use crate::analysis::stdlib;
@@ -117,11 +119,17 @@ fn completions_at<S: ProjectSource>(
         .map(|document| symbols::build_symbol_table(&document, uri, source));
 
     // Every known type: primitives first, then user-declared struct/enum/
-    // alias names, then the ones other files declare.
+    // alias names, then the ones other files declare, then the roots a path
+    // can start with. After a `::` (`types::`, `package::billing::`), only what
+    // that path can go on with.
     let type_items = || {
+        if let Some(path) = type_path::path_before(source, offset) {
+            return type_path::completions(&path, source, uri, offset, other_files);
+        }
         let mut items = get_primitive_type_completions();
         items.extend(get_type_completions(symbol_table.as_ref(), source));
         items.extend(get_import_completions(source, uri, other_files, symbol_table.as_ref()));
+        items.extend(type_path::roots(source, offset, other_files));
         items
     };
 
@@ -205,10 +213,12 @@ fn completions_at<S: ProjectSource>(
 }
 
 /// Type names from the package's other files. First the ones this file's `use`s
-/// bring into scope - under their alias, if they have one - then every
-/// other type those files declare, sorted after everything else, which
-/// inserts the missing `use` line along with the name. Names already
-/// declared here, or already in scope, aren't offered again.
+/// bring into scope - under their alias, if they have one - and the namespaces
+/// it brought in, to qualify with (a whole-namespace `use` brings in only its
+/// own name, core#290); then every other type those files declare, sorted after
+/// everything else: through a namespace in scope as `types::User` where one
+/// reaches it, else inserting the missing `use` line along with the name.
+/// Names already declared here, or already in scope, aren't offered again.
 fn get_import_completions<S: ProjectSource>(
     source: &str,
     uri: &Url,
@@ -222,9 +232,10 @@ fn get_import_completions<S: ProjectSource>(
     // (file, declared name) already imported, under whatever name.
     let mut imported: BTreeSet<(usize, String)> = BTreeSet::new();
     let mut items = Vec::new();
+    let uses = uses_in(source, uri);
 
-    for use_decl in uses_in(source, uri) {
-        let Target::Found(sibling, remaining) = import_check::target_of(&siblings, None, &use_decl)
+    for use_decl in &uses {
+        let Target::Found(sibling, remaining) = import_check::target_of(&siblings, None, use_decl)
         else {
             continue; // can't list what a file outside the project declares
         };
@@ -232,24 +243,26 @@ fn get_import_completions<S: ProjectSource>(
         let symbols = &use_decl.resolved.symbols;
 
         // (name in scope here, name declared there)
-        let names: Vec<(String, String)> =
-            if symbols == &["*"] || (symbols.is_empty() && remaining.is_empty()) {
-                type_names(doc).map(|n| (n.clone(), n)).collect()
-            } else if !symbols.is_empty() {
-                symbols
-                    .iter()
-                    .filter(|n| declares_type(doc, n))
-                    .map(|n| (n.clone(), n.clone()))
-                    .collect()
-            } else {
-                let real = remaining.join("::");
-                match declares_type(doc, &real) {
-                    true => vec![(use_decl.alias.clone().unwrap_or_else(|| real.clone()), real)],
-                    false => vec![],
-                }
-            };
+        let brought: Vec<(String, String)> = if symbols == &["*"] {
+            type_names(doc).map(|n| (n.clone(), n)).collect()
+        } else if !symbols.is_empty() {
+            symbols
+                .iter()
+                .filter(|n| declares_type(doc, n))
+                .map(|n| (n.clone(), n.clone()))
+                .collect()
+        } else if remaining.is_empty() {
+            // `use package::types` brings in `types` and nothing in it.
+            vec![]
+        } else {
+            let real = remaining.join("::");
+            match declares_type(doc, &real) {
+                true => vec![(use_decl.alias.clone().unwrap_or_else(|| real.clone()), real)],
+                false => vec![],
+            }
+        };
 
-        for (label, real) in names {
+        for (label, real) in brought {
             imported.insert((sibling, real.clone()));
             if in_scope.insert(label.clone()) {
                 let detail = imported_detail(doc, &label, &real);
@@ -258,18 +271,61 @@ fn get_import_completions<S: ProjectSource>(
         }
     }
 
+    // What a whole-namespace `use` did bring in: a name to go on with.
+    let bindings = names::namespace_bindings(&siblings, &uses);
+    for (name, namespace) in &bindings {
+        if in_scope.insert(name.clone()) {
+            items.push(namespace_item(name, namespace));
+        }
+    }
+
     for (index, doc) in siblings.docs.iter().enumerate() {
+        let through = import_check::through(&bindings, &doc.namespace);
         for name in type_names(doc) {
             if in_scope.contains(&name) || imported.contains(&(index, name.clone())) {
                 continue;
             }
-            items.push(unimported_item(doc, &name, source, |detail| {
-                type_item(doc, &name, name.clone(), detail)
-            }));
+            match &through {
+                Some(qualifier) => items.push(qualified_item(doc, &name, qualifier)),
+                None => items.push(unimported_item(doc, &name, source, |detail| {
+                    type_item(doc, &name, name.clone(), detail)
+                })),
+            }
         }
     }
 
     items
+}
+
+/// A name a whole-namespace `use` brought in, to qualify with: accepting it
+/// writes `name::` and asks for what is under it.
+fn namespace_item(name: &str, namespace: &[String]) -> CompletionItem {
+    CompletionItem {
+        label: name.to_string(),
+        kind: Some(CompletionItemKind::MODULE),
+        detail: Some(format!("`{}`, to qualify with", namespace.join("::"))),
+        insert_text: Some(format!("{name}::")),
+        command: Some(use_path::trigger_suggest()),
+        ..Default::default()
+    }
+}
+
+/// A type of `doc` that no `use` here imports, but that a namespace one did
+/// bring in reaches: written through it (`types::User`), which needs no new
+/// `use`. Sorted like an unimported one.
+fn qualified_item(doc: &ProjectDoc, name: &str, qualifier: &str) -> CompletionItem {
+    let mut item = type_item(
+        doc,
+        name,
+        format!("{qualifier}::{name}"),
+        format!("from {} — through `{qualifier}`", origin(doc)),
+    );
+    item.filter_text = Some(name.to_string());
+    item.sort_text = Some(match doc.dependency {
+        Some(_) => format!("~~{name}"),
+        None => format!("~{name}"),
+    });
+    item
 }
 
 /// The `use`/`import` declarations in `source`, each parsed on its own

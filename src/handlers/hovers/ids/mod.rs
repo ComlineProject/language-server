@@ -3,8 +3,9 @@
 #[cfg(test)]
 mod tests;
 
-use crate::analysis::imports::{self, ProjectFile};
+use crate::analysis::imports::{self, ResolvedUse};
 use crate::analysis::modules::{self, Module};
+use crate::analysis::names::Names;
 use crate::analysis::project::Project;
 use crate::analysis::source::{self, ProjectSource};
 use crate::analysis::symbols;
@@ -21,6 +22,7 @@ use comline_core::schema::idl::grammar::{
 use comline_core::schema::idl::module_docs::summary;
 use comline_core::schema::idl::size::{self, Range, SizeLookup, SizeTarget, Sizes};
 use comline_core::schema::idl::vocabulary;
+use comline_core::schema::ir::compiler::import_resolver::ResolvedImport;
 use comline_core::encodings::{official, EncodingKind};
 use comline_core::schema::ir::compiler::interpreter::incremental::IncrementalInterpreter;
 use comline_core::schema::ir::compiler::Compile;
@@ -128,19 +130,25 @@ pub fn get_hover_info_with_project<S: ProjectSource>(
         })
         .collect();
 
-    // Only the files this one's `use`s reach - and the files *their* `use`s
-    // reach, since a struct's size follows its fields into wherever they are
-    // imported from. A file nothing imports isn't in scope here, so nothing
-    // in it is either: not for the hover, not for a size estimate.
+    // Only the files this one's `use`s, and the type paths it writes, reach -
+    // and the files *theirs* reach, since a struct's size follows its fields
+    // into wherever they are imported from. A file nothing reaches isn't in
+    // scope here, so nothing in it is either: not for the hover, not for a size
+    // estimate.
+    let project = Project::with_active(uri, source, other_files);
+    let names = Names::of(&project);
     let own_namespace = imports::namespace_of(uri);
-    let own_imports = imports::resolved_imports(&document, &own_namespace);
+    let mut own_imports = imports::resolved_imports(&document, &own_namespace);
+    own_imports.extend(written_reach(&project, &names, &own_namespace));
     let mut reached = vec![false; parsed.len()];
     let mut pending = vec![imports::resolved_imports(&document, &own_namespace)];
+    pending.push(written_reach(&project, &names, &own_namespace));
     while let Some(uses) = pending.pop() {
         for (i, ((_, _, sibling), namespace)) in parsed.iter().enumerate() {
             if !reached[i] && imports_reach(&uses, namespace) {
                 reached[i] = true;
                 pending.push(imports::resolved_imports(sibling, namespace));
+                pending.push(written_reach(&project, &names, namespace));
             }
         }
     }
@@ -152,7 +160,7 @@ pub fn get_hover_info_with_project<S: ProjectSource>(
     // each group is otherwise unchanged), so a name collision with a file
     // only reached through another's `use` resolves to the nearer one.
     parsed.sort_by_key(|(_, namespace)| !imports_reach(&own_imports, namespace));
-    let (other_docs, origins): (Vec<Sibling>, Vec<Origin>) = parsed.into_iter().unzip();
+    let (other_docs, _): (Vec<Sibling>, Vec<Origin>) = parsed.into_iter().unzip();
 
     let lookup = HoverSizeLookup {
         local: &document,
@@ -162,47 +170,32 @@ pub fn get_hover_info_with_project<S: ProjectSource>(
 
     let symbol_table = symbols::build_symbol_table(&document, uri, source);
 
-    // A symbol in this file. The cursor sitting on a declaration's own
-    // name resolves by position; anything else is a reference, resolved in
-    // whatever namespace its position allows.
+    // The declaration the cursor sits on, by position.
     //
     // By name alone, a file declaring `struct Test` beside a
     // `settings Test` answered both with whichever the symbol table had
     // kept - so hovering the struct showed the settings block.
-    let own = symbol_table
-        .at_offset(offset)
-        .or_else(|| symbol_table.get_in(word, symbols::namespace_at(source, offset)));
-    if let Some(symbol) = own {
+    if let Some(symbol) = symbol_table.at_offset(offset) {
         return Some(create_symbol_hover(symbol, &document, &lookup));
     }
 
-    let siblings: Vec<ProjectFile> = other_docs
-        .iter()
-        .zip(&origins)
-        .map(|((u, s, _), namespace)| ProjectFile {
-            uri: u,
-            source: s,
-            namespace: namespace.clone(),
-        })
-        .collect();
-
-    if let Some(resolved) = imports::resolve_symbol(word, &own_imports, &siblings) {
-        let sibling = resolved.file;
-        if let Some((_, _, other_document)) =
-            other_docs.iter().find(|(u, _, _)| **u == *sibling.uri)
-        {
-            let other_table =
-                symbols::build_symbol_table(other_document, sibling.uri, sibling.source);
-            // Look up `real_name`, not `word` — they differ when `word`
-            // is an `as` alias, which `sibling`'s own symbol table never
-            // heard of (see `ResolvedSymbol::real_name`'s doc).
-            // A `use` only ever brings in a declaration - there is no
-            // import that names a settings preset.
-            if let Some(symbol) =
-                other_table.get_in(&resolved.real_name, symbols::Namespace::Declaration)
-            {
-                return Some(create_symbol_hover(symbol, other_document, &lookup));
-            }
+    // A reference: whatever the file's own scope names there (core#290) - a
+    // declaration of this file, a name a `use` brought in (through its `as`
+    // alias too: the declaration's own name is what's shown), a path through a
+    // namespace it brought in (`types::User`, `b::Invoice`,
+    // `billing::api::Invoice`), or a full path from a root
+    // (`package::types::User`, `std::http::Request`). Resolved in whatever
+    // namespace its position allows, as go-to-definition does.
+    let target = project
+        .index_of(uri)
+        .and_then(|active| project.target_at_cursor(active, source, offset));
+    if let Some(target) = target {
+        if let Some(symbol) = project.symbol(&target) {
+            return Some(create_symbol_hover(
+                symbol,
+                &project.docs[target.doc].document,
+                &lookup,
+            ));
         }
     }
 
@@ -217,6 +210,28 @@ pub fn get_hover_info_with_project<S: ProjectSource>(
     }
 
     None
+}
+
+/// The schemas the file seen under `namespace` writes a type path into, as
+/// `use`s of them: a full path needs no `use`, and a size follows it.
+fn written_reach(project: &Project, names: &Names, namespace: &[String]) -> Vec<ResolvedUse> {
+    let Some(doc) = project.docs.iter().position(|d| d.namespace == namespace) else {
+        return vec![];
+    };
+    names
+        .written_namespaces(doc)
+        .into_iter()
+        .map(|absolute_namespace| ResolvedUse {
+            resolved: ResolvedImport {
+                absolute_namespace,
+                schema_path: None,
+                symbols: vec![],
+                alias: None,
+            },
+            alias: None,
+            span: (0, 0),
+        })
+        .collect()
 }
 
 /// Whether one of `uses` points into the file seen under `namespace`.

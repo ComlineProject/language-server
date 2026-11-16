@@ -6,6 +6,7 @@ use std::sync::{Arc, RwLock};
 //
 use crate::analysis::comline_toml::{self, is_comline_toml};
 use crate::analysis::imports::namespace_of;
+use crate::analysis::names::Names;
 use crate::analysis::source::SourceFile;
 use crate::analysis::stdlib;
 use crate::dependencies;
@@ -875,17 +876,34 @@ impl Backend {
             let view = self.package_view(&documents[0].uri);
             let project = Project::new(view.iter());
 
-            for document in documents {
-                // In the project exactly when it parsed cleanly.
-                let lsp_diagnostics = match project.index_of(&document.uri) {
-                    Some(index) => diagnostics::project_diagnostics(&project, index),
-                    None => parser::parse(&document.text)
-                        .map(|result| {
-                            diagnostics::generate_diagnostics(&document.text, &result.errors)
-                        })
-                        .unwrap_or_default(),
-                };
+            // What each file's names are is asked of the one `Names` the
+            // package shares, which holds `Rc`s and so is dropped before the
+            // first `await`.
+            let computed: Vec<_> = {
+                let names = Names::of(&project);
+                documents
+                    .iter()
+                    .map(|document| {
+                        // In the project exactly when it parsed cleanly.
+                        let lsp_diagnostics = match project.index_of(&document.uri) {
+                            Some(index) => {
+                                diagnostics::project_diagnostics_with(&project, &names, index)
+                            }
+                            None => parser::parse(&document.text)
+                                .map(|result| {
+                                    diagnostics::generate_diagnostics(
+                                        &document.text,
+                                        &result.errors,
+                                    )
+                                })
+                                .unwrap_or_default(),
+                        };
+                        (document, lsp_diagnostics)
+                    })
+                    .collect()
+            };
 
+            for (document, lsp_diagnostics) in computed {
                 self.client
                     .publish_diagnostics(
                         document.uri.clone(),
