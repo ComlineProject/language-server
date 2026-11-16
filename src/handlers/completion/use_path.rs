@@ -227,7 +227,7 @@ pub(super) fn completions<S: ProjectSource>(
 
 /// Whether an absolute path starting with `first` goes into `std` or a
 /// dependency, rather than naming one of the package's own schemas.
-fn leaves_the_package(project: &Project, first: &str) -> bool {
+pub(super) fn leaves_the_package(project: &Project, first: &str) -> bool {
     first == stdlib::NAME
         || project.dependencies.iter().any(|d| d.name == first)
         || project.docs.iter().any(|d| d.dependency == Some(first))
@@ -238,7 +238,7 @@ fn leaves_the_package(project: &Project, first: &str) -> bool {
 /// are reached through `package::`, `parent::` or `self::`, so a bare one would
 /// be an error (`import::bare-own-schema-path`). The legacy `import` has no
 /// such prefixes and still lists them.
-fn path_starts(project: &Project, legacy: bool, range: Range) -> Vec<CompletionItem> {
+pub(super) fn path_starts(project: &Project, legacy: bool, range: Range) -> Vec<CompletionItem> {
     let mut items: Vec<CompletionItem> = match legacy {
         true => modules::children(project, &[], true)
             .iter()
@@ -307,7 +307,7 @@ fn path_starts(project: &Project, legacy: bool, range: Range) -> Vec<CompletionI
 
 /// A module one level down, with its docs. A path can end at a schema; a
 /// directory always goes on.
-fn child_item(child: &ChildModule, range: Range) -> CompletionItem {
+pub(super) fn child_item(child: &ChildModule, range: Range) -> CompletionItem {
     let name = &child.name;
     let mut detail = match child.schema {
         true => format!("`{name}.ids`"),
@@ -328,7 +328,7 @@ fn child_item(child: &ChildModule, range: Range) -> CompletionItem {
 }
 
 /// A declaration a `use` can import, with its docstring.
-fn declared_item(declared: &Declared, range: Range) -> CompletionItem {
+pub(super) fn declared_item(declared: &Declared, range: Range) -> CompletionItem {
     let kind = match declared.kind {
         DeclKind::Struct => CompletionItemKind::STRUCT,
         DeclKind::Enum => CompletionItemKind::ENUM,

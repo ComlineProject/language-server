@@ -1130,3 +1130,208 @@ fn an_unimported_own_type_adds_a_package_path_and_a_dependencys_type_its_own_nam
     assert_eq!(edit("Error").as_deref(), Some("use package::api::common::Error\n\n"));
     assert_eq!(edit("Thing").as_deref(), Some("use shared::models::Thing\n\n"));
 }
+
+// ---- qualified references (ComlineProject/language-server#124, core#290) ----
+
+use lsp_types::CompletionTextEdit;
+
+/// A package of its own schemas (`types`, a directory `billing`), a dependency
+/// and std, and the completions at the end of `source`, written in
+/// `pkg/src/<file>`.
+fn type_completions_in(file: &str, source: &str) -> Vec<CompletionItem> {
+    completions_in_package(file, source, source.len())
+}
+
+/// [`type_completions_in`], with the cursor at byte `offset` of `source`.
+fn completions_in_package(file: &str, source: &str, offset: usize) -> Vec<CompletionItem> {
+    use crate::analysis::source::SourceFile;
+    let uri = Url::parse(&format!("file:///pkg/src/{file}")).unwrap();
+    let mut files = vec![
+        SourceFile::local(
+            Url::parse("file:///pkg/config.idp").unwrap(),
+            "congregation app\nspecification_version = 1\n\ndependencies = {\n    shared = {\n        path = \"../shared\"\n    }\n}\n".to_string(),
+        ),
+        SourceFile::local(
+            Url::parse("file:///pkg/src/types.ids").unwrap(),
+            TYPES.to_string(),
+        ),
+        SourceFile::local(
+            Url::parse("file:///pkg/src/billing/api.ids").unwrap(),
+            "struct Invoice {\n    id: u64\n}\n".to_string(),
+        ),
+        SourceFile::local(
+            Url::parse("file:///pkg/src/billing/ledger.ids").unwrap(),
+            "struct Entry {\n    id: u64\n}\n".to_string(),
+        ),
+        SourceFile::of_dependency(
+            Url::parse("file:///shared/src/models.ids").unwrap(),
+            "struct Thing {\n    id: u64\n}\n".to_string(),
+            "shared",
+            vec!["shared".to_string(), "models".to_string()],
+        ),
+    ];
+    files.extend(crate::analysis::stdlib::files(&crate::analysis::stdlib::root()));
+    // The file being edited isn't one of the other files.
+    files.retain(|file| file.uri != uri);
+    let at = crate::util::offset_to_position(source, offset);
+    get_completions_with_project(source, &uri, at, &files)
+}
+
+fn type_completions(source: &str) -> Vec<CompletionItem> {
+    type_completions_in("chat.ids", source)
+}
+
+fn labels_of(items: &[CompletionItem]) -> Vec<&str> {
+    items.iter().map(|c| c.label.as_str()).collect()
+}
+
+#[test]
+fn after_a_whole_namespace_use_the_namespace_completes_its_members() {
+    let items = type_completions("use package::types\n\nstruct S {\n    a: types::");
+    // The types it declares, not its protocol, nor a primitive.
+    assert_eq!(labels_of(&items), ["Message", "Kind"]);
+    let partial = type_completions("use package::types\n\nstruct S {\n    a: types::Me");
+    assert_eq!(labels_of(&partial), ["Message", "Kind"], "the client filters by what's typed");
+}
+
+#[test]
+fn a_bare_name_of_a_whole_namespace_is_not_offered_but_the_namespace_is() {
+    let items = type_completions("use package::types\n\nstruct S {\n    a: ");
+    let labels = labels_of(&items);
+    assert!(!labels.contains(&"Message"), "no bare name from `types`: {labels:?}");
+    assert!(!labels.contains(&"Kind"), "{labels:?}");
+
+    // The name the `use` brought in, to go on with.
+    let types = items.iter().find(|c| c.label == "types").expect("the namespace");
+    assert_eq!(types.kind, Some(CompletionItemKind::MODULE));
+    assert_eq!(types.insert_text.as_deref(), Some("types::"));
+    assert_eq!(
+        types.command.as_ref().map(|c| c.command.as_str()),
+        Some("editor.action.triggerSuggest")
+    );
+
+    // And its types, written through it: no `use` to add.
+    let message = items.iter().find(|c| c.label == "types::Message").expect("through `types`");
+    assert_eq!(message.filter_text.as_deref(), Some("Message"));
+    assert!(message.additional_text_edits.is_none(), "{message:?}");
+}
+
+#[test]
+fn a_type_position_offers_the_names_in_scope_and_the_roots() {
+    let items = type_completions("use package::types::Message as Msg\n\nstruct Local {\n    x: u8\n}\n\nstruct S {\n    a: ");
+    let labels = labels_of(&items);
+    // Declared here, an alias, a primitive.
+    for expected in ["Local", "Msg", "u8"] {
+        assert!(labels.contains(&expected), "{expected}: {labels:?}");
+    }
+    // The roots, which go on with `::`.
+    for root in ["package", "parent", "self", "std", "shared"] {
+        let item = items
+            .iter()
+            .find(|c| c.label == root)
+            .unwrap_or_else(|| panic!("{root}: {labels:?}"));
+        match &item.text_edit {
+            Some(CompletionTextEdit::Edit(edit)) => assert_eq!(edit.new_text, format!("{root}::")),
+            other => panic!("{root}: {other:?}"),
+        }
+        assert_eq!(
+            item.command.as_ref().map(|c| c.command.as_str()),
+            Some("editor.action.triggerSuggest")
+        );
+    }
+    // Sorted after what is in scope.
+    let sort = |label: &str| {
+        items
+            .iter()
+            .find(|c| c.label == label)
+            .and_then(|c| c.sort_text.clone().or_else(|| Some(c.label.clone())))
+            .unwrap()
+    };
+    assert!(sort("Msg") < sort("package"), "{} {}", sort("Msg"), sort("package"));
+}
+
+#[test]
+fn a_root_completes_the_next_segment() {
+    let items = type_completions("struct S {\n    a: package::");
+    assert_eq!(labels_of(&items), ["billing", "types"], "the package's own, no dependency");
+    // A schema is gone through, so it asks for what is in it.
+    let types = items.iter().find(|c| c.label == "types").unwrap();
+    match &types.text_edit {
+        Some(CompletionTextEdit::Edit(edit)) => assert_eq!(edit.new_text, "types::"),
+        other => panic!("{other:?}"),
+    }
+
+    let items = type_completions("struct S {\n    a: package::billing::");
+    assert_eq!(labels_of(&items), ["api", "ledger"]);
+    let items = type_completions("struct S {\n    a: package::billing::api::");
+    assert_eq!(labels_of(&items), ["Invoice"]);
+    let items = type_completions("struct S {\n    a: package::types::");
+    assert_eq!(labels_of(&items), ["Message", "Kind"]);
+}
+
+#[test]
+fn a_dependency_and_std_complete_too() {
+    let items = type_completions("struct S {\n    a: shared::");
+    assert_eq!(labels_of(&items), ["models"]);
+    let items = type_completions("struct S {\n    a: shared::models::");
+    assert_eq!(labels_of(&items), ["Thing"]);
+
+    let items = type_completions("struct S {\n    a: std::http::");
+    assert!(items.iter().any(|c| c.label == "Request"), "{:?}", labels_of(&items));
+    assert!(items.iter().any(|c| c.label == "HttpMethod"), "{:?}", labels_of(&items));
+}
+
+#[test]
+fn a_name_through_a_namespace_use_or_an_alias_completes_what_is_under_it() {
+    // The directory, then what is under it.
+    let items = type_completions("use package::billing\n\nstruct S {\n    a: billing::");
+    assert_eq!(labels_of(&items), ["api", "ledger"]);
+    let items = type_completions("use package::billing\n\nstruct S {\n    a: billing::api::");
+    assert_eq!(labels_of(&items), ["Invoice"]);
+
+    // An alias stands for the namespace; the namespace's own name doesn't.
+    let source = "use package::billing::api as b\n\nstruct S {\n    a: b::";
+    assert_eq!(labels_of(&type_completions(source)), ["Invoice"]);
+    let source = "use package::billing::api as b\n\nstruct S {\n    a: api::";
+    assert!(type_completions(source).is_empty(), "`api` isn't in scope");
+}
+
+#[test]
+fn a_name_that_is_no_qualifier_completes_nothing() {
+    // A declaration of the file, or a name imported, has no `::` to go on with.
+    let source = "struct Local {\n    x: u8\n}\n\nstruct S {\n    a: Local::";
+    assert!(type_completions(source).is_empty());
+    let source = "use package::types::Message\n\nstruct S {\n    a: Message::";
+    assert!(type_completions(source).is_empty());
+    assert!(type_completions("struct S {\n    a: nothing::").is_empty());
+}
+
+#[test]
+fn parent_and_self_stay_in_the_package() {
+    let items = type_completions_in("billing/ledger.ids", "struct S {\n    a: parent::");
+    assert_eq!(labels_of(&items), ["api"], "the other schema of the directory");
+    // The file's own declarations, read without the line being typed.
+    let source = "struct Own {\n    id: u64\n}\n\nstruct S {\n    a: self::\n}\n";
+    let at = source.find("self::").unwrap() + "self::".len();
+    let items = completions_in_package("billing/ledger.ids", source, at);
+    assert_eq!(labels_of(&items), ["Own", "S"]);
+}
+
+#[test]
+fn an_auto_import_writes_an_item_use_never_a_namespace_use() {
+    let items = type_completions("struct S {\n    a: ");
+    let mut seen = 0;
+    for item in &items {
+        let Some(edits) = &item.additional_text_edits else {
+            continue;
+        };
+        seen += 1;
+        let written = edits[0].new_text.trim_end();
+        assert!(
+            written.starts_with("use ") && written.ends_with(&format!("::{}", item.label)),
+            "`{}` adds `{written}`",
+            item.label
+        );
+    }
+    assert!(seen > 0, "something is offered to import");
+}

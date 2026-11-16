@@ -513,4 +513,80 @@ struct User {
             };
         assert_eq!(location.uri.as_str(), "comline-std:/validators.ids");
     }
+
+    // ---- qualified references (ComlineProject/language-server#124, core#290) ----
+
+    /// Go-to-definition at the last `needle` in `source`, written in
+    /// `pkg/src/chat.ids`, among the documented package, std and a directory
+    /// `billing` with `api`.
+    fn qualified_definition(source: &str, needle: &str) -> Option<Location> {
+        let mut files = documented_package();
+        files.push(local(
+            "src/billing/api.ids",
+            "struct Invoice {\n    id: u64\n}\n",
+        ));
+        let uri = Url::parse("file:///pkg/src/chat.ids").unwrap();
+        let offset = source.rfind(needle).unwrap();
+        let position = crate::util::offset_to_position(source, offset);
+        match find_definition_with_project(source, &uri, position, &files)? {
+            GotoDefinitionResponse::Scalar(location) => Some(location),
+            other => panic!("expected a scalar location, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_form_of_a_type_goes_to_its_declaration() {
+        for source in [
+            "use package::billing::api::Invoice\n\nstruct S {\n    i: Invoice\n}\n",
+            "use package::billing\n\nstruct S {\n    i: billing::api::Invoice\n}\n",
+            "use package::billing::api\n\nstruct S {\n    i: api::Invoice\n}\n",
+            "use package::billing::api as b\n\nstruct S {\n    i: b::Invoice\n}\n",
+            "struct S {\n    i: package::billing::api::Invoice\n}\n",
+        ] {
+            let location = qualified_definition(source, "Invoice")
+                .unwrap_or_else(|| panic!("no definition: {source}"));
+            assert_eq!(location.uri.as_str(), "file:///pkg/src/billing/api.ids", "{source}");
+            assert_eq!(location.range.start.line, 0, "{source}");
+        }
+    }
+
+    #[test]
+    fn a_namespace_use_and_a_full_path_from_a_root_reach_the_declaration() {
+        let location = qualified_definition(
+            "use package::types\n\nstruct S {\n    u: types::User\n}\n",
+            "User",
+        )
+        .expect("through the namespace");
+        assert_eq!(location.uri.as_str(), "file:///pkg/src/types.ids");
+
+        let location = qualified_definition(
+            "struct S {\n    r: std::http::Request\n}\n",
+            "Request",
+        )
+        .expect("a full path into std");
+        assert_eq!(location.uri.as_str(), "comline-std:/http.ids");
+    }
+
+    #[test]
+    fn a_bare_name_after_only_a_whole_namespace_use_goes_nowhere() {
+        let source = "use package::types\n\nstruct S {\n    u: User\n}\n";
+        assert!(qualified_definition(source, "User").is_none());
+    }
+
+    #[test]
+    fn a_qualifier_goes_to_the_schema_it_stands_for() {
+        let location = qualified_definition(
+            "use package::types\n\nstruct S {\n    u: types::User\n}\n",
+            "types::User",
+        )
+        .expect("the schema `types`");
+        assert_eq!(location.uri.as_str(), "file:///pkg/src/types.ids");
+
+        let location = qualified_definition(
+            "use package::billing::api as b\n\nstruct S {\n    i: b::Invoice\n}\n",
+            "b::Invoice",
+        )
+        .expect("what the alias stands for");
+        assert_eq!(location.uri.as_str(), "file:///pkg/src/billing/api.ids");
+    }
 }

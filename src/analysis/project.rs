@@ -11,9 +11,12 @@ use comline_core::schema::idl::grammar::{
     Annotation, AnnotationValue, Declaration, Document, Field, Type,
 };
 use comline_core::schema::idl::module_docs::module_docs;
+use comline_core::schema::ir::compiler::references::Scope;
 use lsp_types::{Location, Url};
 
 use crate::analysis::imports::{self, ProjectFile, ResolvedUse};
+use crate::analysis::modules;
+use crate::analysis::names::Names;
 use crate::analysis::parse_cache;
 use crate::analysis::source::{self, DeclaredDependency, ProjectSource};
 use crate::analysis::symbols::{self, Namespace, Symbol, SymbolTable};
@@ -308,18 +311,84 @@ impl<'a> Project<'a> {
         self.docs.iter().position(|d| d.uri == uri)
     }
 
-    /// What `name`, written in `docs[doc]`, refers to, by the file's own
-    /// scope - the way `comline build` sees it:
+    /// What `written`, a name in a type position of `docs[doc]`, refers to, by
+    /// the file's own scope - the way `comline build` sees it (core#290):
     /// 1. a declaration in that same file;
-    /// 2. a sibling that one of that file's own `use`/`import`s brings
-    ///    `name` into scope from (`imports::resolve_symbol` - so through an
-    ///    `as` alias, the target's real name comes back).
+    /// 2. what one of that file's own `use`s brings in: a name it imports (or
+    ///    its `as` alias, so the target's real name comes back), or a
+    ///    namespace to qualify with (`types::User`, `b::Invoice`);
+    /// 3. a full path from a root, which needs no `use` (`package::types::User`).
     ///
-    /// Nothing else: a name the file never imports refers to nothing, even
-    /// where another file declares it - for diagnostics, references and
-    /// rename, and for go-to-definition and hover alike. The missing `use`
-    /// is the diagnostic's to report, and its quick fix's to add.
-    pub fn resolve(&self, doc: usize, name: &str, namespace: Namespace) -> Option<Target> {
+    /// A whole-namespace `use` brings in only its own name: after
+    /// `use package::types`, `types::User` refers to `User` and a bare `User`
+    /// to nothing. Nothing else: a name the file never brings in refers to
+    /// nothing, even where another file declares it - for diagnostics,
+    /// references and rename, and for go-to-definition and hover alike. The
+    /// missing `use` is the diagnostic's to report, and its quick fix's to add.
+    pub fn resolve(&self, doc: usize, written: &str, namespace: Namespace) -> Option<Target> {
+        if let Some(target) = self.local(doc, written, namespace) {
+            return Some(target);
+        }
+        if namespace != Namespace::Declaration {
+            return None;
+        }
+        let names = Names::of(self);
+        self.resolve_in(&names.scope(doc), doc, written, namespace)
+    }
+
+    /// A declaration of `docs[doc]` itself named `written` (a bare name).
+    fn local(&self, doc: usize, written: &str, namespace: Namespace) -> Option<Target> {
+        if written.contains("::") {
+            return None;
+        }
+        let symbol = self.docs[doc].symbols.index_in(written, namespace)?;
+        Some(Target { doc, symbol })
+    }
+
+    /// [`Project::resolve`] with the file's `scope` already built: what a loop
+    /// over many names asks.
+    pub(crate) fn resolve_in(
+        &self,
+        scope: &Scope<'_>,
+        doc: usize,
+        written: &str,
+        namespace: Namespace,
+    ) -> Option<Target> {
+        if let Some(target) = self.local(doc, written, namespace) {
+            return Some(target);
+        }
+        if namespace != Namespace::Declaration {
+            return None;
+        }
+        match scope.resolve(written) {
+            Ok(resolved) => match resolved.target {
+                Some((schema, name)) => {
+                    let index = self.docs.iter().position(|d| d.namespace == schema)?;
+                    let symbol = self.docs[index].symbols.index_in(&name, namespace)?;
+                    Some(Target { doc: index, symbol })
+                }
+                // A `use` core can't read into a schema (the legacy `import`,
+                // one that doesn't resolve): by the older rule, where it stood
+                // for its own name.
+                None if !written.contains("::") => self.resolve_wide(doc, written, namespace),
+                None => None,
+            },
+            Err(_) => None,
+        }
+    }
+
+    /// What `name`, written in `docs[doc]`, refers to by the older, wider rule:
+    /// a declaration in that same file, or a sibling that one of that file's
+    /// own `use`/`import`s brings `name` into scope from
+    /// (`imports::resolve_symbol`), where a whole-namespace `use` brings in
+    /// every name the schema has. Still how a validator, a constant or an error
+    /// a `use` brings in is read, as core reads them.
+    pub(crate) fn resolve_wide(
+        &self,
+        doc: usize,
+        name: &str,
+        namespace: Namespace,
+    ) -> Option<Target> {
         let here = &self.docs[doc];
 
         if let Some(symbol) = here.symbols.index_in(name, namespace) {
@@ -368,11 +437,28 @@ impl<'a> Project<'a> {
             return Some(target);
         }
         let (start, end) = crate::util::word_range_at(source, offset)?;
-        self.resolve(
-            doc,
-            &source[start..end],
-            symbols::namespace_at(source, offset),
-        )
+        let namespace = symbols::namespace_at(source, offset);
+        // In a type position the name is the whole path the cursor ends
+        // (`types::User`, `b::Invoice`, `package::types::User`); its other
+        // segments name a namespace, not a declaration. A `use`'s path is
+        // read as it always was, by the name under the cursor.
+        let written = match crate::util::path_at(source, offset) {
+            Some(path) if !modules::in_use_statement(source, offset) => {
+                if path.continues {
+                    return None;
+                }
+                path.segments.join("::")
+            }
+            // In a `use`, the name written is the item it imports, whatever it
+            // is bound as here (`Message` in `use a::Message as Msg`).
+            _ => {
+                let word = &source[start..end];
+                return self
+                    .resolve(doc, word, namespace)
+                    .or_else(|| self.resolve_wide(doc, word, namespace));
+            }
+        };
+        self.resolve(doc, &written, namespace)
     }
 
     /// The symbol `target` names.
@@ -394,6 +480,7 @@ impl<'a> Project<'a> {
         let Some(target_name) = self.symbol(target).map(|s| s.name.as_str()) else {
             return found;
         };
+        let names = Names::of(self);
 
         for (index, doc) in self.docs.iter().enumerate() {
             // A dependency's own files aren't this package's to search: their
@@ -402,25 +489,26 @@ impl<'a> Project<'a> {
                 continue;
             }
             let mut seen = BTreeSet::new();
+            let scope = names.scope(index);
 
             for span in type_spans(&doc.document) {
-                // The symbol each names: the last segment (`types::User`
-                // names `User`).
-                let names: BTreeSet<&str> = named_types(span.1)
-                    .into_iter()
-                    .filter_map(|name| name.rsplit("::").next())
-                    .collect();
-
-                for name in names {
+                // Each name as written (`User`, `types::User`); the symbol it
+                // names is the last segment.
+                for written in named_types(span.1) {
                     // A type position, so the declaration namespace - a
                     // settings preset of the same name is a different
                     // symbol and must not be swept up here.
                     // In scope only: a file naming `User` without importing
                     // it doesn't refer to this one, and rename mustn't edit it.
-                    if self.resolve(index, name, Namespace::Declaration).as_ref() != Some(target) {
+                    if self
+                        .resolve_in(&scope, index, written, Namespace::Declaration)
+                        .as_ref()
+                        != Some(target)
+                    {
                         continue;
                     }
-                    for offset in occurrences_in(doc.source, span.0, name) {
+                    let name = written.rsplit("::").next().unwrap_or(written);
+                    for offset in path_occurrences(doc.source, span.0, written) {
                         if seen.insert(offset) {
                             found.push(self.reference(doc, offset, name, name == target_name));
                         }
@@ -560,6 +648,25 @@ fn occurrences_in(source: &str, span: (usize, usize), name: &str) -> Vec<usize> 
         .into_iter()
         .filter(|&i| !text[i + name.len()..].starts_with("::"))
         .map(|i| start + i)
+        .collect()
+}
+
+/// Where the last segment of `written` (`User` in `types::User`) is in `span`
+/// each time `written` is written there as a whole path - not part of a longer
+/// one, and, for a bare name, not the end of a qualified one: in
+/// `use User::User`, only the second `User` is the symbol.
+fn path_occurrences(source: &str, span: (usize, usize), written: &str) -> Vec<usize> {
+    let (start, text) = clamped(source, span);
+    let name_len = written.rsplit("::").next().map_or(0, str::len);
+    let part_of_path = |c: char| crate::util::is_ident_char(c) || c == ':';
+
+    text.match_indices(written)
+        .filter(|&(i, _)| {
+            let before = text[..i].chars().next_back();
+            let after = text[i + written.len()..].chars().next();
+            !before.is_some_and(part_of_path) && !after.is_some_and(part_of_path)
+        })
+        .map(|(i, _)| start + i + written.len() - name_len)
         .collect()
 }
 
@@ -972,5 +1079,117 @@ mod tests {
             project.settings.get("max_depth"),
             Some(&SettingsValue::Integer(4))
         );
+    }
+
+    // ---- qualified references (ComlineProject/language-server#124, core#290) ----
+
+    #[test]
+    fn a_whole_namespace_use_brings_in_only_its_name() {
+        let all = files(&[
+            ("file:///pkg/src/types.ids", "struct User {\n    name: string\n}\n"),
+            (
+                "file:///pkg/src/chat.ids",
+                "use package::types\n\nstruct S {\n    a: types::User\n    b: User\n}\n",
+            ),
+        ]);
+        let project = Project::new(all.iter());
+        let target = project
+            .resolve(1, "types::User", Namespace::Declaration)
+            .expect("through the namespace");
+        assert_eq!(
+            (target.doc, project.symbol(&target).unwrap().name.as_str()),
+            (0, "User")
+        );
+        assert_eq!(
+            project.resolve(1, "User", Namespace::Declaration),
+            None,
+            "nothing in `types` is in scope bare"
+        );
+
+        // Only the qualified one refers to it, and at its own `User`.
+        assert_eq!(lines(&project.references(&target)), vec![("chat.ids".into(), 3, 14)]);
+    }
+
+    #[test]
+    fn every_spelling_of_a_path_reaches_the_same_declaration() {
+        let chat = "use package::billing\nuse package::billing::api as b\nuse package::billing::api::Invoice\n\n\
+            struct S {\n    a: billing::api::Invoice\n    b: b::Invoice\n    c: package::billing::api::Invoice\n    d: Invoice\n}\n";
+        let all = files(&[
+            (
+                "file:///pkg/src/billing/api.ids",
+                "struct Invoice {\n    id: u64\n}\n",
+            ),
+            ("file:///pkg/src/chat.ids", chat),
+        ]);
+        let project = Project::new(all.iter());
+        let want = project
+            .resolve(1, "Invoice", Namespace::Declaration)
+            .expect("by its `use`");
+        assert_eq!(want.doc, 0);
+        for written in [
+            "billing::api::Invoice",
+            "b::Invoice",
+            "package::billing::api::Invoice",
+        ] {
+            assert_eq!(
+                project.resolve(1, written, Namespace::Declaration).as_ref(),
+                Some(&want),
+                "{written}"
+            );
+        }
+
+        // Each is a reference at its last segment, and the `use` that imports it.
+        assert_eq!(
+            lines(&project.references(&want)),
+            vec![
+                ("chat.ids".into(), 2, 27),
+                ("chat.ids".into(), 5, 21),
+                ("chat.ids".into(), 6, 10),
+                ("chat.ids".into(), 7, 30),
+                ("chat.ids".into(), 8, 7),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_name_that_is_no_qualifier_resolves_nothing() {
+        let all = files(&[
+            ("file:///pkg/src/types.ids", "struct User {\n    name: string\n}\n"),
+            (
+                "file:///pkg/src/chat.ids",
+                "use package::types as t\nuse package::types::User\n\nstruct S {\n    a: User\n}\n",
+            ),
+        ]);
+        let project = Project::new(all.iter());
+        // After an alias the namespace's own name isn't in scope, and an
+        // imported item has nothing under it.
+        assert_eq!(project.resolve(1, "types::User", Namespace::Declaration), None);
+        assert_eq!(project.resolve(1, "User::User", Namespace::Declaration), None);
+        assert!(project.resolve(1, "t::User", Namespace::Declaration).is_some());
+    }
+
+    #[test]
+    fn a_cursor_on_a_path_resolves_by_the_whole_path() {
+        let chat = "use package::billing\n\nstruct Invoice {\n    mine: bool\n}\n\n\
+            struct S {\n    a: billing::api::Invoice\n    b: Invoice\n}\n";
+        let all = files(&[
+            (
+                "file:///pkg/src/billing/api.ids",
+                "struct Invoice {\n    id: u64\n}\n",
+            ),
+            ("file:///pkg/src/chat.ids", chat),
+        ]);
+        let project = Project::new(all.iter());
+        let at = |needle: &str| {
+            let offset = chat.find(needle).unwrap();
+            project.target_at_cursor(1, chat, offset)
+        };
+        // The qualified one is billing's, the bare one is this file's own.
+        let qualified = at("Invoice\n    b").expect("through the path");
+        assert_eq!(qualified.doc, 0);
+        let bare = at("Invoice\n}").expect("the local struct");
+        assert_eq!(bare.doc, 1);
+        // A qualifier is a namespace, not a declaration.
+        assert_eq!(at("billing::api"), None);
     }
 }

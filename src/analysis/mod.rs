@@ -3,6 +3,7 @@ pub mod generation;
 pub mod import_check;
 pub mod imports;
 pub mod modules;
+pub mod names;
 pub mod parse_cache;
 pub mod project;
 pub mod source;

@@ -6,7 +6,7 @@ A Language Server Protocol (LSP) implementation for [Comline](https://github.com
 
 ### ✅ Fully Implemented
 
-- **Diagnostics** - Real-time syntax errors plus `comline-core`'s validation pass (undefined types, duplicate declarations, ...) — the same checks `comline build` runs. A type from another file of the package used without a `use` gets a specific error with an **"Add `use ...`" quick fix**; a `use` that reaches one of the package's own schemas by a bare path (`use types::User` instead of `use package::types::User`) is an error with a **"Write `package::…`" quick fix**
+- **Diagnostics** - Real-time syntax errors plus `comline-core`'s validation pass (undefined types, duplicate declarations, ...) — the same checks `comline build` runs. A type from another file of the package used without a `use` gets a specific error with an **"Add `use ...`" quick fix**; a `use` that reaches one of the package's own schemas by a bare path (`use types::User` instead of `use package::types::User`) is an error with a **"Write `package::…`" quick fix**; a type written against the Rust model (`reference::not-in-scope`, `reference::qualifier-not-in-scope`, `reference::defined-twice`) is core's own error with its **quick fix**
 - **Whole-package analysis** - every `.ids` file in a package's `src/` takes part, open or not, kept current through file watching; each package only sees its own files
 - **Dependency packages** - the dependencies `config.idp` declares are indexed (path dependencies, and git pins `comline check` has fetched; the editor never fetches), so imports, hover, go-to-definition and completion work into them under the dependency's name. Unresolved imports are errors, worded like `comline check`'s, with a "did you mean" quick fix; imports of a dependency that isn't fetched yet are marked as not checked, and its `config.idp` entry says why. A dependency whose `@unverified` protocols aren't accepted is an error on its entry, with a quick fix that writes the `accept_unverified` line `comline deps accept` would
 - **Standard library** - `use std::…` resolves against the std embedded in `comline-core`, like a read-only dependency: hover, go-to-definition (into virtual `comline-std:` documents, whose text clients fetch with the `comline/stdSource` request), completion, and unresolved-import errors worded like `comline check`'s (`std has no schema matching 'std::htp::Request' - did you mean 'std::http'?`)
@@ -260,6 +260,30 @@ package's own schemas, and a dependency's or `std`'s path as it is.
 
 A dependency that isn't fetched yet is offered, marked as such, with nothing
 under it until `comline check` fetches it.
+
+A type is written as in Rust: a name in scope, or a path that starts with one or
+with a root. A whole-namespace `use` brings in only its own name, so after
+`use package::types` the type is `types::User` and a bare `User` is the error
+`reference::not-in-scope` (fix: "Add `use package::types::User`", or write
+`types::User`). A full path from a root needs no `use`: `package::types::User`,
+`parent::common::Error`, `self::nested::Type`, `std::http::Request`, a
+dependency's `greeting::hello::Greeting`; and a path goes down from a name in
+scope (`billing::api::Invoice` after `use package::billing`, `b::Invoice` after
+`use package::billing::api as b`). These are core's own rule and errors
+(`reference::not-in-scope`, `reference::qualifier-not-in-scope`,
+`reference::defined-twice`, each with its fix), run over the files the server
+has. Completion in a type position follows it:
+
+```comline
+use package::types
+
+struct S {
+    a: types::     // → what `types` declares; a bare `User` is not offered
+    b: package::   // → the package's schemas, then what's under them
+    c:             // → the names in scope (declared here, `use`d, `types`), then
+                   //   the roots package:: parent:: self:: std:: and the dependencies
+}
+```
 
 ### Go to Definition
 

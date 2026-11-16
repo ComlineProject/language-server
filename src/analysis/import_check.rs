@@ -25,15 +25,19 @@ use comline_core::schema::idl::grammar::Declaration;
 use comline_core::schema::ir::compiler::import_resolver::{
     absolute_first_segment, check_imports, ImportResolver, BARE_OWN_SCHEMA_PATH,
 };
+use comline_core::schema::ir::compiler::references::{
+    Refusal, NOT_IN_SCOPE, QUALIFIER_NOT_IN_SCOPE,
+};
 use comline_core::schema::ir::frozen::unit::FrozenUnit;
 use lsp_types::SymbolKind;
 
 use crate::analysis::imports::ResolvedUse;
+use crate::analysis::names::{self, Names};
 use crate::analysis::project::{named_type_sites, validator_sites, Project, ProjectDoc};
 use crate::analysis::source::DependencyKind;
 use crate::analysis::stdlib;
 use crate::analysis::symbols::Namespace;
-use crate::util::{clamped, closest, follows_as, word_occurrences};
+use crate::util::{clamped, closest, follows_as, is_identifier, word_occurrences};
 
 /// What [`check`] found for one file.
 pub struct ImportCheck {
@@ -52,6 +56,16 @@ pub struct ImportCheck {
     /// (`use types::User`, for `use types::User`): core's own error
     /// for it, with its fix - see [`bare_own_schema_paths`].
     pub bare_own: Vec<CoreDiagnostic>,
+    /// What core's reference rule refuses in the file (core#290): a name
+    /// nothing brought into scope, a qualifier that isn't in scope, a name
+    /// defined twice - its own errors, with their fixes (see
+    /// [`Names::reference_errors`]). A bare type another file declares is
+    /// core's `reference::not-in-scope`, as `comline check` reports it.
+    pub references: Vec<CoreDiagnostic>,
+    /// The names core's validation must not also call unknown: those of
+    /// [`ImportCheck::missing`] and of `references`, where the error is
+    /// already the editor's to report.
+    pub stand_ins: BTreeSet<String>,
 }
 
 /// A `use` that doesn't resolve, the way core's `check_imports` sees it.
@@ -85,6 +99,11 @@ pub struct MissingImport {
     /// binds only the alias (`use types::User as U` makes `U` usable, not
     /// `User`).
     pub imported_as: Option<String>,
+    /// A validator named in a `@validators` list, which core's reference rule
+    /// doesn't cover: the only name `import::missing` is still reported for.
+    /// A type is core's `reference::not-in-scope`; what is here for it is
+    /// what its quick fixes are made of (every file that declares it).
+    pub validator: bool,
 }
 
 /// A project file a missing name could be imported from.
@@ -95,6 +114,11 @@ pub struct Candidate {
     pub own: bool,
     /// The file's name, for messages (`types.ids`).
     pub file: String,
+    /// How the file is written through a namespace a `use` here brought in
+    /// (`types` after `use package::types`, `b::sub` after
+    /// `use package::billing as b`), when one reaches it: the other fix to a
+    /// missing `use`.
+    pub via: Option<String>,
 }
 
 impl Candidate {
@@ -103,6 +127,12 @@ impl Candidate {
     /// for a dependency's.
     pub fn use_path(&self, name: &str) -> String {
         use_path(self.own, &self.namespace, name)
+    }
+
+    /// `name` written through a namespace a `use` here brought in
+    /// (`types::User`), if one reaches the file.
+    pub fn qualified(&self, name: &str) -> Option<String> {
+        self.via.as_ref().map(|via| format!("{via}::{name}"))
     }
 }
 
@@ -118,6 +148,11 @@ pub(crate) enum Target {
 }
 
 pub fn check(project: &Project, doc: usize) -> ImportCheck {
+    check_with(project, &Names::of(project), doc)
+}
+
+/// [`check`], with the project's [`Names`] already built.
+pub fn check_with(project: &Project, names: &Names, doc: usize) -> ImportCheck {
     let here = &project.docs[doc];
     let sites = named_type_sites(here);
     let bare_sites: BTreeSet<&str> = sites
@@ -197,25 +232,36 @@ pub fn check(project: &Project, doc: usize) -> ImportCheck {
     }
 
     // Validators too: a `use` brings one in the same way, and core calls a
-    // missing one an unknown validator.
+    // missing one an unknown validator. A type is in scope by the Rust model
+    // (core#290), which is core's own rule, [`Names::scope`]; the older, wider
+    // reading of a `use` stays for what core still reads that way.
     let validators = validator_sites(here);
     let named = sites
         .iter()
-        .map(|site| (site, declares_type as fn(&ProjectDoc, &str) -> bool))
-        .chain(
-            validators
-                .iter()
-                .map(|site| (site, declares_validator as fn(&ProjectDoc, &str) -> bool)),
-        );
+        .map(|site| (site, true))
+        .chain(validators.iter().map(|site| (site, false)));
+    let types = names.scope(doc);
+    let bindings = names::namespace_bindings(project, &here.imports);
 
     let mut missing = Vec::new();
-    for ((name, offset), declares) in named {
-        if name.contains("::")
-            || here.symbols.get_in(name, Namespace::Declaration).is_some()
-            || covered.contains(name)
-        {
+    for ((name, offset), is_type) in named {
+        if name.contains("::") || here.symbols.get_in(name, Namespace::Declaration).is_some() {
             continue;
         }
+        let in_scope = match is_type {
+            true => !matches!(
+                types.resolve(name),
+                Err(Refusal::NotInScope { namespace: false })
+            ),
+            false => covered.contains(name),
+        };
+        if in_scope {
+            continue;
+        }
+        let declares = match is_type {
+            true => declares_type as fn(&ProjectDoc, &str) -> bool,
+            false => declares_validator as fn(&ProjectDoc, &str) -> bool,
+        };
 
         let candidates: Vec<Candidate> = project
             .docs
@@ -226,6 +272,7 @@ pub fn check(project: &Project, doc: usize) -> ImportCheck {
                 namespace: d.namespace.clone(),
                 own: d.dependency.is_none(),
                 file: file_name(d),
+                via: is_type.then(|| through(&bindings, &d.namespace)).flatten(),
             })
             .collect();
 
@@ -243,7 +290,33 @@ pub fn check(project: &Project, doc: usize) -> ImportCheck {
                 range: (*offset, offset + name.len()),
                 candidates,
                 imported_as: aliases.get(name).cloned(),
+                validator: !is_type,
             });
+        }
+    }
+
+    // What core's reference rule refuses, each with its own fix. A
+    // dependency's files are written against its own package.
+    let mut stand_ins: BTreeSet<String> = missing.iter().map(|m| m.name.clone()).collect();
+    let mut references = vec![];
+    if here.dependency.is_none() {
+        for error in names.reference_errors(doc) {
+            let refused = error.code == NOT_IN_SCOPE || error.code == QUALIFIER_NOT_IN_SCOPE;
+            // The name as written, which core's validation must not also call
+            // an unknown type.
+            if let (true, Some(span)) = (refused, error.span) {
+                let written = here.source.get(span.0..span.1).unwrap_or_default();
+                if !written.is_empty() && written.split("::").all(is_identifier) {
+                    scope.push(FrozenUnit::Import(written.to_string(), None, span));
+                    stand_ins.insert(written.to_string());
+                }
+            }
+            // Without the manifest the view may not be the whole package, so a
+            // qualifier nothing here matches may be a dependency's name.
+            let unknown_root = error.code == QUALIFIER_NOT_IN_SCOPE && !project.has_manifest;
+            if !unknown_root {
+                references.push(error);
+            }
         }
     }
 
@@ -255,7 +328,22 @@ pub fn check(project: &Project, doc: usize) -> ImportCheck {
         unresolved,
         unverified,
         bare_own,
+        references,
+        stand_ins,
     }
+}
+
+/// How the schema `namespace` is written from a name a whole-namespace `use`
+/// brought in: through the deepest one it is under (`types`, or `b::sub`
+/// after `use package::billing as b`).
+pub(crate) fn through(bindings: &[(String, Vec<String>)], namespace: &[String]) -> Option<String> {
+    let (name, path) = bindings
+        .iter()
+        .filter(|(_, path)| namespace.starts_with(path))
+        .max_by_key(|(_, path)| path.len())?;
+    let mut parts = vec![name.as_str()];
+    parts.extend(namespace[path.len()..].iter().map(String::as_str));
+    Some(parts.join("::"))
 }
 
 /// Every `use` in `docs[doc]` that doesn't resolve, by core's own rule
@@ -376,6 +464,15 @@ fn resolution(
                     }
                 }
 
+                // A directory of schemas, `std` or a dependency's name on its
+                // own is a name to qualify with, as in core (core#290):
+                // `use package::billing`, `use shared`.
+                if use_decl.resolved.symbols.is_empty()
+                    && names::is_namespace(project, &namespace)
+                {
+                    continue;
+                }
+
                 if first == stdlib::NAME {
                     unresolved.push(unknown_std_path(project, text, span, &namespace));
                     continue;
@@ -387,16 +484,33 @@ fn resolution(
                 } else {
                     find_in(text, span.0, first, true)
                 };
+                // One of the package's own schemas is reached through
+                // `package::`, so that is what is suggested for a bare path to
+                // it, as core does (core#286); a dependency's name and `std`
+                // are absolute as they are.
+                let bare = absolute_first_segment(&use_stmt.path) == Some(first);
+                let suggestion = range
+                    .and(closest(
+                        first,
+                        top_level.iter().copied().chain(declared.keys().copied()),
+                    ))
+                    .map(|closest| {
+                        let own = top_level.contains(closest.as_str())
+                            && !declared.contains_key(closest.as_str())
+                            && !indexed.contains(closest.as_str())
+                            && closest != stdlib::NAME;
+                        match own && bare {
+                            true => format!("package::{closest}"),
+                            false => closest,
+                        }
+                    });
                 unresolved.push(UnresolvedImport {
                     range: range.unwrap_or(span),
                     detail: format!(
                         "no schema in this package or its dependencies matches '{}'",
                         namespace.join("::")
                     ),
-                    suggestion: range.and(closest(
-                        first,
-                        top_level.iter().copied().chain(declared.keys().copied()),
-                    )),
+                    suggestion,
                 });
             }
         }
@@ -542,7 +656,7 @@ fn find_in(text: &str, base: usize, word: &str, segment: bool) -> Option<(usize,
 /// Every name a `use` can import from a schema: its types, protocols and
 /// consts, plus errors (`! Name` throws), validators and settings - what
 /// core's `check_imports` accepts.
-fn importable_names(doc: &ProjectDoc) -> BTreeSet<String> {
+pub(crate) fn importable_names(doc: &ProjectDoc) -> BTreeSet<String> {
     let mut names: BTreeSet<String> = doc
         .symbols
         .all_symbols()
@@ -732,7 +846,6 @@ mod tests {
             "use package::types::Message",
             "use package::types::*",
             "use package::types::{Message, Kind}",
-            "use package::types",
             "import types::Message",
         ] {
             let source = format!("{header}\n\nstruct S {{\n    m: Message\n}}\n");
@@ -795,16 +908,113 @@ mod tests {
     }
 
     #[test]
-    fn a_glob_or_whole_namespace_use_of_a_file_outside_the_project_gets_the_benefit_of_the_doubt() {
-        for header in ["use package::other::*", "use package::other"] {
+    fn a_glob_of_a_file_outside_the_project_gets_the_benefit_of_the_doubt() {
+        let source = "use package::other::*\n\nstruct S {\n    m: Message\n}\n";
+        let files = project(&[("file:///pkg/src/chat.ids", source), TYPES]);
+        assert_eq!(
+            missing_names(&files, 0),
+            vec![],
+            "`Message` may come from the glob"
+        );
+    }
+
+    /// A whole-namespace `use` brings in its own name and nothing in it
+    /// (core#290), whether or not the schema is among the files.
+    #[test]
+    fn a_whole_namespace_use_brings_in_only_its_name() {
+        for header in ["use package::types", "use package::other"] {
             let source = format!("{header}\n\nstruct S {{\n    m: Message\n}}\n");
             let files = project(&[("file:///pkg/src/chat.ids", &source), TYPES]);
             assert_eq!(
                 missing_names(&files, 0),
-                vec![],
-                "`Message` may come from `{header}`"
+                vec![("Message".into(), vec!["package::types::Message".into()])],
+                "`{header}` doesn't import `Message`"
             );
         }
+    }
+
+    #[test]
+    fn a_missing_name_can_be_written_through_the_namespace_a_use_brought_in() {
+        let source = "use package::types\n\nstruct S {\n    m: Message\n}\n";
+        let files = project(&[("file:///pkg/src/chat.ids", source), TYPES]);
+        let view = Project::new(files.iter());
+        let missing = check(&view, 0).missing;
+        assert_eq!(missing.len(), 1);
+        let candidate = &missing[0].candidates[0];
+        assert_eq!(candidate.use_path("Message"), "package::types::Message");
+        assert_eq!(candidate.qualified("Message").as_deref(), Some("types::Message"));
+
+        // Through an alias, and a directory: the name it brought in, then the
+        // rest of the path.
+        let source = "use package::types as t\n\nstruct S {\n    m: Message\n}\n";
+        let files = project_files(source);
+        let view = Project::new(files.iter());
+        let missing = check(&view, 0).missing;
+        assert_eq!(
+            missing[0].candidates[0].qualified("Message").as_deref(),
+            Some("t::Message")
+        );
+        let source = "use package::legacy\n\nstruct S {\n    m: Message\n}\n";
+        let files = project_files(source);
+        let view = Project::new(files.iter());
+        let missing = check(&view, 0).missing;
+        let qualified: Vec<_> = missing[0]
+            .candidates
+            .iter()
+            .map(|c| c.qualified("Message"))
+            .collect();
+        assert_eq!(qualified, vec![None, Some("legacy::types::Message".to_string())]);
+    }
+
+    /// `chat.ids` with `source`, `types.ids` and `legacy/types.ids`.
+    fn project_files(source: &str) -> Vec<(Url, String)> {
+        project(&[
+            ("file:///pkg/src/chat.ids", source),
+            TYPES,
+            (
+                "file:///pkg/src/legacy/types.ids",
+                "struct Message {\n    old: bool\n}\n",
+            ),
+        ])
+    }
+
+    #[test]
+    fn what_core_refuses_is_reported_with_its_fix_and_not_twice() {
+        use comline_core::schema::ir::compiler::references::DEFINED_TWICE;
+
+        // A bare name after only a whole-namespace `use`: core's
+        // `reference::not-in-scope`, which `missing` holds the candidates of.
+        let source = "use package::types\n\nstruct S {\n    m: Message\n}\n";
+        let files = project(&[("file:///pkg/src/chat.ids", source), TYPES]);
+        let view = Project::new(files.iter());
+        let found = check(&view, 0);
+        assert_eq!(found.missing.len(), 1);
+        assert_eq!(found.references.len(), 1, "{:?}", found.references);
+        assert_eq!(found.references[0].code, NOT_IN_SCOPE);
+        assert!(!found.missing[0].validator);
+        assert!(found.stand_ins.contains("Message"));
+
+        // A name declared nowhere: core's own error, and no unknown type.
+        let source = "struct S {\n    m: Nope\n}\n";
+        let files = project(&[("file:///pkg/src/chat.ids", source), TYPES]);
+        let view = Project::new(files.iter());
+        let found = check(&view, 0);
+        assert!(found.missing.is_empty());
+        assert_eq!(found.references.len(), 1);
+        assert_eq!(found.references[0].code, NOT_IN_SCOPE);
+        assert!(found.stand_ins.contains("Nope"));
+
+        // A qualifier that matches nothing, and a name defined twice.
+        let source = "use package::types::Message\n\nstruct Message {\n    x: bool\n}\n\nstruct S {\n    m: typse::Message\n}\n";
+        let files = project(&[("file:///pkg/src/chat.ids", source), TYPES]);
+        let view = Project::new(files.iter());
+        let found = check(&view, 0);
+        let codes: Vec<_> = found.references.iter().map(|d| d.code).collect();
+        assert!(codes.contains(&DEFINED_TWICE), "{codes:?}");
+        assert!(
+            !codes.contains(&QUALIFIER_NOT_IN_SCOPE),
+            "without a manifest the qualifier may be a dependency's name: {codes:?}"
+        );
     }
 
     #[test]
@@ -948,9 +1158,18 @@ mod tests {
             vec![(
                 "typse".to_string(),
                 "no schema in this package or its dependencies matches 'typse::User'".to_string(),
-                Some("types".to_string())
+                // One of the package's own schemas is reached as `package::`,
+                // as core suggests it (core#286).
+                Some("package::types".to_string())
             )]
         );
+
+        // Written `package::`, the typo is of the next segment alone.
+        let (unresolved, _) =
+            resolution_of("use package::typse::User\n\nstruct S {\n    u: User\n}\n");
+        assert_eq!(unresolved.len(), 1, "{unresolved:?}");
+        assert_eq!(unresolved[0].0, "typse");
+        assert_eq!(unresolved[0].2.as_deref(), Some("types"));
     }
 
     #[test]
@@ -972,11 +1191,14 @@ mod tests {
         for body in [
             "use package::types::User\n\nstruct S {\n    u: User\n}\n",
             "use package::types::Gone\n\nstruct S {\n    id: u64\n}\n",
-            "use package::types\n\nstruct S {\n    u: User\n}\n",
             "use std::http::{Request, Response}\n\nstruct S {\n    r: Request\n}\n",
             "use std::validators::StringBounds\n\nstruct S {\n    id: u64\n}\n",
             "use package::broken::Anything\n\nstruct S {\n    id: u64\n}\n",
             "use shared::models::Thing\n\nstruct S {\n    t: Thing\n}\n",
+            // A dependency's name and `std` on their own are names to qualify with.
+            "use shared\n\nstruct S {\n    t: shared::models::Thing\n}\n",
+            "use std\n\nstruct S {\n    r: std::http::Request\n}\n",
+            "use package::types\n\nstruct S {\n    u: types::User\n}\n",
         ] {
             let (unresolved, unverified) = resolution_of(body);
             assert!(
