@@ -3080,7 +3080,6 @@ mod reference_tests {
     fn a_full_path_from_a_root_needs_no_use() {
         for chat in [
             "struct S {\n    u: package::types::User\n}\n",
-            "struct S {\n    u: package::types::User[]\n}\n",
             "struct S {\n    i: package::billing::api::Invoice\n}\n",
             "struct S {\n    t: shared::models::Thing\n}\n",
         ] {

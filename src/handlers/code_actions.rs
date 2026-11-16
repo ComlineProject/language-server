@@ -1126,7 +1126,7 @@ mod reference_tests {
             local("config.idp", MANIFEST),
             local(
                 "src/types.ids",
-                "struct Message {\n    text: string\n}\n\nenum Kind {\n    A\n}\n",
+                "struct Message {\n    id: u64\n}\n\nenum Kind {\n    A\n}\n",
             ),
             SourceFile::of_dependency(
                 Url::parse("file:///shared/src/models.ids").unwrap(),

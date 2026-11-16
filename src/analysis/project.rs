@@ -449,7 +449,14 @@ impl<'a> Project<'a> {
                 }
                 path.segments.join("::")
             }
-            _ => source[start..end].to_string(),
+            // In a `use`, the name written is the item it imports, whatever it
+            // is bound as here (`Message` in `use a::Message as Msg`).
+            _ => {
+                let word = &source[start..end];
+                return self
+                    .resolve(doc, word, namespace)
+                    .or_else(|| self.resolve_wide(doc, word, namespace));
+            }
         };
         self.resolve(doc, &written, namespace)
     }
