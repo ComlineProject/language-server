@@ -38,14 +38,14 @@ serde_json = "1.0"
 # Pure Rust, so the analysis library still builds for wasm32. The same
 # release line `comline-codegen`'s `toml` 0.8 parses with.
 toml_edit = { version = "0.22", default-features = false, features = ["parse"] }
-comline-core = { git = "https://github.com/ComlineProject/core", rev = "69039e7ab05953760bb7a6818f61e98c14b43922" }
+comline-core = { git = "https://github.com/ComlineProject/core", rev = "4ab870539d763a6ca611db8339db02134af18328" }
 # What each generator supports, feature by feature (`comline_codegen::features`)
 # - for warning at a use a declared language can't generate. Only the
 # generators' `SUPPORT` tables are read; nothing is generated. Pinned to the
 # same commits as the CLI, so a build has one `comline-codegen`.
-comline-codegen = { git = "https://github.com/ComlineProject/generation", rev = "99187d77f16827b5c159c5a91da8aa66f74864ed" }
-comline-codegen-rust = { git = "https://github.com/ComlineProject/comline-rust", rev = "86d5f2109cc97a51031dea6b692e8d51168d2c96" }
-comline-codegen-typescript = { git = "https://github.com/ComlineProject/comline-typescript", rev = "d13f4bdaa07d958ffcceb77420de366d16952863" }
+comline-codegen = { git = "https://github.com/ComlineProject/generation", rev = "ca5fae8c9c22753e33dbd801f436c714909cb2aa" }
+comline-codegen-rust = { git = "https://github.com/ComlineProject/comline-rust", rev = "232b41e75a3b377db374d337affffc2f50c31758" }
+comline-codegen-typescript = { git = "https://github.com/ComlineProject/comline-typescript", rev = "af3f29eeb6ef7f3bd4720d1c2c30146636ca8159" }
 
 # `server`-only.
 tower-lsp = { version = "0.20.0", optional = true }
