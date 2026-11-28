@@ -997,7 +997,9 @@ fn value_snippet(ty: &ValueType, n: usize) -> Option<String> {
         ValueType::Keyword(_) if spellings.len() == 1 => spellings[0].to_string(),
         ValueType::Keyword(_) => format!("${{{n}|{}|}}", spellings.join(",")),
         ValueType::Name => format!("${{{n}:Name}}"),
-        ValueType::ValidatorList => format!("[${n}]"),
+        // A list the user fills in: validator calls, or bare names
+        // (`@connection = [admin, public]`).
+        ValueType::ValidatorList | ValueType::NameList => format!("[${n}]"),
         // One of several forms: the first, the plainest (`@framing`'s name,
         // not its dictionary).
         ValueType::AnyOf(types) => return types.first().and_then(|first| value_snippet(first, n)),
